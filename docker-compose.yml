@@ -3,6 +3,9 @@
 # Wallet address secret: create before first run:
 #   echo -n 0xYourWallet > secrets/wallet_address && chmod 600 secrets/wallet_address
 #
+# Feed event log: persisted to ./data/feed-events.ndjson on the host.
+# The data/ directory is created automatically on first run.
+#
 # The dashboard (port 9090) has NO external port mapping.
 # Access it via Tailscale or internal Docker network only.
 
@@ -15,9 +18,12 @@ services:
     environment:
       MDF_PORT: 3000
       MDF_DASHBOARD_PORT: 9090
+      MDF_DATA_DIR: /app/data
+      # MDF_WATCH_INTERVAL_MS: 30000  # default: 30s
     volumes:
       - ./mdf.yaml:/app/mdf.yaml:ro
       - ./content:/app/content:ro
+      - ./data:/app/data
       # Wallet secret — bind-mounted as a file instead of using Docker secrets,
       # because the Compose secret uid/gid feature is not supported on this
       # Docker version. The host file has 600 permissions; inside the container

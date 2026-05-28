@@ -4,14 +4,19 @@
  *
  * Request routing order:
  *   1. Discovery  — /mdf.json, /llms.txt
- *   2. Auth       — POST /mdf/auth (token issuance)
- *   3. Token check — if path requires token, validate Authorization header
- *   4. Payment    — if path is paid and no token, verify X-Payment header
- *   5. Content    — serve markdown or HTML
+ *   2. Feed       — /feed.xml
+ *   3. Auth       — POST /mdf/auth (token issuance)
+ *   4. Token check — if path requires token, validate Authorization header
+ *   5. Payment    — if path is paid and no token, verify X-Payment header
+ *   6. Content    — serve markdown or HTML
  */
 
 import { loadConfig } from "./config/loader.ts";
 import { serveDiscovery } from "./discovery/discovery.ts";
+import { serveFeed } from "./feed/handler.ts";
+import { ensureDataDir } from "./feed/events.ts";
+import { initWatcher, startWatcher } from "./feed/watcher.ts";
+import { emitEvent } from "./feed/events.ts";
 import { serveContent } from "./content/handler.ts";
 import { verifyPayment, build402Response } from "./payment/payment.ts";
 import {
@@ -42,14 +47,34 @@ try {
 const dashboardPort =
   DASHBOARD_PORT_OVERRIDE ?? loaded.config.dashboard.port;
 
-// Start token expiry sweep
+// ---------------------------------------------------------------------------
+// Feed setup — data dir, initial manifest, startup event
+// ---------------------------------------------------------------------------
+
+ensureDataDir();
+initWatcher(loaded);
+startWatcher(loaded);
+
+// Emit startup capability event — records that the server started and
+// what MDF version/capabilities it advertises. One event per start.
+emitEvent(
+  "mdf_capability",
+  "/mdf.json",
+  `mdf-server started — MDF v1.0`,
+  `site: ${loaded.config.site.url}`
+);
+
+// ---------------------------------------------------------------------------
+// Token store sweep
+// ---------------------------------------------------------------------------
+
 tokenStore.startSweep();
 
 // ---------------------------------------------------------------------------
 // Request size limit
 // ---------------------------------------------------------------------------
 
-const MAX_BODY_BYTES = 64 * 1024; // 64 KB — generous for a payment proof JSON body
+const MAX_BODY_BYTES = 64 * 1024; // 64 KB
 
 async function readBody(req: Request): Promise<string | null> {
   const contentLength = req.headers.get("content-length");
@@ -130,7 +155,17 @@ async function handleRequest(req: Request): Promise<Response> {
     }
   }
 
-  // ── 2. Auth endpoint ──────────────────────────────────────────────────────
+  // ── 2. Feed ───────────────────────────────────────────────────────────────
+  if (method === "GET" || method === "HEAD") {
+    const feed = serveFeed(urlPath, loaded);
+    if (feed) {
+      logRequest(method, urlPath, feed.status, Date.now() - start);
+      const res = toResponse(feed);
+      return method === "HEAD" ? new Response(null, { status: res.status, headers: res.headers }) : res;
+    }
+  }
+
+  // ── 3. Auth endpoint ──────────────────────────────────────────────────────
   if (urlPath === "/mdf/auth" || urlPath === loaded.config.auth?.endpoint) {
     if (method !== "POST") {
       logRequest(method, urlPath, 405, Date.now() - start);
@@ -159,14 +194,12 @@ async function handleRequest(req: Request): Promise<Response> {
   const ifNoneMatch = req.headers.get("if-none-match");
   const paymentHeader = req.headers.get("x-payment");
 
-  // ── 3. Payment verification ───────────────────────────────────────────────
+  // ── 4. Payment verification ───────────────────────────────────────────────
   const paymentResult = verifyPayment(urlPath, paymentHeader, loaded);
 
   if (paymentResult.requiresToken) {
-    // High-price tier — must have a valid bearer token
     const tokenResult = validateToken(authHeader, urlPath);
     if (!tokenResult.ok) {
-      // No valid token — return 402 with auth endpoint details
       const response402 = build402Response(urlPath, paymentResult, loaded);
       logRequest(method, urlPath, 402, Date.now() - start, {
         reason: tokenResult.reason,
@@ -174,21 +207,18 @@ async function handleRequest(req: Request): Promise<Response> {
       });
       return toResponse(response402);
     }
-    // Token valid — fall through to content serving
   } else if (
     paymentResult.status === "no_proof" ||
     paymentResult.status === "rejected"
   ) {
-    // Paid content without valid proof
     const response402 = build402Response(urlPath, paymentResult, loaded);
     logRequest(method, urlPath, 402, Date.now() - start, {
       reason: paymentResult.reason,
     });
     return toResponse(response402);
   }
-  // status === "approved" | "stub_approved" — fall through
 
-  // ── 4. Content serving ────────────────────────────────────────────────────
+  // ── 5. Content serving ────────────────────────────────────────────────────
   const content = serveContent(urlPath, acceptHeader, ifNoneMatch, loaded);
   logRequest(method, urlPath, content.status, Date.now() - start, {
     contentType: content.headers["Content-Type"]?.split(";")[0],
@@ -200,7 +230,7 @@ async function handleRequest(req: Request): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard server (internal port, not public-facing)
+// Dashboard server
 // ---------------------------------------------------------------------------
 
 function buildDashboardHtml(): string {
