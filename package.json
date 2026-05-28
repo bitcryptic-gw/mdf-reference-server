@@ -1,0 +1,21 @@
+{
+  "name": "mdf-server",
+  "version": "0.1.0",
+  "description": "MDF — Markdown First reference implementation",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "test:config": "bun run src/config/loader.test.ts"
+  },
+  "dependencies": {
+  "js-yaml": "^4.1.0",
+  "zod": "^3.23.8",
+  "gray-matter": "^4.0.3",
+  "marked": "^18.0.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "bun-types": "latest"
+  }
+}

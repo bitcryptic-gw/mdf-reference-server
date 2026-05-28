@@ -1,0 +1,26 @@
+# mdf-server — Docker Compose configuration
+#
+# Wallet address secret: create before first run:
+#   echo -n 0xYourWallet > secrets/wallet_address && chmod 600 secrets/wallet_address
+#
+# The dashboard (port 9090) has NO external port mapping.
+# Access it via Tailscale or internal Docker network only.
+
+services:
+  mdf-server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - 3030:3000
+    environment:
+      MDF_PORT: 3000
+      MDF_DASHBOARD_PORT: 9090
+    volumes:
+      - ./mdf.yaml:/app/mdf.yaml:ro
+      - ./content:/app/content:ro
+      # Wallet secret — bind-mounted as a file instead of using Docker secrets,
+      # because the Compose secret uid/gid feature is not supported on this
+      # Docker version. The host file has 600 permissions; inside the container
+      # it appears world-readable (444). The secret never appears in env vars
+      # or image layers.
+      - ./secrets/wallet_address:/run/secrets/wallet_address:ro

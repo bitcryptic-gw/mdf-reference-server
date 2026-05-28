@@ -1,0 +1,63 @@
+# mdf.yaml — MDF Server Configuration
+# Reference implementation demo configuration
+
+site:
+  url: https://mdf-demo.bitcryptic.com
+  name: MDF Demo Site
+  contact: admin@mdf-demo.bitcryptic.com
+
+content:
+  dir: ./content
+  dialect: commonmark
+  frontmatter: true
+  math: false
+
+pricing:
+  default:
+    amount: "0.0001"
+    currency: USDC
+    chain: base
+  sections:
+    /:
+      amount: "0.0000"
+    /docs/**:
+      amount: "0.0000"
+    /premium/**:
+      amount: "1.0000"
+      currency: USDC
+      chain: base
+    /private/**:
+      amount: "100.00"
+      currency: USDC
+      chain: base
+
+payment:
+  endpoint: /mdf/pay
+  accepted_chains: [base, ethereum]
+  accepted_currencies: [USDC, USDT]
+  # wallet: set via /run/secrets/wallet_address or MDF_WALLET env var
+
+auth:
+  endpoint: /mdf/auth
+  token_ttl_seconds: 86400
+  price_threshold: "10.00"
+
+signals:
+  ai_train: false
+  ai_input: true
+  search: true
+  human_only: false
+
+feed:
+  url: /feed.xml
+  format: atom
+  websub_hub: https://pubsubhubbub.appspot.com/
+  change_types:
+    - content_update
+    - new_page
+    - pricing_change
+    - mdf_capability
+
+dashboard:
+  enabled: true
+  port: 9090

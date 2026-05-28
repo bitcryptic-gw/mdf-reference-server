@@ -1,0 +1,13 @@
+# mdf-server Caddy reverse proxy configuration
+#
+# Replace mdf-demo.example.com with your actual domain below.
+# TLS is handled automatically by Caddy's ACME — no explicit TLS block needed.
+#
+# NOTE: The dashboard (port 9090) is accessible only via Tailscale or
+# internal Docker network and must NOT have any route defined here.
+
+mdf-demo.example.com {
+    reverse_proxy mdf-server:3000 {
+        header_up X-Real-IP {remote_host}
+    }
+}

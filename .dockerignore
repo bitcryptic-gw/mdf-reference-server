@@ -1,0 +1,12 @@
+node_modules
+.env*
+secrets/
+**/*.test.ts
+smoke-test.sh
+.git
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
