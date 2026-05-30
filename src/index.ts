@@ -6,9 +6,8 @@
  *   1. Discovery  — /mdf.json, /llms.txt
  *   2. Feed       — /feed.xml
  *   3. Auth       — POST /mdf/auth (token issuance)
- *   4. Token check — if path requires token, validate Authorization header
- *   5. Payment    — if path is paid and no token, verify X-Payment header
- *   6. Content    — serve markdown or HTML
+ *   4. Payment    — L402 (Lightning) or x402 (EVM) verification
+ *   5. Content    — serve markdown or HTML
  */
 
 import { loadConfig } from "./config/loader.ts";
@@ -18,7 +17,7 @@ import { ensureDataDir } from "./feed/events.ts";
 import { initWatcher, startWatcher } from "./feed/watcher.ts";
 import { emitEvent } from "./feed/events.ts";
 import { serveContent } from "./content/handler.ts";
-import { verifyPayment, build402Response } from "./payment/payment.ts";
+import { verifyPayment, verifyL402, build402Response } from "./payment/payment.ts";
 import {
   validateToken,
   handleAuthRequest,
@@ -190,32 +189,43 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   const acceptHeader = req.headers.get("accept");
-  const authHeader = req.headers.get("authorization");
   const ifNoneMatch = req.headers.get("if-none-match");
   const paymentHeader = req.headers.get("x-payment");
+  const authHeader = req.headers.get("authorization") ?? "";
 
   // ── 4. Payment verification ───────────────────────────────────────────────
-  const paymentResult = verifyPayment(urlPath, paymentHeader, loaded);
+  if (authHeader.toLowerCase().startsWith("l402 ")) {
+    // L402: agent submitting a Lightning preimage proof
+    const l402Result = await verifyL402(urlPath, authHeader, loaded);
+    if (l402Result.status !== "approved" && l402Result.status !== "stub_approved") {
+      const response402 = await build402Response(urlPath, l402Result, loaded);
+      logRequest(method, urlPath, 402, Date.now() - start, { reason: l402Result.reason });
+      return toResponse(response402);
+    }
+  } else {
+    // x402: agent submitting EVM payment proof, or no proof at all
+    const paymentResult = verifyPayment(urlPath, paymentHeader, loaded);
 
-  if (paymentResult.requiresToken) {
-    const tokenResult = validateToken(authHeader, urlPath);
-    if (!tokenResult.ok) {
-      const response402 = build402Response(urlPath, paymentResult, loaded);
+    if (paymentResult.requiresToken) {
+      const tokenResult = validateToken(authHeader, urlPath);
+      if (!tokenResult.ok) {
+        const response402 = await build402Response(urlPath, paymentResult, loaded);
+        logRequest(method, urlPath, 402, Date.now() - start, {
+          reason: tokenResult.reason,
+          requiresToken: true,
+        });
+        return toResponse(response402);
+      }
+    } else if (
+      paymentResult.status === "no_proof" ||
+      paymentResult.status === "rejected"
+    ) {
+      const response402 = await build402Response(urlPath, paymentResult, loaded);
       logRequest(method, urlPath, 402, Date.now() - start, {
-        reason: tokenResult.reason,
-        requiresToken: true,
+        reason: paymentResult.reason,
       });
       return toResponse(response402);
     }
-  } else if (
-    paymentResult.status === "no_proof" ||
-    paymentResult.status === "rejected"
-  ) {
-    const response402 = build402Response(urlPath, paymentResult, loaded);
-    logRequest(method, urlPath, 402, Date.now() - start, {
-      reason: paymentResult.reason,
-    });
-    return toResponse(response402);
   }
 
   // ── 5. Content serving ────────────────────────────────────────────────────
