@@ -140,13 +140,19 @@ async function albyCreateInvoice(
 /**
  * Look up a Lightning invoice by payment hash via Alby Hub.
  * Returns settlement status and preimage if settled.
+ *
+ * NOTE: Alby Hub's /api/invoices/<hash> endpoint returns HTML (not JSON).
+ * We use /api/transactions instead and filter by paymentHash client-side.
+ * Fetches up to 50 recent transactions — sufficient for demo/reference use.
+ * A production implementation should use a more targeted lookup if Alby Hub
+ * exposes one in a future API version, or migrate to NWC for stability.
  */
 async function albyGetInvoice(
   paymentHash: string,
   apiUrl: string,
   apiToken: string
 ): Promise<AlbyInvoiceStatus> {
-  const res = await fetch(`${apiUrl}/invoices/${encodeURIComponent(paymentHash)}`, {
+  const res = await fetch(`${apiUrl}/transactions?limit=50&offset=0`, {
     headers: {
       "Authorization": `Bearer ${apiToken}`,
     },
@@ -155,10 +161,20 @@ async function albyGetInvoice(
 
   if (!res.ok) {
     const text = await res.text().catch(() => "(no body)");
-    throw new Error(`Alby Hub invoice lookup failed: ${res.status} ${text}`);
+    throw new Error(`Alby Hub transaction lookup failed: ${res.status} ${text}`);
   }
 
-  return res.json() as Promise<AlbyInvoiceStatus>;
+  const data = await res.json() as { transactions: AlbyInvoiceStatus[] };
+  const match = data.transactions.find(
+    (t) => t.paymentHash.toLowerCase() === paymentHash.toLowerCase()
+  );
+
+  if (!match) {
+    // Invoice not found in recent transactions — treat as unsettled
+    return { paymentHash, state: "pending", preimage: null };
+  }
+
+  return match;
 }
 
 // ---------------------------------------------------------------------------
