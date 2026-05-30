@@ -254,6 +254,26 @@ export function loadConfig(configPath = "./mdf.yaml"): LoadedConfig {
     config.payment?.wallet
   );
 
+  // Resolve lightning secrets — only if lightning block is present in config
+if (config.lightning) {
+  const apiToken = resolveSecret("alby_api_token", "MDF_ALBY_TOKEN", undefined);
+  if (!apiToken) {
+    throw new Error(
+      "mdf-server: lightning block configured but alby_api_token secret not found — " +
+      "mount at /run/secrets/alby_api_token or set MDF_ALBY_TOKEN env var"
+    );
+  }
+  const tokenSecret = resolveSecret("lightning_token_secret", "MDF_LIGHTNING_SECRET", undefined);
+  if (!tokenSecret) {
+    throw new Error(
+      "mdf-server: lightning block configured but lightning_token_secret not found — " +
+      "mount at /run/secrets/lightning_token_secret or set MDF_LIGHTNING_SECRET env var"
+    );
+  }
+  config.lightning.api_token = apiToken;
+  config.lightning.token_secret = tokenSecret;
+}
+  
   // Startup constraint validation
   validateStartupConstraints(config, walletAddress);
 
