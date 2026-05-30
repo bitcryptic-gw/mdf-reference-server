@@ -97,6 +97,13 @@ const DashboardSchema = z.object({
 // Root config schema
 // ---------------------------------------------------------------------------
 
+const LightningSchema = z.object({
+  api_url: z.string().url(),
+  api_token: z.string().min(1),
+  invoice_expiry_seconds: z.number().int().min(60).default(300),
+  token_secret: z.string().min(32),
+});
+
 export const MdfConfigSchema = z.object({
   site: SiteSchema,
   content: ContentSchema.default({}),
@@ -106,7 +113,9 @@ export const MdfConfigSchema = z.object({
   signals: SignalsSchema.default({}),
   feed: FeedSchema.optional(),
   dashboard: DashboardSchema.default({}),
+  lightning: LightningSchema.optional(),
 });
 
 export type MdfConfig = z.infer<typeof MdfConfigSchema>;
 export type PriceEntry = z.infer<typeof PriceEntry>;
+export type LightningConfig = z.infer<typeof LightningSchema>;
