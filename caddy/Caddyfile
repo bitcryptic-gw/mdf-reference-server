@@ -7,6 +7,9 @@
 # internal Docker network and must NOT have any route defined here.
 
 mdf-demo.example.com {
+    handle /.well-known/402index-verify.txt {
+        respond "eeaa80a9c7eed6210c4bc85891438a4577a0a3bdf11d77fdea0f1020e4fd77c1" 200
+    }
     reverse_proxy mdf-server:3000 {
         header_up X-Real-IP {remote_host}
     }
