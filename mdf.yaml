@@ -65,3 +65,9 @@ feed:
 dashboard:
   enabled: true
   port: 9090
+
+lightning:
+  api_url: http://10.61.21.97:8021/api
+  invoice_expiry_seconds: 3600
+  api_token: "placeholder-value-replaced-by-secret-at-runtime"
+  token_secret: "placeholder-value-replaced-by-secret-at-runtime-xx"
