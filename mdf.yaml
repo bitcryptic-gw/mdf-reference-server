@@ -22,6 +22,10 @@ pricing:
       amount: "0.0000"
     /docs/**:
       amount: "0.0000"
+    /micropayment/**:
+      amount: "0.00000001"
+      currency: "BTC"
+      chain: "lightning"
     /premium/**:
       amount: "1.0000"
       currency: USDC
