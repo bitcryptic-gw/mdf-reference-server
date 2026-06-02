@@ -355,7 +355,10 @@ function currencyAccepted(currency: string | undefined, config: LoadedConfig["co
 // Price / token helpers
 // ---------------------------------------------------------------------------
 
-function requiredPrice(urlPath: string, config: LoadedConfig["config"]): string {
+function requiredPriceEntry(
+  urlPath: string,
+  config: LoadedConfig["config"]
+): { amount: string; currency: string | null | undefined; chain: string | null | undefined } {
   const sections = config.pricing.sections ?? {};
 
   function globToRegex(pattern: string): RegExp {
@@ -376,7 +379,11 @@ function requiredPrice(urlPath: string, config: LoadedConfig["config"]): string 
     }
   }
 
-  return bestPattern ? sections[bestPattern].amount : config.pricing.default.amount;
+  return bestPattern ? sections[bestPattern] : config.pricing.default;
+}
+
+function requiredPrice(urlPath: string, config: LoadedConfig["config"]): string {
+  return requiredPriceEntry(urlPath, config).amount;
 }
 
 function pathRequiresToken(urlPath: string, config: LoadedConfig["config"]): boolean {
@@ -409,6 +416,9 @@ function usdToSats(usdAmount: string): number {
   const usd = parseFloat(usdAmount);
   if (isNaN(usd)) return 0;
   // 1 sat = $0.001 USD at $100k/BTC
+  // Math.max(1, ...) enforces a 1 sat floor — for the micropayment tier
+  // (amount: "0.00000001" BTC) this arithmetic lands on exactly 1 sat,
+  // which is correct. Replace the fixed rate with a live feed for production.
   return Math.max(1, Math.ceil(usd * 1000));
 }
 
@@ -783,6 +793,8 @@ export async function build402Response(
     }
   }
 
+  const priceEntry = requiredPriceEntry(urlPath, config);
+
   const body = JSON.stringify({
     error: "Payment Required",
     reason: result.reason,
@@ -790,8 +802,9 @@ export async function build402Response(
       endpoint: config.payment?.endpoint
         ? resolveEndpoint(config.payment.endpoint, config.site.url)
         : null,
-      amount: price,
-      currency: config.pricing.default.currency,
+      amount: priceEntry.amount,
+      currency: priceEntry.currency ?? config.pricing.default.currency,
+      chain: priceEntry.chain ?? null,
       accepted_chains: config.payment?.accepted_chains ?? [],
       accepted_currencies: config.payment?.accepted_currencies ?? [],
       ...(l402Challenge ? { lightning_invoice: headers["WWW-Authenticate"] } : {}),
