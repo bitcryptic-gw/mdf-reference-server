@@ -702,7 +702,7 @@ export function verifyPayment(
       status: "no_proof",
       proof: null,
       l402Credential: null,
-      reason: `payment required: ${required} ${config.pricing.default.currency ?? ""}`.trim(),
+      reason: `payment required: ${priceEntry.amount} ${priceEntry.currency ?? config.pricing.default.currency ?? ""}`.trim(),
       requiresToken,
       rail: "none",
     };
