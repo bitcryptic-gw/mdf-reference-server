@@ -96,9 +96,13 @@ Place markdown files under `content/`. The directory structure maps directly to 
 
 ## Payment rails
 
-Both x402 (EVM/stablecoin) and L402 (Bitcoin/Lightning) are implemented as structural stubs — receipt shape is validated but on-chain settlement is not yet verified. Sites advertise accepted rails via `payment.accepted_chains` in `/mdf.json`.
+Two rails are implemented:
 
-Real verification is the next implementation milestone. See the [open issue](https://github.com/bitcryptic-gw/mdf/issues/3) for the x402 trust model discussion.
+**L402 (Bitcoin/Lightning)** — production-complete. Creates real Lightning invoices via Alby Hub, issues HMAC-bound macaroons, and verifies preimage submission against settled invoice records.
+
+**x402 (EVM/stablecoin)** — structural stub. Receipt shape is validated but on-chain settlement is not yet verified. See the [open issue](https://github.com/bitcryptic-gw/mdf/issues/3) for the x402 trust model discussion.
+
+Sites advertise accepted rails via `payment.accepted_chains` in `/mdf.json`.
 
 ---
 
@@ -115,14 +119,13 @@ A Caddy snippet is included at `caddy/Caddyfile`. Point your reverse proxy at po
 | HTTP content negotiation (`Accept: text/markdown`) | ✅ Complete |
 | `/mdf.json` + `/llms.txt` auto-generation | ✅ Complete |
 | ETag / `Last-Modified` caching headers | ✅ Complete |
-| x402 payment stub (EVM/stablecoin) | ✅ Stub |
-| L402 payment stub (Bitcoin/Lightning) | ✅ Stub |
+| Atom feed with `mdf:change_type` extension | ✅ Complete |
+| WebSub hub declaration | ✅ Complete |
 | Bearer token issuance (auth-via-payment) | ✅ Complete |
 | Dashboard | ✅ Complete |
+| L402 payment verification (Bitcoin/Lightning) | ✅ Complete |
+| Validator CLI | ✅ Complete |
 | x402 on-chain receipt verification | 🔲 Next milestone |
-| L402 Lightning invoice verification | 🔲 Next milestone |
-| Validator CLI | 🔲 Planned |
-| Feed namespace (`mdf:change_type`) | 🔲 Planned |
 
 ---
 
