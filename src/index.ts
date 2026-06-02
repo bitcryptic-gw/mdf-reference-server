@@ -453,7 +453,7 @@ function buildDashboardHtml(): string {
   </tr>
   <tr>
     <td class="meta-label">Payment endpoint</td>
-    <td><code class="subtle">${cfg.payment?.endpoint ?? "—"}</code></td>
+    <td><code class="subtle">${(cfg.site?.url ?? "") + (cfg.payment?.endpoint ?? "") || "—"}</code></td>
   </tr>
   ${lightningRow}
 </table>
@@ -470,7 +470,7 @@ function buildDashboardHtml(): string {
   </tr>
   <tr>
     <td class="meta-label">Auth endpoint</td>
-    <td><code class="subtle">${cfg.auth?.endpoint ?? "—"}</code></td>
+    <td><code class="subtle">${(cfg.site?.url ?? "") + (cfg.auth?.endpoint ?? "") || "—"}</code></td>
   </tr>
 </table>
 
@@ -493,7 +493,7 @@ function buildDashboardHtml(): string {
 <table class="meta">
   <tr>
     <td class="meta-label">Feed URL</td>
-    <td><code class="subtle">${cfg.feed?.url ?? "—"}</code></td>
+    <td><code class="subtle">${(cfg.site?.url ?? "") + (cfg.feed?.url ?? "") || "—"}</code></td>
   </tr>
   <tr>
     <td class="meta-label">WebSub hub</td>

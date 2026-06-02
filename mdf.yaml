@@ -37,8 +37,8 @@ pricing:
 
 payment:
   endpoint: /mdf/pay
-  accepted_chains: [base, ethereum]
-  accepted_currencies: [USDC, USDT]
+  accepted_chains: [base, ethereum, lightning]
+  accepted_currencies: [USDC, USDT, BTC]
   # wallet: set via /run/secrets/wallet_address or MDF_WALLET env var
 
 auth:
