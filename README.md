@@ -8,6 +8,8 @@ A self-hostable server that serves markdown natively to AI agents via HTTP conte
 **Spec:** https://github.com/bitcryptic-gw/mdf  
 **Status:** v0.1.0-draft — payment verification is stubbed; see [open milestones](#status)
 
+![mdf-server dashboard](docs/dashboard.png)
+
 ---
 
 ## Quick start
