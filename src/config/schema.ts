@@ -104,6 +104,24 @@ const LightningSchema = z.object({
   token_secret: z.string().min(32),
 });
 
+export const OracleSchema = z.object({
+  ws_endpoints: z.array(z.string().url()).min(1),
+  pubkey: z.union([
+    z.string().refine(
+      (v) => v === "" || /^0x[0-9a-fA-F]{66}$/.test(v),
+      "oracle pubkey must be empty string or 0x-prefixed 33-byte compressed secp256k1 hex"
+    ),
+    z.array(
+      z.string().regex(
+        /^0x[0-9a-fA-F]{66}$/,
+        "oracle pubkey must be 0x-prefixed 33-byte compressed secp256k1 hex"
+      )
+    ),
+  ]),
+  timeout_ms: z.number().int().min(5000).max(60000).default(20000),
+  max_verdict_age_seconds: z.number().int().min(60).max(3600).default(300),
+}).optional();
+
 export const MdfConfigSchema = z.object({
   site: SiteSchema,
   content: ContentSchema.default({}),
@@ -114,8 +132,10 @@ export const MdfConfigSchema = z.object({
   feed: FeedSchema.optional(),
   dashboard: DashboardSchema.default({}),
   lightning: LightningSchema.optional(),
+  oracle: OracleSchema,
 });
 
 export type MdfConfig = z.infer<typeof MdfConfigSchema>;
 export type PriceEntry = z.infer<typeof PriceEntry>;
 export type LightningConfig = z.infer<typeof LightningSchema>;
+export type OracleConfig = z.infer<typeof OracleSchema>;

@@ -71,3 +71,11 @@ lightning:
   invoice_expiry_seconds: 3600
   api_token: "placeholder-value-replaced-by-secret-at-runtime"
   token_secret: "placeholder-value-replaced-by-secret-at-runtime-xx"
+
+oracle:
+  ws_endpoints:
+    - "wss://ws-1.ws-server-1.acurast.com"
+    - "wss://ws-1.ws-server-2.acurast.com"
+  pubkey: []                        # operator fills in
+  timeout_ms: 20000
+  max_verdict_age_seconds: 300

@@ -1,5 +1,7 @@
-import { createHash, createHmac, timingSafeEqual, randomBytes } from "crypto";
+import { createHash, createHmac, timingSafeEqual, randomBytes, randomUUID } from "crypto";
+import { verify, Signature } from "@noble/secp256k1";
 import type { LoadedConfig } from "../config/loader.ts";
+import type { OracleConfig } from "../config/schema.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -22,6 +24,8 @@ export interface PaymentProof {
   txHash?: string;
   /** Paying wallet address */
   from?: string;
+  /** Oracle session nonce (issued in prior 402 response) */
+  nonce?: string;
   /** Any additional fields present in the proof */
   extra: Record<string, string>;
 }
@@ -74,6 +78,122 @@ export interface VerificationResult {
   requiresToken: boolean;
   /** Rail that processed this result */
   rail: "x402" | "l402" | "none";
+}
+
+// ---------------------------------------------------------------------------
+// Session nonce store (x402 oracle handshake)
+// ---------------------------------------------------------------------------
+
+export interface NonceRecord {
+  resource_uri: string;
+  amount: string;
+  currency: string;
+  chain_id: string;
+  expires_at: number;
+}
+
+class NonceStore {
+  private store = new Map<string, NonceRecord>();
+  private sweepIntervalMs: number;
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(sweepIntervalMs = 60_000) {
+    this.sweepIntervalMs = sweepIntervalMs;
+  }
+
+  set(nonce: string, record: NonceRecord): void {
+    this.store.set(nonce, record);
+  }
+
+  get(nonce: string): NonceRecord | undefined {
+    return this.store.get(nonce);
+  }
+
+  delete(nonce: string): void {
+    this.store.delete(nonce);
+  }
+
+  sweep(): number {
+    const now = Date.now();
+    let removed = 0;
+    for (const [nonce, record] of this.store) {
+      if (record.expires_at <= now) {
+        this.store.delete(nonce);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
+  startSweep(): void {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setInterval(() => {
+      const removed = this.sweep();
+      if (removed > 0) {
+        console.log(`[mdf:payment:nonce] swept ${removed} expired nonce(s)`);
+      }
+    }, this.sweepIntervalMs);
+    if (typeof this.sweepTimer === "object" && "unref" in this.sweepTimer) {
+      (this.sweepTimer as NodeJS.Timeout).unref();
+    }
+  }
+
+  stopSweep(): void {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+  }
+}
+
+const nonceStore = new NonceStore();
+
+export function startNonceSweep(): void {
+  nonceStore.startSweep();
+}
+
+export function lookupNonce(nonce: string): NonceRecord | undefined {
+  return nonceStore.get(nonce);
+}
+
+export function consumeNonce(nonce: string): void {
+  nonceStore.delete(nonce);
+}
+
+// ---------------------------------------------------------------------------
+// Oracle types
+// ---------------------------------------------------------------------------
+
+interface OracleRequestParams {
+  tx_hash: string;
+  chain_id: string;
+  amount: string;
+  currency: string;
+  resource_uri: string;
+  session_nonce: string;
+}
+
+interface OracleVerdictPayload {
+  v: string;
+  verified: boolean;
+  tx_hash: string;
+  chain_id: string;
+  amount: string;
+  currency: string;
+  payer: string;
+  resource_uri: string;
+  session_nonce: string;
+  verified_at: number;
+  oracle_version: string;
+  rpc_consensus: string;
+  peer_consensus: string;
+  reason?: string;
+}
+
+interface OracleVerdict {
+  payload: OracleVerdictPayload;
+  signature: string;
+  public_key: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,8 +416,9 @@ function parsePaymentHeader(raw: string): PaymentProof {
       proof.amount   = typeof parsed.amount   === "string" ? parsed.amount   : undefined;
       proof.txHash   = typeof parsed.txHash   === "string" ? parsed.txHash   : undefined;
       proof.from     = typeof parsed.from     === "string" ? parsed.from     : undefined;
+      proof.nonce    = typeof parsed.nonce    === "string" ? parsed.nonce    : undefined;
       for (const [k, v] of Object.entries(parsed)) {
-        if (!["chain", "currency", "amount", "txHash", "from"].includes(k)) {
+        if (!["chain", "currency", "amount", "txHash", "from", "nonce"].includes(k)) {
           proof.extra[k] = String(v);
         }
       }
@@ -447,6 +568,303 @@ function logL402(urlPath: string, paymentHash: string, result: VerificationStatu
     payment_hash: paymentHash,
     detail,
   })}`);
+}
+
+// ---------------------------------------------------------------------------
+// Oracle WebSocket client
+// ---------------------------------------------------------------------------
+
+const MAX_ORACLE_RESPONSE_BYTES = 64 * 1024; // 64 KB
+
+async function wsConnectAndRequest(
+  endpoint: string,
+  requestHex: string,
+  connectTimeoutMs: number,
+  requestTimeoutMs: number
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const ws = new WebSocket(endpoint);
+    let settled = false;
+
+    const connectTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      ws.close();
+      reject(new Error(`oracle WS connect timeout after ${connectTimeoutMs}ms`));
+    }, connectTimeoutMs);
+
+    const requestTimer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      ws.close();
+      reject(new Error(`oracle WS request timeout after ${requestTimeoutMs}ms`));
+    }, requestTimeoutMs);
+
+    ws.onopen = () => {
+      clearTimeout(connectTimer);
+      ws.send(requestHex);
+    };
+
+    ws.onmessage = (event: MessageEvent) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(connectTimer);
+      clearTimeout(requestTimer);
+      ws.close();
+      const data = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer);
+      resolve(data);
+    };
+
+    ws.onerror = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(connectTimer);
+      clearTimeout(requestTimer);
+      try { ws.close(); } catch { /* ignore */ }
+      reject(new Error("oracle WS connection error"));
+    };
+
+    ws.onclose = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(connectTimer);
+      clearTimeout(requestTimer);
+      reject(new Error("oracle WS closed before response"));
+    };
+  });
+}
+
+async function queryOracle(
+  params: OracleRequestParams,
+  config: OracleConfig
+): Promise<OracleVerdict> {
+  const requestBody = JSON.stringify({ params });
+  const requestHex = Buffer.from(requestBody, "utf8").toString("hex");
+
+  const overallDeadline = Date.now() + config.timeout_ms;
+  const errors: string[] = [];
+
+  for (const endpoint of config.ws_endpoints) {
+    const remaining = overallDeadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(`oracle request timed out before connecting`);
+    }
+
+    const connectTimeout = Math.min(5000, remaining);
+    const requestTimeout = remaining;
+
+    try {
+      const responseHex = await wsConnectAndRequest(
+        endpoint,
+        requestHex,
+        connectTimeout,
+        requestTimeout
+      );
+
+      if (responseHex.length > MAX_ORACLE_RESPONSE_BYTES) {
+        console.warn(`[mdf:payment:oracle] oversize response from ${endpoint}: ${responseHex.length} bytes`);
+        errors.push(`${endpoint}: response too large`);
+        continue;
+      }
+
+      const responseBytes = Buffer.from(responseHex, "hex");
+      const responseText = new TextDecoder().decode(responseBytes);
+      const verdict = JSON.parse(responseText) as OracleVerdict;
+
+      if (!verdict.payload || !verdict.signature || !verdict.public_key) {
+        console.warn(`[mdf:payment:oracle] malformed verdict from ${endpoint}: missing required fields`);
+        errors.push(`${endpoint}: malformed verdict`);
+        continue;
+      }
+
+      return verdict;
+    } catch (err) {
+      const msg = (err as Error).message;
+      errors.push(`${endpoint}: ${msg}`);
+      console.warn(`[mdf:payment:oracle] endpoint ${endpoint} failed: ${msg}`);
+    }
+  }
+
+  throw new Error(`all oracle endpoints failed: ${errors.join("; ")}`);
+}
+
+// ---------------------------------------------------------------------------
+// Oracle signature verification
+// ---------------------------------------------------------------------------
+
+function derToCompact(derHex: string): string | null {
+  try {
+    const der = Buffer.from(derHex.startsWith("0x") ? derHex.slice(2) : derHex, "hex");
+    if (der[0] !== 0x30) return null;
+    let pos = 2;
+    if (der[pos] === 0x02) {
+      const rLen = der[pos + 1];
+      const r = der.slice(pos + 2, pos + 2 + rLen);
+      pos += 2 + rLen;
+      if (der[pos] === 0x02) {
+        const sLen = der[pos + 1];
+        const s = der.slice(pos + 2, pos + 2 + sLen);
+        const compact = Buffer.concat([
+          Buffer.alloc(32 - r.length, 0),
+          r,
+          Buffer.alloc(32 - s.length, 0),
+          s,
+        ]);
+        return compact.toString("hex");
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function normaliseSignature(raw: string): string {
+  let sig = raw.startsWith("0x") ? raw.slice(2) : raw;
+  // Strip recovery byte if present (65 bytes = 130 hex chars)
+  if (sig.length === 130) sig = sig.slice(0, 128);
+  // If DER-encoded, convert to compact
+  if (sig.length !== 128) {
+    const compact = derToCompact(sig);
+    if (compact) sig = compact;
+  }
+  return sig;
+}
+
+function normalisePubkeys(pubkey: string | string[]): string[] {
+  if (Array.isArray(pubkey)) return pubkey;
+  if (!pubkey || pubkey.trim().length === 0) return [];
+  return [pubkey];
+}
+
+function verifyOracleSignature(
+  payload: OracleVerdictPayload,
+  signatureHex: string,
+  configPubkeys: string | string[]
+): boolean {
+  const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+  const msgHash = createHash("sha256").update(jsonBytes).digest("hex");
+  const sig = normaliseSignature(signatureHex);
+
+  const pubkeys = normalisePubkeys(configPubkeys);
+  for (const pk of pubkeys) {
+    const raw = pk.startsWith("0x") ? pk.slice(2) : pk;
+    try {
+      if (verify(sig, msgHash, raw)) return true;
+    } catch {
+      // try next
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// verifyX402WithOracle
+// ---------------------------------------------------------------------------
+
+export async function verifyX402WithOracle(
+  params: {
+    tx_hash: string;
+    chain_id: string;
+    amount: string;
+    currency: string;
+    resource_uri: string;
+    session_nonce: string;
+  },
+  config: OracleConfig
+): Promise<{ verified: boolean; payer?: string; reason?: string }> {
+  // Query oracle via WebSocket
+  let verdict: OracleVerdict;
+  try {
+    verdict = await queryOracle(
+      {
+        tx_hash: params.tx_hash,
+        chain_id: params.chain_id,
+        amount: params.amount,
+        currency: params.currency,
+        resource_uri: params.resource_uri,
+        session_nonce: params.session_nonce,
+      },
+      config
+    );
+  } catch (err) {
+    console.warn(`[mdf:payment:oracle] oracle query failed: ${(err as Error).message}`);
+    return { verified: false, reason: "oracle unreachable" };
+  }
+
+  const p = verdict.payload;
+
+  // 1. Cross-check public_key in response against configured pubkeys
+  const responsePubkey = verdict.public_key.toLowerCase();
+  const trustedPubkeys = normalisePubkeys(config.pubkey);
+  const matchedPubkey = trustedPubkeys.find(
+    (pk) => pk.toLowerCase() === responsePubkey
+  );
+  if (!matchedPubkey) {
+    console.error(
+      `[mdf:payment:oracle] pubkey mismatch — verdict signed by unexpected key. ` +
+      `configured count: ${trustedPubkeys.length}, ` +
+      `received starts: ${responsePubkey.slice(0, 10)}…`
+    );
+    return { verified: false, reason: "oracle pubkey mismatch" };
+  }
+
+  // 2. Verify ES256K signature (using configured pubkey, not the response one)
+  const sigValid = verifyOracleSignature(p, verdict.signature, matchedPubkey);
+  if (!sigValid) {
+    console.error(
+      `[mdf:payment:oracle] signature verification failed — ` +
+      `verdict ts=${p.verified_at}, resource=${p.resource_uri}, ` +
+      `tx=${p.tx_hash?.slice(0, 10)}…`
+    );
+    return { verified: false, reason: "oracle signature invalid" };
+  }
+
+  // 3. Enforce verified === true (boolean)
+  // TODO: Once all 3 oracle replicas are populated, gate on peer_consensus
+  // reaching the configured threshold (e.g. "2/3" or higher). Currently with
+  // only 1/3 replicas running, we accept the aggregator's verified=true as-is.
+  if (p.verified !== true) {
+    console.warn(`[mdf:payment:oracle] oracle returned verified=false: ${p.reason ?? "no reason"}`);
+    return { verified: false, reason: p.reason ?? "oracle rejected payment" };
+  }
+
+  // 4. Enforce verified_at freshness
+  const age = Math.floor(Date.now() / 1000) - p.verified_at;
+  if (age > config.max_verdict_age_seconds) {
+    console.warn(`[mdf:payment:oracle] verdict too old: ${age}s > ${config.max_verdict_age_seconds}s`);
+    return { verified: false, reason: `verdict too old (${age}s)` };
+  }
+
+  // 5. Enforce resource_uri matches
+  if (p.resource_uri !== params.resource_uri) {
+    console.warn(`[mdf:payment:oracle] resource_uri mismatch: expected ${params.resource_uri}, got ${p.resource_uri}`);
+    return { verified: false, reason: "resource_uri mismatch" };
+  }
+
+  // 6. Enforce session_nonce matches
+  if (p.session_nonce !== params.session_nonce) {
+    console.warn(`[mdf:payment:oracle] session_nonce mismatch`);
+    return { verified: false, reason: "session_nonce mismatch" };
+  }
+
+  // 7. Enforce amount and currency match
+  if (p.amount !== params.amount) {
+    console.warn(`[mdf:payment:oracle] amount mismatch: expected ${params.amount}, got ${p.amount}`);
+    return { verified: false, reason: "amount mismatch" };
+  }
+  if (p.currency.toUpperCase() !== params.currency.toUpperCase()) {
+    console.warn(`[mdf:payment:oracle] currency mismatch: expected ${params.currency}, got ${p.currency}`);
+    return { verified: false, reason: "currency mismatch" };
+  }
+
+  // 8. Enforce chain_id matches (Base Mainnet = "8453")
+  if (p.chain_id !== params.chain_id) {
+    console.warn(`[mdf:payment:oracle] chain_id mismatch: expected ${params.chain_id}, got ${p.chain_id}`);
+    return { verified: false, reason: "chain_id mismatch" };
+  }
+
+  return { verified: true, payer: p.payer };
 }
 
 // ---------------------------------------------------------------------------
@@ -665,22 +1083,38 @@ export async function verifyL402(
 }
 
 // ---------------------------------------------------------------------------
-// Main verifier — x402 path (unchanged logic, updated return shape)
+// Main verifier — x402 path with oracle integration
 // ---------------------------------------------------------------------------
+
+const CHAIN_ID_MAP: Record<string, string> = {
+  base: "8453",
+  ethereum: "1",
+};
+
+function x402ChainId(chain: string | null | undefined): string | null {
+  if (!chain) return null;
+  return CHAIN_ID_MAP[chain.toLowerCase()] ?? null;
+}
+
+function isLightningChain(chain: string | null | undefined): boolean {
+  return chain?.toLowerCase() === "lightning";
+}
 
 /**
  * Verify an x402 payment proof for a given request.
  *
- * STUB BEHAVIOUR: On-chain receipt verification not yet implemented.
- * Real x402 verification slots in by replacing the stub_approved return
- * with an on-chain receipt check against Base RPC. See spec repo issue #3.
+ * When the oracle is configured and the chain is non-lightning:
+ *   - Delegates to the Acurast oracle for on-chain receipt verification
+ *   - Requires a session_nonce (issued in the prior 402 response)
+ *
+ * When oracle is not configured, falls back to stub mode (structural validation only).
  */
-export function verifyPayment(
+export async function verifyPayment(
   urlPath: string,
   paymentHeader: string | null | undefined,
   loaded: LoadedConfig
-): VerificationResult {
-  const { config } = loaded;
+): Promise<VerificationResult> {
+  const { config, oracleConfig } = loaded;
   const requiresToken = pathRequiresToken(urlPath, config);
   const required      = requiredPrice(urlPath, config);
 
@@ -746,13 +1180,142 @@ export function verifyPayment(
     };
   }
 
-  // ── STUB: would perform on-chain txHash verification here ──
-  logX402(urlPath, proof, "stub_approved");
+  // Lightning paths are handled by L402 flow — no oracle needed
+  if (isLightningChain(proof.chain)) {
+    logX402(urlPath, proof, "stub_approved");
+    return {
+      status: "stub_approved",
+      proof,
+      l402Credential: null,
+      reason: "lightning chain — handled by L402 flow",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  // Non-lightning EVM chain — use oracle if configured
+  if (!oracleConfig) {
+    logX402(urlPath, proof, "stub_approved");
+    return {
+      status: "stub_approved",
+      proof,
+      l402Credential: null,
+      reason: "stub mode: oracle not configured, structural validation only",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  // Validate nonce
+  if (!proof.nonce) {
+    logX402(urlPath, proof, "rejected");
+    return {
+      status: "rejected",
+      proof,
+      l402Credential: null,
+      reason: "session_nonce required — obtain via initial 402 response",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  const nonceRecord = nonceStore.get(proof.nonce);
+  if (!nonceRecord) {
+    logX402(urlPath, proof, "rejected");
+    nonceStore.delete(proof.nonce);
+    return {
+      status: "rejected",
+      proof,
+      l402Credential: null,
+      reason: "unknown or expired session_nonce",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  nonceStore.delete(proof.nonce);
+
+  if (Date.now() > nonceRecord.expires_at) {
+    logX402(urlPath, proof, "rejected");
+    return {
+      status: "rejected",
+      proof,
+      l402Credential: null,
+      reason: "session_nonce expired",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  // Cross-check nonce record against the proof
+  if (nonceRecord.resource_uri !== urlPath) {
+    logX402(urlPath, proof, "rejected");
+    return {
+      status: "rejected",
+      proof,
+      l402Credential: null,
+      reason: "session_nonce bound to different resource",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  const chainId = x402ChainId(proof.chain);
+  if (!chainId) {
+    logX402(urlPath, proof, "rejected");
+    return {
+      status: "rejected",
+      proof,
+      l402Credential: null,
+      reason: `unknown chain_id for chain '${proof.chain}'`,
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  // Oracle verification
+  if (!proof.txHash) {
+    logX402(urlPath, proof, "rejected");
+    return {
+      status: "rejected",
+      proof,
+      l402Credential: null,
+      reason: "txHash required for on-chain verification",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  const oracleResult = await verifyX402WithOracle(
+    {
+      tx_hash: proof.txHash,
+      chain_id: chainId,
+      amount: required,
+      currency: proof.currency ?? config.pricing.default.currency ?? "USDC",
+      resource_uri: `${config.site.url.replace(/\/$/, "")}${urlPath}`,
+      session_nonce: proof.nonce,
+    },
+    oracleConfig
+  );
+
+  if (!oracleResult.verified) {
+    logX402(urlPath, proof, "rejected");
+    return {
+      status: "rejected",
+      proof,
+      l402Credential: null,
+      reason: oracleResult.reason ?? "oracle rejected payment",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  logX402(urlPath, proof, "approved");
   return {
-    status: "stub_approved",
+    status: "approved",
     proof,
     l402Credential: null,
-    reason: "stub mode: structural validation passed, on-chain verification not yet implemented",
+    reason: "x402: on-chain payment verified by oracle",
     requiresToken,
     rail: "x402",
   };
@@ -795,6 +1358,21 @@ export async function build402Response(
 
   const priceEntry = requiredPriceEntry(urlPath, config);
 
+  // Generate session nonce for x402 (non-lightning) paths
+  let sessionNonce: string | undefined;
+  if (!isLightningChain(priceEntry.chain)) {
+    const nonce = randomUUID();
+    const nonceTtlSeconds = config.lightning?.invoice_expiry_seconds ?? 3600;
+    nonceStore.set(nonce, {
+      resource_uri: urlPath,
+      amount: priceEntry.amount,
+      currency: priceEntry.currency ?? config.pricing.default.currency ?? "USDC",
+      chain_id: x402ChainId(priceEntry.chain) ?? "8453",
+      expires_at: Date.now() + nonceTtlSeconds * 1000,
+    });
+    sessionNonce = nonce;
+  }
+
   const body = JSON.stringify({
     error: "Payment Required",
     reason: result.reason,
@@ -807,6 +1385,7 @@ export async function build402Response(
       chain: priceEntry.chain ?? null,
       accepted_chains: config.payment?.accepted_chains ?? [],
       accepted_currencies: config.payment?.accepted_currencies ?? [],
+      ...(sessionNonce ? { session_nonce: sessionNonce } : {}),
       ...(l402Challenge ? { lightning_invoice: headers["WWW-Authenticate"] } : {}),
     },
     ...(result.requiresToken && config.auth

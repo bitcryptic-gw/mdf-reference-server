@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "fs";
 import { resolve, isAbsolute } from "path";
 import yaml from "js-yaml";
-import { MdfConfigSchema, type MdfConfig } from "./schema.ts";
+import { MdfConfigSchema, type MdfConfig, type OracleConfig } from "./schema.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -16,6 +16,8 @@ export interface LoadedConfig {
   contentDir: string;
   /** Wallet address — from config or secret */
   walletAddress: string | null;
+  /** Oracle config — resolved from config or secrets */
+  oracleConfig: OracleConfig | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +167,16 @@ function hasNonZeroPrice(config: MdfConfig): boolean {
   return false;
 }
 
+function hasX402Price(config: MdfConfig): boolean {
+  const entries = [config.pricing.default];
+  if (config.pricing.sections) {
+    entries.push(...Object.values(config.pricing.sections));
+  }
+  return entries.some(
+    (s) => parseFloat(s.amount) > 0 && (!s.chain || s.chain !== "lightning")
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Startup validation
 // ---------------------------------------------------------------------------
@@ -175,7 +187,8 @@ function hasNonZeroPrice(config: MdfConfig): boolean {
  */
 function validateStartupConstraints(
   config: MdfConfig,
-  walletAddress: string | null
+  walletAddress: string | null,
+  oracleConfig: OracleConfig | null
 ): void {
   const errors: string[] = [];
 
@@ -188,6 +201,24 @@ function validateStartupConstraints(
       if (!walletAddress) {
         errors.push(
           "non-zero pricing requires a wallet address — set via /run/secrets/wallet_address, MDF_WALLET env var, or payment.wallet in config"
+        );
+      }
+    }
+  }
+
+  if (hasX402Price(config)) {
+    if (!oracleConfig) {
+      errors.push(
+        "x402 pricing (non-lightning chain with amount > 0) detected but no [oracle] block is configured"
+      );
+    } else {
+      const pubkeyVal = oracleConfig.pubkey;
+      const isEmpty = Array.isArray(pubkeyVal)
+        ? pubkeyVal.length === 0
+        : !pubkeyVal || pubkeyVal.trim().length === 0;
+      if (isEmpty) {
+        errors.push(
+          "x402 pricing requires oracle.pubkey — set via /run/secrets/oracle_pubkey, MDF_ORACLE_PUBKEY env var, or oracle.pubkey in mdf.yaml"
         );
       }
     }
@@ -254,6 +285,29 @@ export function loadConfig(configPath = "./mdf.yaml"): LoadedConfig {
     config.payment?.wallet
   );
 
+  // Resolve oracle pubkey — secret takes priority over config value.
+  // Secret file / env var may contain newline-delimited keys for multiple pubkeys.
+  let oracleConfig: OracleConfig | null = null;
+  if (config.oracle) {
+    const secretRaw = resolveSecret(
+      "oracle_pubkey",
+      "MDF_ORACLE_PUBKEY",
+      undefined
+    );
+    let resolvedPubkey: string | string[] | undefined;
+    if (secretRaw) {
+      const lines = secretRaw
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+      resolvedPubkey = lines.length === 1 ? lines[0] : lines;
+    }
+    oracleConfig = {
+      ...config.oracle,
+      pubkey: resolvedPubkey ?? config.oracle.pubkey,
+    };
+  }
+
   // Resolve lightning secrets — only if lightning block is present in config
 if (config.lightning) {
   const apiToken = resolveSecret("alby_api_token", "MDF_ALBY_TOKEN", undefined);
@@ -275,7 +329,7 @@ if (config.lightning) {
 }
   
   // Startup constraint validation
-  validateStartupConstraints(config, walletAddress);
+  validateStartupConstraints(config, walletAddress, oracleConfig);
 
   // Resolve content directory to absolute path
   const contentDir = isAbsolute(config.content.dir)
@@ -291,5 +345,5 @@ if (config.lightning) {
   const mdfJsonObj = buildMdfJson(config, walletAddress);
   const mdfJson = JSON.stringify(mdfJsonObj, null, 2);
 
-  return { config, mdfJson, contentDir, walletAddress };
+  return { config, mdfJson, contentDir, walletAddress, oracleConfig };
 }

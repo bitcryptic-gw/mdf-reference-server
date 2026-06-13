@@ -9,10 +9,11 @@
     "test:config": "bun run src/config/loader.test.ts"
   },
   "dependencies": {
-  "js-yaml": "^4.1.0",
-  "zod": "^3.23.8",
-  "gray-matter": "^4.0.3",
-  "marked": "^18.0.0"
+    "@noble/secp256k1": "^2.2.3",
+    "js-yaml": "^4.1.0",
+    "zod": "^3.23.8",
+    "gray-matter": "^4.0.3",
+    "marked": "^18.0.0"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",

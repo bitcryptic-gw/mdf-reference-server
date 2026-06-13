@@ -17,10 +17,11 @@ import { ensureDataDir } from "./feed/events.ts";
 import { initWatcher, startWatcher } from "./feed/watcher.ts";
 import { emitEvent } from "./feed/events.ts";
 import { serveContent } from "./content/handler.ts";
-import { verifyPayment, verifyL402, build402Response } from "./payment/payment.ts";
+import { verifyPayment, verifyL402, build402Response, startNonceSweep, verifyX402WithOracle, lookupNonce, consumeNonce } from "./payment/payment.ts";
 import {
   validateToken,
   handleAuthRequest,
+  issueToken,
   tokenStore,
 } from "./auth/auth.ts";
 
@@ -68,6 +69,9 @@ emitEvent(
 // ---------------------------------------------------------------------------
 
 tokenStore.startSweep();
+
+// Nonce store sweep (x402 oracle handshake)
+startNonceSweep();
 
 // ---------------------------------------------------------------------------
 // Request size limit
@@ -182,6 +186,123 @@ async function handleRequest(req: Request): Promise<Response> {
     return toResponse(result);
   }
 
+  // ── 3.5 Pay endpoint ──────────────────────────────────────────────────────
+  if (method === "POST" && urlPath === "/mdf/pay") {
+    try {
+      const body = await readBody(req);
+      if (body === null) {
+        logRequest(method, urlPath, 413, Date.now() - start);
+        return jsonError(413, "Request body too large");
+      }
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        logRequest(method, urlPath, 400, Date.now() - start);
+        return jsonError(400, "Invalid JSON body");
+      }
+
+      const requiredFields = ["tx_hash", "chain_id", "amount", "currency", "resource_uri", "session_nonce"] as const;
+      for (const f of requiredFields) {
+        const v = parsed[f];
+        if (typeof v !== "string" || v.trim().length === 0) {
+          logRequest(method, urlPath, 400, Date.now() - start);
+          return jsonError(400, `Missing or invalid field: ${f}`);
+        }
+      }
+
+      const txHash = parsed.tx_hash as string;
+      const chainId = parsed.chain_id as string;
+      const amount = parsed.amount as string;
+      const currency = parsed.currency as string;
+      const resourceUri = parsed.resource_uri as string;
+      const sessionNonce = parsed.session_nonce as string;
+
+      const nonceRecord = lookupNonce(sessionNonce);
+      if (!nonceRecord) {
+        consumeNonce(sessionNonce);
+        logRequest(method, urlPath, 400, Date.now() - start);
+        return jsonError(400, "Unknown or expired session_nonce");
+      }
+
+      if (Date.now() > nonceRecord.expires_at) {
+        consumeNonce(sessionNonce);
+        logRequest(method, urlPath, 400, Date.now() - start);
+        return jsonError(400, "Session nonce expired");
+      }
+
+      let bodyPath: string;
+      try {
+        bodyPath = new URL(resourceUri).pathname;
+      } catch {
+        bodyPath = resourceUri;
+      }
+      if (nonceRecord.resource_uri !== bodyPath) {
+        consumeNonce(sessionNonce);
+        logRequest(method, urlPath, 400, Date.now() - start);
+        return jsonError(400, "Session nonce bound to different resource");
+      }
+
+      consumeNonce(sessionNonce);
+
+      if (!loaded.oracleConfig) {
+        logRequest(method, urlPath, 500, Date.now() - start);
+        return jsonError(500, "Oracle not configured");
+      }
+
+      const oracleResult = await verifyX402WithOracle(
+        {
+          tx_hash: txHash,
+          chain_id: chainId,
+          amount,
+          currency,
+          resource_uri: resourceUri,
+          session_nonce: sessionNonce,
+        },
+        loaded.oracleConfig
+      );
+
+      if (!oracleResult.verified) {
+        logRequest(method, urlPath, 402, Date.now() - start, { reason: oracleResult.reason });
+        return new Response(JSON.stringify({
+          error: "Payment verification failed",
+          reason: oracleResult.reason ?? "verification failed",
+        }), {
+          status: 402,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        });
+      }
+
+      const pathFromUri = bodyPath;
+      const tokenResult = issueToken(
+        pathFromUri,
+        oracleResult.payer ?? txHash,
+        txHash,
+        loaded
+      );
+
+      if (!tokenResult.ok) {
+        logRequest(method, urlPath, 500, Date.now() - start, { reason: tokenResult.reason });
+        return jsonError(500, "Token issuance failed");
+      }
+
+      logRequest(method, urlPath, 200, Date.now() - start);
+      return new Response(JSON.stringify({
+        token: tokenResult.token,
+        expires_at: new Date(tokenResult.expiresAt).toISOString(),
+        ttl_seconds: tokenResult.ttlSeconds,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      });
+    } catch (err) {
+      console.error(`[mdf:pay] unexpected error: ${(err as Error).message}`);
+      logRequest(method, urlPath, 500, Date.now() - start);
+      return jsonError(500, "Internal error");
+    }
+  }
+
   // ── Content methods only beyond this point ────────────────────────────────
   if (method !== "GET" && method !== "HEAD") {
     logRequest(method, urlPath, 405, Date.now() - start);
@@ -204,7 +325,7 @@ async function handleRequest(req: Request): Promise<Response> {
     }
   } else {
     // x402: agent submitting EVM payment proof, or no proof at all
-    const paymentResult = verifyPayment(urlPath, paymentHeader, loaded);
+    const paymentResult = await verifyPayment(urlPath, paymentHeader, loaded);
 
     if (paymentResult.requiresToken) {
       const tokenResult = validateToken(authHeader, urlPath);
