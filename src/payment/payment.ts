@@ -1,7 +1,9 @@
 import { createHash, createHmac, timingSafeEqual, randomBytes, randomUUID } from "crypto";
+import { statSync } from "fs";
 import { verify, Signature } from "@noble/secp256k1";
 import type { LoadedConfig } from "../config/loader.ts";
 import type { OracleConfig } from "../config/schema.ts";
+import { resolveContentPath } from "../content/handler.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1373,9 +1375,23 @@ export async function build402Response(
     sessionNonce = nonce;
   }
 
+  // source_bytes — stat the content file serveContent would resolve for this
+  // urlPath (the markdown source file's size). A 402 can be reached for a URL
+  // with no content file, so omit the field rather than erroring.
+  let sourceBytes: number | undefined;
+  const contentFilePath = resolveContentPath(urlPath, loaded.contentDir);
+  if (contentFilePath) {
+    try {
+      sourceBytes = statSync(contentFilePath).size;
+    } catch {
+      sourceBytes = undefined;
+    }
+  }
+
   const body = JSON.stringify({
     error: "Payment Required",
     reason: result.reason,
+    ...(sourceBytes !== undefined ? { source_bytes: sourceBytes } : {}),
     payment: {
       endpoint: config.payment?.endpoint
         ? resolveEndpoint(config.payment.endpoint, config.site.url)

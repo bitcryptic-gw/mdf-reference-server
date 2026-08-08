@@ -28,7 +28,7 @@ export interface ServeResult {
  * Returns null if the path resolves outside contentDir (traversal attempt)
  * or if no matching file exists.
  */
-function resolveContentPath(
+export function resolveContentPath(
   urlPath: string,
   contentDir: string
 ): string | null {
@@ -150,6 +150,7 @@ function computeEtag(content: string): string {
 function mdfHeaders(
   urlPath: string,
   markdownContent: string,
+  sourceBytes: number,
   config: LoadedConfig["config"]
 ): Record<string, string> {
   const price = priceForPath(urlPath, config);
@@ -158,6 +159,7 @@ function mdfHeaders(
   const headers: Record<string, string> = {
     "X-MDF-Version": "1",
     "X-MDF-Tokens": String(tokens),
+    "X-MDF-Source-Bytes": String(sourceBytes),
   };
 
   if (parseFloat(price.amount) > 0 && price.currency) {
@@ -247,13 +249,11 @@ export function serveContent(
   // If frontmatter is enabled in config, include it in the markdown response;
   // strip it for HTML (it's already parsed).
   const markdownForResponse = config.content.frontmatter ? rawContent : markdownBody;
-  const mdfHdrs = mdfHeaders(urlPath, markdownBody, config);
 
   const baseHeaders: Record<string, string> = {
     ETag: etag,
     "Cache-Control": "no-cache",
     "Last-Modified": new Date(statSync(filePath).mtimeMs).toUTCString(),
-    ...mdfHdrs,
   };
 
   if (wantsMarkdown) {
@@ -261,6 +261,7 @@ export function serveContent(
       status: 200,
       headers: {
         ...baseHeaders,
+        ...mdfHeaders(urlPath, markdownBody, Buffer.byteLength(markdownForResponse, "utf8"), config),
         "Content-Type": "text/markdown; charset=utf-8",
       },
       body: markdownForResponse,
@@ -275,6 +276,7 @@ export function serveContent(
     status: 200,
     headers: {
       ...baseHeaders,
+      ...mdfHeaders(urlPath, markdownBody, Buffer.byteLength(html, "utf8"), config),
       "Content-Type": "text/html; charset=utf-8",
     },
     body: html,
