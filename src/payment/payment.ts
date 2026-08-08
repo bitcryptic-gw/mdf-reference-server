@@ -1118,7 +1118,8 @@ export async function verifyPayment(
 ): Promise<VerificationResult> {
   const { config, oracleConfig } = loaded;
   const requiresToken = pathRequiresToken(urlPath, config);
-  const required      = requiredPrice(urlPath, config);
+  const priceEntry    = requiredPriceEntry(urlPath, config);
+  const required      = priceEntry.amount;
 
   // Free content
   if (parseFloat(required) === 0) {
