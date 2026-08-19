@@ -10,6 +10,7 @@
  *   5. Content    — serve markdown or HTML
  */
 
+import { accessSync, constants } from "fs";
 import { loadConfig } from "./config/loader.ts";
 import { serveDiscovery } from "./discovery/discovery.ts";
 import { serveFeed } from "./feed/handler.ts";
@@ -139,6 +140,48 @@ function toResponse(result: {
 }
 
 // ---------------------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------------------
+
+/**
+ * Liveness + readiness probe for Caddy health checks.
+ *
+ * Verifies the two filesystem dependencies the app actually reads/writes at
+ * runtime: the content directory (read per-request) and the data directory
+ * (feed-event log). Config and secrets are startup-time only — if they were
+ * broken the process would not be running, so they are not checked here.
+ *
+ * External payment deps (Alby Hub for L402, Acurast oracle for x402) are
+ * deliberately NOT checked: they are only touched on the payment paths, and
+ * their outage should not take a healthy content-serving instance out of the
+ * Caddy pool.
+ *
+ * Cheap by design — access checks only, no writes, no network I/O — since
+ * Caddy polls this frequently.
+ */
+function isHealthy(): boolean {
+  try {
+    accessSync(loaded.contentDir, constants.R_OK);
+    accessSync(process.env.MDF_DATA_DIR ?? "/app/data", constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function healthResponse(): Response {
+  const ok = isHealthy();
+  const body = ok ? "OK" : "UNAVAILABLE";
+  return new Response(body, {
+    status: ok ? 200 : 503,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main request handler
 // ---------------------------------------------------------------------------
 
@@ -147,6 +190,13 @@ async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const urlPath = url.pathname;
   const method = req.method;
+
+  // ── 0. Health check ────────────────────────────────────────────────────────
+  if (urlPath === "/health") {
+    const res = healthResponse();
+    logRequest(method, urlPath, res.status, Date.now() - start);
+    return res;
+  }
 
   // ── 1. Discovery ──────────────────────────────────────────────────────────
   if (method === "GET" || method === "HEAD") {
