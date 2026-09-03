@@ -6,7 +6,8 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch src/index.ts",
-    "test:config": "bun run src/config/loader.test.ts"
+    "test:config": "bun run src/config/loader.test.ts",
+    "test:402": "bun run src/payment/402-schema.test.ts"
   },
   "dependencies": {
     "@noble/secp256k1": "^2.2.3",
@@ -17,6 +18,8 @@
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "bun-types": "latest"
   }
 }
