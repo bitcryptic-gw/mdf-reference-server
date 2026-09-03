@@ -191,6 +191,11 @@ async function handleRequest(req: Request): Promise<Response> {
   const urlPath = url.pathname;
   const method = req.method;
 
+  // Absolute URL of the resource being requested, query string included.
+  // The 402 body carries this so a consumer can reconstruct the priced
+  // resource out of band (queued, retried, logged, passed between processes).
+  const resourceUri = `${loaded.config.site.url.replace(/\/$/, "")}${url.pathname}${url.search}`;
+
   // ── 0. Health check ────────────────────────────────────────────────────────
   if (urlPath === "/health") {
     const res = healthResponse();
@@ -369,7 +374,7 @@ async function handleRequest(req: Request): Promise<Response> {
     // L402: agent submitting a Lightning preimage proof
     const l402Result = await verifyL402(urlPath, authHeader, loaded);
     if (l402Result.status !== "approved" && l402Result.status !== "stub_approved") {
-      const response402 = await build402Response(urlPath, l402Result, loaded);
+      const response402 = await build402Response(urlPath, l402Result, loaded, resourceUri);
       logRequest(method, urlPath, 402, Date.now() - start, { reason: l402Result.reason });
       return toResponse(response402);
     }
@@ -380,7 +385,7 @@ async function handleRequest(req: Request): Promise<Response> {
     if (paymentResult.requiresToken) {
       const tokenResult = validateToken(authHeader, urlPath);
       if (!tokenResult.ok) {
-        const response402 = await build402Response(urlPath, paymentResult, loaded);
+        const response402 = await build402Response(urlPath, paymentResult, loaded, resourceUri);
         logRequest(method, urlPath, 402, Date.now() - start, {
           reason: tokenResult.reason,
           requiresToken: true,
@@ -391,7 +396,7 @@ async function handleRequest(req: Request): Promise<Response> {
       paymentResult.status === "no_proof" ||
       paymentResult.status === "rejected"
     ) {
-      const response402 = await build402Response(urlPath, paymentResult, loaded);
+      const response402 = await build402Response(urlPath, paymentResult, loaded, resourceUri);
       logRequest(method, urlPath, 402, Date.now() - start, {
         reason: paymentResult.reason,
       });

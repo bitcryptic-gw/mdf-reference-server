@@ -1103,6 +1103,22 @@ function isLightningChain(chain: string | null | undefined): boolean {
 }
 
 /**
+ * Map a settlement network to the payment rail that would handle it.
+ *
+ * This mirrors the branch that selects the verifier: `lightning` is served by
+ * the L402 flow (invoice + macaroon), while chains in CHAIN_ID_MAP (base,
+ * ethereum) are served by the x402 flow. Any chain with no known rail returns
+ * null so the caller can omit the field rather than assert a mapping that may
+ * not hold.
+ */
+function railForChain(chain: string | null | undefined): "x402" | "l402" | null {
+  const c = chain?.toLowerCase();
+  if (c === "lightning") return "l402";
+  if (c && CHAIN_ID_MAP[c]) return "x402";
+  return null;
+}
+
+/**
  * Verify an x402 payment proof for a given request.
  *
  * When the oracle is configured and the chain is non-lightning:
@@ -1340,7 +1356,8 @@ export async function verifyPayment(
 export async function build402Response(
   urlPath: string,
   result: VerificationResult,
-  loaded: LoadedConfig
+  loaded: LoadedConfig,
+  resourceUrl?: string
 ): Promise<{ status: 402; headers: Record<string, string>; body: string }> {
   const { config } = loaded;
   const price = requiredPrice(urlPath, config);
@@ -1361,20 +1378,35 @@ export async function build402Response(
 
   const priceEntry = requiredPriceEntry(urlPath, config);
 
-  // Generate session nonce for x402 (non-lightning) paths
+  // Absolute URL of the priced resource, reconstructed from the request. The
+  // caller passes the full URL (query string included) where available; the
+  // fallback covers path-only callers.
+  const resource =
+    resourceUrl ?? `${config.site.url.replace(/\/$/, "")}${urlPath}`;
+
+  // Generate session nonce for x402 (non-lightning) paths. expires_at is
+  // derived from the same expiry the nonce is bound to, so an offer and its
+  // nonce can never disagree about the validity window.
   let sessionNonce: string | undefined;
+  let offerExpiresAt: string | undefined;
   if (!isLightningChain(priceEntry.chain)) {
     const nonce = randomUUID();
     const nonceTtlSeconds = config.lightning?.invoice_expiry_seconds ?? 3600;
+    const nonceExpiryMs = Date.now() + nonceTtlSeconds * 1000;
     nonceStore.set(nonce, {
       resource_uri: urlPath,
       amount: priceEntry.amount,
       currency: priceEntry.currency ?? config.pricing.default.currency ?? "USDC",
       chain_id: x402ChainId(priceEntry.chain) ?? "8453",
-      expires_at: Date.now() + nonceTtlSeconds * 1000,
+      expires_at: nonceExpiryMs,
     });
     sessionNonce = nonce;
+    offerExpiresAt = new Date(nonceExpiryMs).toISOString();
   }
+
+  // The rail for this offer, derived from the same chain->rail mapping that
+  // selects the verifier at payment time.
+  const offerRail = railForChain(priceEntry.chain);
 
   // source_bytes — stat the content file serveContent would resolve for this
   // urlPath (the markdown source file's size). A 402 can be reached for a URL
@@ -1392,6 +1424,7 @@ export async function build402Response(
   const body = JSON.stringify({
     error: "Payment Required",
     reason: result.reason,
+    resource,
     ...(sourceBytes !== undefined ? { source_bytes: sourceBytes } : {}),
     payment: {
       endpoint: config.payment?.endpoint
@@ -1400,9 +1433,11 @@ export async function build402Response(
       amount: priceEntry.amount,
       currency: priceEntry.currency ?? config.pricing.default.currency,
       chain: priceEntry.chain ?? null,
+      ...(offerRail ? { rail: offerRail } : {}),
       accepted_chains: config.payment?.accepted_chains ?? [],
       accepted_currencies: config.payment?.accepted_currencies ?? [],
       ...(sessionNonce ? { session_nonce: sessionNonce } : {}),
+      ...(offerExpiresAt ? { expires_at: offerExpiresAt } : {}),
       ...(l402Challenge ? { lightning_invoice: headers["WWW-Authenticate"] } : {}),
     },
     ...(result.requiresToken && config.auth
