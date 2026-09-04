@@ -3,6 +3,7 @@
  * Run with: bun run src/content/handler.test.ts
  */
 
+import { join } from "path";
 import { parseAccept, prefersMarkdown } from "./accept.ts";
 import { serveContent } from "./handler.ts";
 import type { LoadedConfig } from "../config/loader.ts";
@@ -39,7 +40,9 @@ function assertEquals(actual: unknown, expected: unknown, msg: string) {
 // Fixture
 // ---------------------------------------------------------------------------
 
-const CONTENT_DIR = "/home/claude/mdf-server/content";
+// Resolve the repo's content/ directory relative to this file, so the suite
+// works from a clean checkout on any machine (src/content/ -> repo root).
+const CONTENT_DIR = join(import.meta.dir, "..", "..", "content");
 
 function makeLoaded(overrides: Partial<LoadedConfig["config"]["pricing"]> = {}): LoadedConfig {
   return {
