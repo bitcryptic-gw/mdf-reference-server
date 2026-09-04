@@ -209,7 +209,7 @@ async function handleRequest(req: Request): Promise<Response> {
     if (discovery) {
       logRequest(method, urlPath, discovery.status, Date.now() - start);
       const res = toResponse(discovery);
-      return method === "HEAD" ? new Response(null, { status: res.status, headers: res.headers }) : res;
+      return res;
     }
   }
 
@@ -219,7 +219,7 @@ async function handleRequest(req: Request): Promise<Response> {
     if (feed) {
       logRequest(method, urlPath, feed.status, Date.now() - start);
       const res = toResponse(feed);
-      return method === "HEAD" ? new Response(null, { status: res.status, headers: res.headers }) : res;
+      return res;
     }
   }
 
@@ -412,7 +412,7 @@ async function handleRequest(req: Request): Promise<Response> {
   });
 
   const res = toResponse(content);
-  return method === "HEAD" ? new Response(null, { status: res.status, headers: res.headers }) : res;
+  return res;
 }
 
 // ---------------------------------------------------------------------------
