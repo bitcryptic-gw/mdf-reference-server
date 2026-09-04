@@ -193,12 +193,6 @@ test("emits X-MDF-Version header", () => {
   assertEquals(result.headers["X-MDF-Version"], "1", "X-MDF-Version");
 });
 
-test("emits X-MDF-Tokens header with positive integer", () => {
-  const result = serveContent("/docs/getting-started", "text/markdown", null, loaded);
-  const tokens = parseInt(result.headers["X-MDF-Tokens"], 10);
-  assert(tokens > 0, `tokens should be positive, got ${tokens}`);
-});
-
 test("emits X-MDF-Price and X-MDF-Currency for paid content", () => {
   const result = serveContent("/premium/deep-dive", "text/markdown", null, loaded);
   assertEquals(result.headers["X-MDF-Price"], "1.0000", "price");

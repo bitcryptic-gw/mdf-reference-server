@@ -4,7 +4,6 @@ import { createHash } from "crypto";
 import { marked } from "marked";
 import matter from "gray-matter";
 import { prefersMarkdown } from "./accept.ts";
-import { estimateTokens } from "./tokens.ts";
 import type { LoadedConfig } from "../config/loader.ts";
 
 // ---------------------------------------------------------------------------
@@ -149,16 +148,13 @@ function computeEtag(content: string): string {
 
 function mdfHeaders(
   urlPath: string,
-  markdownContent: string,
   sourceBytes: number,
   config: LoadedConfig["config"]
 ): Record<string, string> {
   const price = priceForPath(urlPath, config);
-  const tokens = estimateTokens(markdownContent);
 
   const headers: Record<string, string> = {
     "X-MDF-Version": "1",
-    "X-MDF-Tokens": String(tokens),
     "X-MDF-Source-Bytes": String(sourceBytes),
   };
 
@@ -261,7 +257,7 @@ export function serveContent(
       status: 200,
       headers: {
         ...baseHeaders,
-        ...mdfHeaders(urlPath, markdownBody, Buffer.byteLength(markdownForResponse, "utf8"), config),
+        ...mdfHeaders(urlPath, Buffer.byteLength(markdownForResponse, "utf8"), config),
         "Content-Type": "text/markdown; charset=utf-8",
       },
       body: markdownForResponse,
@@ -276,7 +272,7 @@ export function serveContent(
     status: 200,
     headers: {
       ...baseHeaders,
-      ...mdfHeaders(urlPath, markdownBody, Buffer.byteLength(html, "utf8"), config),
+      ...mdfHeaders(urlPath, Buffer.byteLength(html, "utf8"), config),
       "Content-Type": "text/html; charset=utf-8",
     },
     body: html,

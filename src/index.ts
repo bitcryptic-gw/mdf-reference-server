@@ -408,7 +408,6 @@ async function handleRequest(req: Request): Promise<Response> {
   const content = serveContent(urlPath, acceptHeader, ifNoneMatch, loaded);
   logRequest(method, urlPath, content.status, Date.now() - start, {
     contentType: content.headers["Content-Type"]?.split(";")[0],
-    tokens: content.headers["X-MDF-Tokens"],
   });
 
   const res = toResponse(content);
