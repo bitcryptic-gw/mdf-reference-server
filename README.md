@@ -142,13 +142,13 @@ bun install
 bun run src/index.ts
 ```
 
-Run the smoke tests:
+Run the smoke walk-through:
 
 ```bash
 bash smoke-test.sh
 ```
 
-36 tests across content negotiation, discovery, payment stubs, and auth — all passing.
+`smoke-test.sh` is a manual smoke walk-through, not an assertion suite with a pass/fail result. It starts the server on :3000 (dashboard on :3001) and prints the response for each step: discovery (`/mdf.json`, `/llms.txt`), markdown/HTML negotiation on `/`, response headers on a free content page, the priced and auth flows (402 without payment, a stub x402 payment via `X-Payment`, bearer-token issuance through `POST /mdf/auth` and its use on `/private/internals`), a conditional 304 GET, the dashboard `/health`, and a 404. There is no count and no expected output to compare against — read its output to judge whether each step behaved. The real regression checks are the unit suites in `package.json` (`test:402`) and `src/content/handler.test.ts`, which report their own pass/fail counts.
 
 ---
 
