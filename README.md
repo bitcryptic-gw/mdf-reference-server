@@ -2,11 +2,11 @@
 
 Reference implementation of the [MDF (Markdown First)](https://github.com/bitcryptic-gw/mdf) spec.
 
-A self-hostable server that serves markdown natively to AI agents via HTTP content negotiation, with structured discovery, payment-gated content tiers, and bearer token auth. Built with Bun, configured via a single YAML file, runs as a non-root Docker container.
+A self-hostable server that serves markdown natively to AI agents via HTTP content negotiation, with structured discovery, payment-gated content tiers, and bearer token auth. Built with Bun, configured via a single YAML file. The container runs as root only long enough for the Tailscale-in-container hook; the application itself runs as an unprivileged user (su-exec drops from root to `bun:bun`).
 
 **Live demo:** https://mdf-demo.bitcryptic.com  
 **Spec:** https://github.com/bitcryptic-gw/mdf  
-**Status:** v0.1.0-draft — payment verification is stubbed; see [open milestones](#status)
+**Status:** v0.1.5 — L402 (Lightning) payment verification is live and settles real invoices; x402 (EVM) payment verification remains stubbed; see [open milestones](#status)
 
 ![mdf-server dashboard](docs/dashboard.png)
 
@@ -50,15 +50,21 @@ curl -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/docs/getting-sta
 # Paid content — returns 402 with payment instructions
 curl -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/premium/deep-dive
 
+# Micropayment tier over Lightning — returns 402 with an L402 invoice
+curl -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/micropayment/intro
+
 # Private content — returns 402 with auth endpoint hint
 curl https://mdf-demo.bitcryptic.com/private/internals
+
+# Atom feed with mdf:change_type metadata
+curl https://mdf-demo.bitcryptic.com/feed.xml
 ```
 
 ---
 
 ## Configuration
 
-All server configuration lives in `mdf.yaml`. The wallet address is never in config — it is read from `/run/secrets/wallet_address` at startup (file-mounted via Docker, not an env var).
+All server configuration lives in `mdf.yaml`. Secrets are resolved at startup in precedence order — from `/run/secrets/<name>` files, then `MDF_*` environment variables, then any value in `mdf.yaml`. In the provided Compose setup the wallet address is mounted as `/run/secrets/wallet_address` (a file, never an env var); the Alby and Lightning-token secrets are mounted the same way. A non-zero price with no resolvable wallet, or a configured Lightning block with no token secrets, aborts startup with a descriptive error.
 
 ```yaml
 site:
@@ -108,7 +114,7 @@ Sites advertise accepted rails via `payment.accepted_chains` in `/mdf.json`.
 
 ## Reverse proxy
 
-A Caddy snippet is included at `caddy/Caddyfile`. Point your reverse proxy at port 3030.
+A Caddy snippet is included at `caddy/Caddyfile`. Point your reverse proxy at port 3030. The server exposes `/health` (200 when the content and data directories are accessible, 503 otherwise) for load-balancer health checks; since 0.1.5 the image's own Docker `HEALTHCHECK` probes it.
 
 ---
 
