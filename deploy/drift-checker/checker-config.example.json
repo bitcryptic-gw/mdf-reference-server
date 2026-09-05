@@ -1,0 +1,11 @@
+{
+  "host_label": "unraid-syd",
+  "public_manifest_url": "http://mdf-manifest-public.pygmy-bramble.ts.net/manifest.json",
+  "syd_manifest_path": "/syd/manifest.json",
+  "repo_url": "https://github.com/bitcryptic-gw/mdf-reference-server",
+  "interval_s": 300,
+  "stale_grace_s": 150,
+  "alarm_after": 2,
+  "hold_ttl_s": 3600,
+  "state_dir": "/state"
+}

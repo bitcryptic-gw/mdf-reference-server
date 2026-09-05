@@ -1,0 +1,21 @@
+# mdf-drift-checker — compares public+syd manifests and a fresh repo clone.
+#
+# Runs on unraid-syd. Entrypoint serves verdict.json on :8080 for Kuma; the
+# actual check is triggered by a host user.scripts wrapper via
+# `docker exec mdf-drift-checker python3 /opt/mdf-drift/run-check.py`.
+#
+# Least privilege: outbound HTTPS to GitHub + one HTTP GET to
+# mdf-manifest-public + local reads. No secrets in env.
+FROM alpine:3.20
+
+RUN apk add --no-cache python3 git curl ca-certificates bash openssl
+
+WORKDIR /opt/mdf-drift
+COPY manifest.sh run-check.py serve.py /opt/mdf-drift/
+RUN chmod +x /opt/mdf-drift/manifest.sh
+
+ENV STATE_DIR=/state
+ENV PORT=8080
+EXPOSE 8080
+
+ENTRYPOINT ["python3", "/opt/mdf-drift/serve.py"]
