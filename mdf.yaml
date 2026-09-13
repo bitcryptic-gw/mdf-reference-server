@@ -34,10 +34,15 @@ pricing:
       amount: "100.00"
       currency: USDC
       chain: base
+    # Base Sepolia testnet tier — exercises x402 end-to-end with testnet funds.
+    /testnet/**:
+      amount: "0.0010"
+      currency: USDC
+      chain: base_sepolia
 
 payment:
   endpoint: /mdf/pay
-  accepted_chains: [base, ethereum, lightning]
+  accepted_chains: [base, base_sepolia, ethereum, lightning]
   accepted_currencies: [USDC, USDT, BTC]
   # wallet: set via /run/secrets/wallet_address or MDF_WALLET env var
 
@@ -72,10 +77,21 @@ lightning:
   api_token: "placeholder-value-replaced-by-secret-at-runtime"
   token_secret: "placeholder-value-replaced-by-secret-at-runtime-xx"
 
-oracle:
-  ws_endpoints:
-    - "wss://ws-1.ws-server-1.acurast.com"
-    - "wss://ws-1.ws-server-2.acurast.com"
-  pubkey: []                        # operator fills in
-  timeout_ms: 20000
-  max_verdict_age_seconds: 300
+# x402 facilitator — any service exposing the standard /verify and /settle
+# endpoints. MDF delegates all x402 verification and settlement to it.
+facilitator:
+  url: https://x402.bitcryptic.com
+  scheme: exact
+  max_timeout_seconds: 300
+  timeout_ms: 15000
+  chains:
+    base:
+      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (Base)
+      decimals: 6
+      extra: { name: "USD Coin", version: "2" }
+      rpc_url: "https://mainnet.base.org"
+    base_sepolia:
+      asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"   # USDC (Base Sepolia)
+      decimals: 6
+      extra: { name: "USDC", version: "2" }
+      rpc_url: "https://sepolia.base.org"

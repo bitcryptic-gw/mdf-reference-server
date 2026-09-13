@@ -104,22 +104,37 @@ const LightningSchema = z.object({
   token_secret: z.string().min(32),
 });
 
-export const OracleSchema = z.object({
-  ws_endpoints: z.array(z.string().url()).min(1),
-  pubkey: z.union([
-    z.string().refine(
-      (v) => v === "" || /^0x[0-9a-fA-F]{66}$/.test(v),
-      "oracle pubkey must be empty string or 0x-prefixed 33-byte compressed secp256k1 hex"
-    ),
-    z.array(
-      z.string().regex(
-        /^0x[0-9a-fA-F]{66}$/,
-        "oracle pubkey must be 0x-prefixed 33-byte compressed secp256k1 hex"
-      )
-    ),
-  ]),
-  timeout_ms: z.number().int().min(5000).max(60000).default(20000),
-  max_verdict_age_seconds: z.number().int().min(60).max(3600).default(300),
+/**
+ * Per-chain data needed to build standard x402 `PaymentRequirements` and to
+ * confirm settlement on-chain independently of the facilitator's report.
+ */
+export const FacilitatorChainSchema = z.object({
+  /** ERC-20 token contract address for this chain, e.g. USDC. */
+  asset: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/, "must be a 0x-prefixed 20-byte EVM address"),
+  /** Token decimals, used to convert MDF amounts to atomic units. */
+  decimals: z.number().int().min(0).max(36).default(6),
+  /** Scheme-specific extra data passed through opaquely to the facilitator. */
+  extra: z.record(z.string(), z.unknown()).optional(),
+  /** JSON-RPC endpoint used for on-chain settlement confirmation. */
+  rpc_url: z.string().url().optional(),
+});
+
+export const FacilitatorSchema = z.object({
+  /** Base URL of a standard x402 facilitator exposing /verify and /settle. */
+  url: z
+    .string()
+    .url()
+    .refine((v) => v.startsWith("https://"), "must use https://"),
+  /** x402 scheme name (e.g. "exact"). */
+  scheme: z.string().min(1).default("exact"),
+  /** Offer validity window in seconds, shared by expires_at. */
+  max_timeout_seconds: z.number().int().min(1).max(86400).default(300),
+  /** Per-request HTTP timeout for facilitator calls. */
+  timeout_ms: z.number().int().min(1000).max(60000).default(15000),
+  /** Per-MDF-chain asset metadata, keyed by the MDF chain name. */
+  chains: z.record(z.string(), FacilitatorChainSchema).default({}),
 }).optional();
 
 export const MdfConfigSchema = z.object({
@@ -132,10 +147,11 @@ export const MdfConfigSchema = z.object({
   feed: FeedSchema.optional(),
   dashboard: DashboardSchema.default({}),
   lightning: LightningSchema.optional(),
-  oracle: OracleSchema,
+  facilitator: FacilitatorSchema,
 });
 
 export type MdfConfig = z.infer<typeof MdfConfigSchema>;
 export type PriceEntry = z.infer<typeof PriceEntry>;
 export type LightningConfig = z.infer<typeof LightningSchema>;
-export type OracleConfig = z.infer<typeof OracleSchema>;
+export type FacilitatorConfig = NonNullable<z.infer<typeof FacilitatorSchema>>;
+export type FacilitatorChainConfig = z.infer<typeof FacilitatorChainSchema>;

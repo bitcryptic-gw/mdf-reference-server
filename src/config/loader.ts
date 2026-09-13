@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "fs";
 import { resolve, isAbsolute } from "path";
 import yaml from "js-yaml";
-import { MdfConfigSchema, type MdfConfig, type OracleConfig } from "./schema.ts";
+import { MdfConfigSchema, type MdfConfig, type FacilitatorConfig } from "./schema.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -16,8 +16,8 @@ export interface LoadedConfig {
   contentDir: string;
   /** Wallet address — from config or secret */
   walletAddress: string | null;
-  /** Oracle config — resolved from config or secrets */
-  oracleConfig: OracleConfig | null;
+  /** Facilitator config — resolved from config, optional */
+  facilitatorConfig: FacilitatorConfig | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,10 +185,30 @@ function hasX402Price(config: MdfConfig): boolean {
  * Enforce startup preconditions that cannot be expressed in the Zod schema alone.
  * Throws with a descriptive message on any violation.
  */
+/**
+ * Non-lightning chains carrying a non-zero price. These are the chains for
+ * which the x402 rail is selected, and therefore the chains that need a
+ * facilitator asset entry.
+ */
+function x402ChainsUsed(config: MdfConfig): string[] {
+  const entries = [
+    config.pricing.default,
+    ...Object.values(config.pricing.sections ?? {}),
+  ];
+  const chains = new Set<string>();
+  for (const entry of entries) {
+    const chain = entry.chain?.toLowerCase();
+    if (parseFloat(entry.amount) > 0 && chain && chain !== "lightning") {
+      chains.add(chain);
+    }
+  }
+  return [...chains];
+}
+
 function validateStartupConstraints(
   config: MdfConfig,
   walletAddress: string | null,
-  oracleConfig: OracleConfig | null
+  facilitatorConfig: FacilitatorConfig | null
 ): void {
   const errors: string[] = [];
 
@@ -207,19 +227,21 @@ function validateStartupConstraints(
   }
 
   if (hasX402Price(config)) {
-    if (!oracleConfig) {
+    if (!facilitatorConfig) {
       errors.push(
-        "x402 pricing (non-lightning chain with amount > 0) detected but no [oracle] block is configured"
+        "x402 pricing (non-lightning chain with amount > 0) detected but no [facilitator] block is configured"
       );
     } else {
-      const pubkeyVal = oracleConfig.pubkey;
-      const isEmpty = Array.isArray(pubkeyVal)
-        ? pubkeyVal.length === 0
-        : !pubkeyVal || pubkeyVal.trim().length === 0;
-      if (isEmpty) {
-        errors.push(
-          "x402 pricing requires oracle.pubkey — set via /run/secrets/oracle_pubkey, MDF_ORACLE_PUBKEY env var, or oracle.pubkey in mdf.yaml"
-        );
+      for (const chain of x402ChainsUsed(config)) {
+        if (!facilitatorConfig.chains[chain]) {
+          errors.push(
+            `x402 pricing on chain '${chain}' requires facilitator.chains.${chain}.asset`
+          );
+        } else if (!facilitatorConfig.chains[chain].rpc_url) {
+          console.warn(
+            `[mdf:config] facilitator.chains.${chain} has no rpc_url — on-chain settlement confirmation on /settle errors is disabled for this chain`
+          );
+        }
       }
     }
   }
@@ -285,28 +307,10 @@ export function loadConfig(configPath = "./mdf.yaml"): LoadedConfig {
     config.payment?.wallet
   );
 
-  // Resolve oracle pubkey — secret takes priority over config value.
-  // Secret file / env var may contain newline-delimited keys for multiple pubkeys.
-  let oracleConfig: OracleConfig | null = null;
-  if (config.oracle) {
-    const secretRaw = resolveSecret(
-      "oracle_pubkey",
-      "MDF_ORACLE_PUBKEY",
-      undefined
-    );
-    let resolvedPubkey: string | string[] | undefined;
-    if (secretRaw) {
-      const lines = secretRaw
-        .split("\n")
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0);
-      resolvedPubkey = lines.length === 1 ? lines[0] : lines;
-    }
-    oracleConfig = {
-      ...config.oracle,
-      pubkey: resolvedPubkey ?? config.oracle.pubkey,
-    };
-  }
+  // Facilitator config is taken verbatim from mdf.yaml. Unlike the previous
+  // [oracle] block there is no signer pubkey to resolve — verification is
+  // delegated to a standard facilitator's /verify and /settle endpoints.
+  const facilitatorConfig: FacilitatorConfig | null = config.facilitator ?? null;
 
   // Resolve lightning secrets — only if lightning block is present in config
 if (config.lightning) {
@@ -329,7 +333,7 @@ if (config.lightning) {
 }
   
   // Startup constraint validation
-  validateStartupConstraints(config, walletAddress, oracleConfig);
+  validateStartupConstraints(config, walletAddress, facilitatorConfig);
 
   // Resolve content directory to absolute path
   const contentDir = isAbsolute(config.content.dir)
@@ -345,5 +349,5 @@ if (config.lightning) {
   const mdfJsonObj = buildMdfJson(config, walletAddress);
   const mdfJson = JSON.stringify(mdfJsonObj, null, 2);
 
-  return { config, mdfJson, contentDir, walletAddress, oracleConfig };
+  return { config, mdfJson, contentDir, walletAddress, facilitatorConfig };
 }

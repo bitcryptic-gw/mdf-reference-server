@@ -6,7 +6,7 @@ A self-hostable server that serves markdown natively to AI agents via HTTP conte
 
 **Live demo:** https://mdf-demo.bitcryptic.com  
 **Spec:** https://github.com/bitcryptic-gw/mdf  
-**Status:** v0.1.5 — L402 (Lightning) payment verification is live and settles real invoices; x402 (EVM) payment verification remains stubbed; see [open milestones](#status)
+**Status:** v0.2.0 — L402 (Lightning) and x402 (EVM) payment verification are both live. x402 verification and settlement are delegated to a standard x402 facilitator's `/verify` and `/settle` endpoints; see [open milestones](#status)
 
 ![mdf-server dashboard](docs/dashboard.png)
 
@@ -106,7 +106,9 @@ Two rails are implemented:
 
 **L402 (Bitcoin/Lightning)** — production-complete. Creates real Lightning invoices via Alby Hub, issues HMAC-bound macaroons, and verifies preimage submission against settled invoice records.
 
-**x402 (EVM/stablecoin)** — structural stub. Receipt shape is validated but on-chain settlement is not yet verified. See the [open issue](https://github.com/bitcryptic-gw/mdf/issues/3) for the x402 trust model discussion.
+**x402 (EVM/stablecoin)** — live. The 402 `payment` object is a strict superset of x402's `PaymentRequirements` (`pay_to`, `asset`, `scheme`, `max_timeout_seconds`, optional `extra` alongside MDF's own fields). Clients submit a standard base64 `PaymentPayload` in the `X-PAYMENT` header; the server builds `PaymentRequirements` from the offer it issued and calls a configured facilitator's `/verify` then `/settle`. Any x402-compliant facilitator is pluggable via the `[facilitator]` config block.
+
+On a `/settle` error the server's response is not treated as final: it confirms the EIP-3009 authorization on-chain (`authorizationState(from, nonce)`, or the tx receipt when a hash is returned) before concluding the payment failed, so a facilitator false-failure neither double-charges nor wrongly denies access.
 
 Sites advertise accepted rails via `payment.accepted_chains` in `/mdf.json`.
 
@@ -131,7 +133,7 @@ A Caddy snippet is included at `caddy/Caddyfile`. Point your reverse proxy at po
 | Dashboard | ✅ Complete |
 | L402 payment verification (Bitcoin/Lightning) | ✅ Complete |
 | Validator CLI | ✅ Complete |
-| x402 on-chain receipt verification | 🔲 Next milestone |
+| x402 payment verification + settlement (via facilitator `/verify` + `/settle`) | ✅ Complete |
 
 ---
 
@@ -148,7 +150,7 @@ Run the smoke walk-through:
 bash smoke-test.sh
 ```
 
-`smoke-test.sh` is a manual smoke walk-through, not an assertion suite with a pass/fail result. It starts the server on :3000 (dashboard on :3001) and prints the response for each step: discovery (`/mdf.json`, `/llms.txt`), markdown/HTML negotiation on `/`, response headers on a free content page, the priced and auth flows (402 without payment, a stub x402 payment via `X-Payment`, bearer-token issuance through `POST /mdf/auth` and its use on `/private/internals`), a conditional 304 GET, the dashboard `/health`, and a 404. There is no count and no expected output to compare against — read its output to judge whether each step behaved. The real regression checks are the unit suites in `package.json` (`test:402`) and `src/content/handler.test.ts`, which report their own pass/fail counts.
+`smoke-test.sh` is a manual smoke walk-through, not an assertion suite with a pass/fail result. It starts the server on :3000 (dashboard on :3001) and prints the response for each step: discovery (`/mdf.json`, `/llms.txt`), markdown/HTML negotiation on `/`, response headers on a free content page, the priced and auth flows (402 without payment, a malformed `X-PAYMENT` rejected with 402, bearer-token issuance through `POST /mdf/auth` and its use on `/private/internals`), a conditional 304 GET, the dashboard `/health`, and a 404. There is no count and no expected output to compare against — read its output to judge whether each step behaved. The real regression checks are the unit suites in `package.json` (`test:402`) and `src/content/handler.test.ts`, which report their own pass/fail counts.
 
 ---
 

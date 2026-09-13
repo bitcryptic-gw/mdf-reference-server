@@ -1,8 +1,7 @@
-import { createHash, createHmac, timingSafeEqual, randomBytes, randomUUID } from "crypto";
+import { createHash, createHmac, timingSafeEqual, randomBytes } from "crypto";
 import { statSync } from "fs";
-import { verify, Signature } from "@noble/secp256k1";
 import type { LoadedConfig } from "../config/loader.ts";
-import type { OracleConfig } from "../config/schema.ts";
+import type { FacilitatorConfig, FacilitatorChainConfig } from "../config/schema.ts";
 import { resolveContentPath } from "../content/handler.ts";
 
 // ---------------------------------------------------------------------------
@@ -10,26 +9,35 @@ import { resolveContentPath } from "../content/handler.ts";
 // ---------------------------------------------------------------------------
 
 /**
- * Parsed x402 payment proof extracted from request headers.
- * Structure follows the x402 draft spec — fields are advisory at stub stage.
+ * Parsed standard x402 (V1) payment payload, extracted from the X-PAYMENT
+ * header. This is the decoded envelope plus the EIP-3009 authorization the
+ * facilitator will act on.
  */
 export interface PaymentProof {
-  /** Raw X-Payment header value */
+  /** Raw X-PAYMENT header value (base64) */
   raw: string;
-  /** Chain identifier e.g. "base", "ethereum" */
-  chain?: string;
-  /** Currency symbol e.g. "USDC" */
-  currency?: string;
-  /** Payment amount as decimal string */
-  amount?: string;
-  /** Transaction hash or payment identifier */
-  txHash?: string;
-  /** Paying wallet address */
-  from?: string;
-  /** Oracle session nonce (issued in prior 402 response) */
-  nonce?: string;
-  /** Any additional fields present in the proof */
-  extra: Record<string, string>;
+  /** x402 protocol version (1) */
+  x402Version: number;
+  /** Payment scheme, e.g. "exact" */
+  scheme: string;
+  /** x402 network name, e.g. "base" or "base-sepolia" */
+  network: string;
+  /** Signer / payer address */
+  from: string;
+  /** Recipient address */
+  to: string;
+  /** Amount in atomic token units (decimal string) */
+  value: string;
+  /** Authorization validity start (unix seconds) */
+  validAfter: number;
+  /** Authorization validity end (unix seconds) */
+  validBefore: number;
+  /** 32-byte authorization nonce (0x hex) */
+  nonce: string;
+  /** EOA / EIP-1271 signature bytes (0x hex) */
+  signature: string;
+  /** Full decoded PaymentPayload envelope, forwarded verbatim to the facilitator. */
+  envelope: Record<string, unknown>;
 }
 
 /**
@@ -69,7 +77,8 @@ export type VerificationStatus =
   | "approved"      // proof accepted — serve content
   | "rejected"      // proof invalid — return 402
   | "stub_approved" // stub mode — structural validation only, no real verification
-  | "no_proof";     // no payment header present
+  | "no_proof"      // no payment header present
+  | "error";        // upstream dependency failure — not a payment denial
 
 export interface VerificationResult {
   status: VerificationStatus;
@@ -80,122 +89,8 @@ export interface VerificationResult {
   requiresToken: boolean;
   /** Rail that processed this result */
   rail: "x402" | "l402" | "none";
-}
-
-// ---------------------------------------------------------------------------
-// Session nonce store (x402 oracle handshake)
-// ---------------------------------------------------------------------------
-
-export interface NonceRecord {
-  resource_uri: string;
-  amount: string;
-  currency: string;
-  chain_id: string;
-  expires_at: number;
-}
-
-class NonceStore {
-  private store = new Map<string, NonceRecord>();
-  private sweepIntervalMs: number;
-  private sweepTimer: ReturnType<typeof setInterval> | null = null;
-
-  constructor(sweepIntervalMs = 60_000) {
-    this.sweepIntervalMs = sweepIntervalMs;
-  }
-
-  set(nonce: string, record: NonceRecord): void {
-    this.store.set(nonce, record);
-  }
-
-  get(nonce: string): NonceRecord | undefined {
-    return this.store.get(nonce);
-  }
-
-  delete(nonce: string): void {
-    this.store.delete(nonce);
-  }
-
-  sweep(): number {
-    const now = Date.now();
-    let removed = 0;
-    for (const [nonce, record] of this.store) {
-      if (record.expires_at <= now) {
-        this.store.delete(nonce);
-        removed++;
-      }
-    }
-    return removed;
-  }
-
-  startSweep(): void {
-    if (this.sweepTimer) return;
-    this.sweepTimer = setInterval(() => {
-      const removed = this.sweep();
-      if (removed > 0) {
-        console.log(`[mdf:payment:nonce] swept ${removed} expired nonce(s)`);
-      }
-    }, this.sweepIntervalMs);
-    if (typeof this.sweepTimer === "object" && "unref" in this.sweepTimer) {
-      (this.sweepTimer as NodeJS.Timeout).unref();
-    }
-  }
-
-  stopSweep(): void {
-    if (this.sweepTimer) {
-      clearInterval(this.sweepTimer);
-      this.sweepTimer = null;
-    }
-  }
-}
-
-const nonceStore = new NonceStore();
-
-export function startNonceSweep(): void {
-  nonceStore.startSweep();
-}
-
-export function lookupNonce(nonce: string): NonceRecord | undefined {
-  return nonceStore.get(nonce);
-}
-
-export function consumeNonce(nonce: string): void {
-  nonceStore.delete(nonce);
-}
-
-// ---------------------------------------------------------------------------
-// Oracle types
-// ---------------------------------------------------------------------------
-
-interface OracleRequestParams {
-  tx_hash: string;
-  chain_id: string;
-  amount: string;
-  currency: string;
-  resource_uri: string;
-  session_nonce: string;
-}
-
-interface OracleVerdictPayload {
-  v: string;
-  verified: boolean;
-  tx_hash: string;
-  chain_id: string;
-  amount: string;
-  currency: string;
-  payer: string;
-  resource_uri: string;
-  session_nonce: string;
-  verified_at: number;
-  oracle_version: string;
-  rpc_consensus: string;
-  peer_consensus: string;
-  reason?: string;
-}
-
-interface OracleVerdict {
-  payload: OracleVerdictPayload;
-  signature: string;
-  public_key: string;
+  /** Settlement metadata, present when an x402 payment settled successfully */
+  settlement?: { payer: string; transaction: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -402,76 +297,101 @@ function parseL402Header(raw: string): L402Credential | null {
 // ---------------------------------------------------------------------------
 
 /**
- * Parse the X-Payment header value.
+ * Parse the standard x402 `X-PAYMENT` header: base64-encoded JSON of a V1
+ * `PaymentPayload`. Returns null if malformed or missing required fields.
  *
- * x402 uses a structured header. The draft spec allows both JSON and
- * a key=value format. We attempt JSON first, fall back to key=value pairs.
+ * Shape (x402 v1, exact scheme):
+ *   {
+ *     "x402Version": 1,
+ *     "scheme": "exact",
+ *     "network": "base-sepolia",
+ *     "payload": {
+ *       "signature": "0x…",
+ *       "authorization": {
+ *         "from": "0x…", "to": "0x…", "value": "100000",
+ *         "validAfter": "0", "validBefore": "9999999999",
+ *         "nonce": "0x…"
+ *       }
+ *     }
+ *   }
  */
-function parsePaymentHeader(raw: string): PaymentProof {
-  const proof: PaymentProof = { raw, extra: {} };
-
-  if (raw.trimStart().startsWith("{")) {
-    try {
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      proof.chain    = typeof parsed.chain    === "string" ? parsed.chain    : undefined;
-      proof.currency = typeof parsed.currency === "string" ? parsed.currency : undefined;
-      proof.amount   = typeof parsed.amount   === "string" ? parsed.amount   : undefined;
-      proof.txHash   = typeof parsed.txHash   === "string" ? parsed.txHash   : undefined;
-      proof.from     = typeof parsed.from     === "string" ? parsed.from     : undefined;
-      proof.nonce    = typeof parsed.nonce    === "string" ? parsed.nonce    : undefined;
-      for (const [k, v] of Object.entries(parsed)) {
-        if (!["chain", "currency", "amount", "txHash", "from", "nonce"].includes(k)) {
-          proof.extra[k] = String(v);
-        }
-      }
-      return proof;
-    } catch {
-      // Fall through to KV parsing
-    }
+function parseX402PaymentHeader(raw: string): PaymentProof | null {
+  let decoded: string;
+  try {
+    const normalized = raw.trim().replace(/-/g, "+").replace(/_/g, "/");
+    decoded = Buffer.from(normalized, "base64").toString("utf8");
+  } catch {
+    return null;
   }
 
-  for (const segment of raw.split(/[;&]/)) {
-    const eqIdx = segment.indexOf("=");
-    if (eqIdx === -1) continue;
-    const key   = segment.slice(0, eqIdx).trim().toLowerCase();
-    const value = segment.slice(eqIdx + 1).trim();
-    switch (key) {
-      case "chain":    proof.chain    = value; break;
-      case "currency": proof.currency = value; break;
-      case "amount":   proof.amount   = value; break;
-      case "txhash":   proof.txHash   = value; break;
-      case "from":     proof.from     = value; break;
-      default:         proof.extra[key] = value;
-    }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(decoded) as Record<string, unknown>;
+  } catch {
+    return null;
   }
 
-  return proof;
+  if (parsed.x402Version !== 1) return null;
+  if (typeof parsed.scheme !== "string" || typeof parsed.network !== "string") return null;
+
+  const payload = parsed.payload as Record<string, unknown> | undefined;
+  const auth = payload?.authorization as Record<string, unknown> | undefined;
+  if (!payload || !auth) return null;
+
+  const signature = typeof payload.signature === "string" ? payload.signature : null;
+  const from      = typeof auth.from    === "string" ? auth.from    : null;
+  const to        = typeof auth.to      === "string" ? auth.to      : null;
+  const value     = typeof auth.value   === "string" ? auth.value   : null;
+  const nonce     = typeof auth.nonce   === "string" ? auth.nonce   : null;
+
+  if (!signature || !from || !to || !value || !nonce) return null;
+  if (auth.validAfter === undefined || auth.validBefore === undefined) return null;
+
+  const validAfter  = Number(auth.validAfter);
+  const validBefore = Number(auth.validBefore);
+  if (!Number.isFinite(validAfter) || !Number.isFinite(validBefore)) return null;
+
+  return {
+    raw,
+    x402Version: 1,
+    scheme: parsed.scheme,
+    network: parsed.network,
+    from,
+    to,
+    value,
+    validAfter,
+    validBefore,
+    nonce,
+    signature,
+    envelope: parsed,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Amount / chain / currency helpers
+// Amount helpers
 // ---------------------------------------------------------------------------
 
-function amountSufficient(declared: string | undefined, required: string): boolean {
-  if (!declared) return false;
-  const d = parseFloat(declared);
-  const r = parseFloat(required);
-  if (isNaN(d) || isNaN(r)) return false;
-  return d >= r;
-}
+/**
+ * Convert a human-readable decimal amount (e.g. "1.0000") to atomic token
+ * units for a token with `decimals` decimals (e.g. "1000000" for 6 decimals).
+ *
+ * Rounds up when the amount carries more precision than the token supports, so
+ * a price is never under-charged. String/BigInt arithmetic only — no floats.
+ */
+function toAtomicUnits(amount: string, decimals: number): string {
+  const [intPart = "0", fracPartRaw = ""] = amount.split(".");
+  const frac = fracPartRaw.replace(/[^0-9]/g, "");
+  const intDigits = intPart.replace(/[^0-9]/g, "") || "0";
 
-function chainAccepted(chain: string | undefined, config: LoadedConfig["config"]): boolean {
-  if (!chain || !config.payment?.accepted_chains) return false;
-  return config.payment.accepted_chains
-    .map((c) => c.toLowerCase())
-    .includes(chain.toLowerCase());
-}
+  if (frac.length <= decimals) {
+    return BigInt(intDigits + frac.padEnd(decimals, "0")).toString();
+  }
 
-function currencyAccepted(currency: string | undefined, config: LoadedConfig["config"]): boolean {
-  if (!currency || !config.payment?.accepted_currencies) return false;
-  return config.payment.accepted_currencies
-    .map((c) => c.toUpperCase())
-    .includes(currency.toUpperCase());
+  const keep = frac.slice(0, decimals);
+  const rest = frac.slice(decimals);
+  let units = BigInt(intDigits + keep);
+  if (/[1-9]/.test(rest)) units += 1n; // ceil — never under-charge
+  return units.toString();
 }
 
 // ---------------------------------------------------------------------------
@@ -554,10 +474,9 @@ function logX402(urlPath: string, proof: PaymentProof, result: VerificationStatu
     ts: new Date().toISOString(),
     path: urlPath,
     status: result,
-    chain: proof.chain,
-    currency: proof.currency,
-    amount: proof.amount,
-    txHash: proof.txHash,
+    network: proof.network,
+    value: proof.value,
+    nonce: proof.nonce ? `${proof.nonce.slice(0, 10)}…` : undefined,
     from: proof.from ? `${proof.from.slice(0, 6)}…${proof.from.slice(-4)}` : undefined,
   })}`);
 }
@@ -573,300 +492,247 @@ function logL402(urlPath: string, paymentHash: string, result: VerificationStatu
 }
 
 // ---------------------------------------------------------------------------
-// Oracle WebSocket client
+// x402 facilitator client
 // ---------------------------------------------------------------------------
+//
+// All x402 verification and settlement is delegated to a standard facilitator's
+// /verify and /settle endpoints. One base URL, one HTTP client — no client-side
+// failover logic (Caddy fronts the facilitator pool).
 
-const MAX_ORACLE_RESPONSE_BYTES = 64 * 1024; // 64 KB
+export interface FacilitatorChainInfo {
+  /** x402 network name for this MDF chain, e.g. "base-sepolia". */
+  network: string;
+  /** Numeric EVM chain id, e.g. "84532". */
+  chainId: string;
+  /** ERC-20 asset (token contract) address. */
+  asset: string;
+  /** Token decimals. */
+  decimals: number;
+  /** Scheme-specific extra data, passed through opaquely. */
+  extra?: Record<string, unknown>;
+  /** Optional JSON-RPC URL for independent settlement confirmation. */
+  rpcUrl?: string;
+}
 
-async function wsConnectAndRequest(
-  endpoint: string,
-  requestHex: string,
-  connectTimeoutMs: number,
-  requestTimeoutMs: number
-): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const ws = new WebSocket(endpoint);
-    let settled = false;
+function facilitatorUrl(base: string, path: string): string {
+  return `${base.replace(/\/+$/, "")}${path}`;
+}
 
-    const connectTimer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      ws.close();
-      reject(new Error(`oracle WS connect timeout after ${connectTimeoutMs}ms`));
-    }, connectTimeoutMs);
-
-    const requestTimer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      ws.close();
-      reject(new Error(`oracle WS request timeout after ${requestTimeoutMs}ms`));
-    }, requestTimeoutMs);
-
-    ws.onopen = () => {
-      clearTimeout(connectTimer);
-      ws.send(requestHex);
-    };
-
-    ws.onmessage = (event: MessageEvent) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(connectTimer);
-      clearTimeout(requestTimer);
-      ws.close();
-      const data = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer);
-      resolve(data);
-    };
-
-    ws.onerror = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(connectTimer);
-      clearTimeout(requestTimer);
-      try { ws.close(); } catch { /* ignore */ }
-      reject(new Error("oracle WS connection error"));
-    };
-
-    ws.onclose = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(connectTimer);
-      clearTimeout(requestTimer);
-      reject(new Error("oracle WS closed before response"));
-    };
+async function facilitatorPost(
+  config: FacilitatorConfig,
+  path: "/verify" | "/settle",
+  body: unknown
+): Promise<{ status: number; json: Record<string, unknown> | null; text: string }> {
+  const res = await fetch(facilitatorUrl(config.url, path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(config.timeout_ms),
   });
-}
-
-async function queryOracle(
-  params: OracleRequestParams,
-  config: OracleConfig
-): Promise<OracleVerdict> {
-  const requestBody = JSON.stringify({ params });
-  const requestHex = Buffer.from(requestBody, "utf8").toString("hex");
-
-  const overallDeadline = Date.now() + config.timeout_ms;
-  const errors: string[] = [];
-
-  for (const endpoint of config.ws_endpoints) {
-    const remaining = overallDeadline - Date.now();
-    if (remaining <= 0) {
-      throw new Error(`oracle request timed out before connecting`);
-    }
-
-    const connectTimeout = Math.min(5000, remaining);
-    const requestTimeout = remaining;
-
-    try {
-      const responseHex = await wsConnectAndRequest(
-        endpoint,
-        requestHex,
-        connectTimeout,
-        requestTimeout
-      );
-
-      if (responseHex.length > MAX_ORACLE_RESPONSE_BYTES) {
-        console.warn(`[mdf:payment:oracle] oversize response from ${endpoint}: ${responseHex.length} bytes`);
-        errors.push(`${endpoint}: response too large`);
-        continue;
-      }
-
-      const responseBytes = Buffer.from(responseHex, "hex");
-      const responseText = new TextDecoder().decode(responseBytes);
-      const verdict = JSON.parse(responseText) as OracleVerdict;
-
-      if (!verdict.payload || !verdict.signature || !verdict.public_key) {
-        console.warn(`[mdf:payment:oracle] malformed verdict from ${endpoint}: missing required fields`);
-        errors.push(`${endpoint}: malformed verdict`);
-        continue;
-      }
-
-      return verdict;
-    } catch (err) {
-      const msg = (err as Error).message;
-      errors.push(`${endpoint}: ${msg}`);
-      console.warn(`[mdf:payment:oracle] endpoint ${endpoint} failed: ${msg}`);
-    }
-  }
-
-  throw new Error(`all oracle endpoints failed: ${errors.join("; ")}`);
-}
-
-// ---------------------------------------------------------------------------
-// Oracle signature verification
-// ---------------------------------------------------------------------------
-
-function derToCompact(derHex: string): string | null {
+  const text = await res.text();
+  let json: Record<string, unknown> | null = null;
   try {
-    const der = Buffer.from(derHex.startsWith("0x") ? derHex.slice(2) : derHex, "hex");
-    if (der[0] !== 0x30) return null;
-    let pos = 2;
-    if (der[pos] === 0x02) {
-      const rLen = der[pos + 1];
-      const r = der.slice(pos + 2, pos + 2 + rLen);
-      pos += 2 + rLen;
-      if (der[pos] === 0x02) {
-        const sLen = der[pos + 1];
-        const s = der.slice(pos + 2, pos + 2 + sLen);
-        const compact = Buffer.concat([
-          Buffer.alloc(32 - r.length, 0),
-          r,
-          Buffer.alloc(32 - s.length, 0),
-          s,
-        ]);
-        return compact.toString("hex");
-      }
-    }
-    return null;
+    json = JSON.parse(text) as Record<string, unknown>;
   } catch {
-    return null;
+    json = null;
   }
+  return { status: res.status, json, text };
 }
 
-function normaliseSignature(raw: string): string {
-  let sig = raw.startsWith("0x") ? raw.slice(2) : raw;
-  // Strip recovery byte if present (65 bytes = 130 hex chars)
-  if (sig.length === 130) sig = sig.slice(0, 128);
-  // If DER-encoded, convert to compact
-  if (sig.length !== 128) {
-    const compact = derToCompact(sig);
-    if (compact) sig = compact;
+interface X402VerifyRequest {
+  x402Version: 1;
+  paymentPayload: unknown;
+  paymentRequirements: Record<string, unknown>;
+}
+
+interface VerifyOutcome {
+  ok: boolean;
+  payer?: string;
+  reason?: string;
+}
+
+async function facilitatorVerify(
+  request: X402VerifyRequest,
+  config: FacilitatorConfig
+): Promise<VerifyOutcome> {
+  const { status, json, text } = await facilitatorPost(config, "/verify", request);
+  if (status !== 200) {
+    return { ok: false, reason: `facilitator /verify HTTP ${status}: ${text.slice(0, 200)}` };
   }
-  return sig;
-}
-
-function normalisePubkeys(pubkey: string | string[]): string[] {
-  if (Array.isArray(pubkey)) return pubkey;
-  if (!pubkey || pubkey.trim().length === 0) return [];
-  return [pubkey];
-}
-
-function verifyOracleSignature(
-  payload: OracleVerdictPayload,
-  signatureHex: string,
-  configPubkeys: string | string[]
-): boolean {
-  const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
-  const msgHash = createHash("sha256").update(jsonBytes).digest("hex");
-  const sig = normaliseSignature(signatureHex);
-
-  const pubkeys = normalisePubkeys(configPubkeys);
-  for (const pk of pubkeys) {
-    const raw = pk.startsWith("0x") ? pk.slice(2) : pk;
-    try {
-      if (verify(sig, msgHash, raw)) return true;
-    } catch {
-      // try next
-    }
+  if (!json || json.isValid !== true) {
+    const invalidReason = typeof json?.invalidReason === "string" ? json.invalidReason : undefined;
+    const details =
+      typeof json?.invalidReasonDetails === "string" ? json.invalidReasonDetails : undefined;
+    return {
+      ok: false,
+      reason: `facilitator rejected payment: ${invalidReason ?? "unknown"}${details ? ` (${details})` : ""}`,
+    };
   }
-  return false;
+  return { ok: true, payer: typeof json.payer === "string" ? json.payer : undefined };
 }
 
-// ---------------------------------------------------------------------------
-// verifyX402WithOracle
-// ---------------------------------------------------------------------------
+interface SettleOutcome {
+  settled: boolean;
+  payer?: string;
+  transaction?: string;
+  reason?: string;
+  /** True when the facilitator error could not be resolved on-chain. */
+  ambiguous?: boolean;
+}
 
-export async function verifyX402WithOracle(
-  params: {
-    tx_hash: string;
-    chain_id: string;
-    amount: string;
-    currency: string;
-    resource_uri: string;
-    session_nonce: string;
-  },
-  config: OracleConfig
-): Promise<{ verified: boolean; payer?: string; reason?: string }> {
-  // Query oracle via WebSocket
-  let verdict: OracleVerdict;
+/**
+ * Call the facilitator's /settle, and on any non-success result confirm on-chain
+ * before concluding the payment failed.
+ *
+ * The facilitator can return HTTP 500 for a settlement that actually executed
+ * (confirmed Phase 1 behaviour). Treating that as "payment not received" would
+ * either double-charge on client retry or deny access after a real payment.
+ */
+async function facilitatorSettle(
+  request: X402VerifyRequest,
+  config: FacilitatorConfig,
+  chain: FacilitatorChainInfo,
+  authorization: { from: string; nonce: string }
+): Promise<SettleOutcome> {
+  let json: Record<string, unknown> | null = null;
+  let status = 0;
+  let text = "";
   try {
-    verdict = await queryOracle(
-      {
-        tx_hash: params.tx_hash,
-        chain_id: params.chain_id,
-        amount: params.amount,
-        currency: params.currency,
-        resource_uri: params.resource_uri,
-        session_nonce: params.session_nonce,
-      },
-      config
-    );
+    const res = await facilitatorPost(config, "/settle", request);
+    status = res.status;
+    json = res.json;
+    text = res.text;
   } catch (err) {
-    console.warn(`[mdf:payment:oracle] oracle query failed: ${(err as Error).message}`);
-    return { verified: false, reason: "oracle unreachable" };
+    text = (err as Error).message;
   }
 
-  const p = verdict.payload;
+  if (status === 200 && json?.success === true) {
+    return {
+      settled: true,
+      payer: typeof json.payer === "string" ? json.payer : undefined,
+      transaction: typeof json.transaction === "string" ? json.transaction : undefined,
+    };
+  }
 
-  // 1. Cross-check public_key in response against configured pubkeys
-  const responsePubkey = verdict.public_key.toLowerCase();
-  const trustedPubkeys = normalisePubkeys(config.pubkey);
-  const matchedPubkey = trustedPubkeys.find(
-    (pk) => pk.toLowerCase() === responsePubkey
+  const facilitReason =
+    typeof json?.errorMessage === "string"
+      ? json.errorMessage
+      : typeof json?.errorReason === "string"
+        ? json.errorReason
+        : text || "unknown";
+
+  console.warn(
+    `[mdf:payment:x402] /settle did not return success (HTTP ${status}): ${facilitReason} — checking on-chain state`
   );
-  if (!matchedPubkey) {
-    console.error(
-      `[mdf:payment:oracle] pubkey mismatch — verdict signed by unexpected key. ` +
-      `configured count: ${trustedPubkeys.length}, ` +
-      `received starts: ${responsePubkey.slice(0, 10)}…`
+
+  const txHash =
+    typeof json?.transaction === "string" && json.transaction.length > 0
+      ? json.transaction
+      : undefined;
+
+  const onchain = await confirmSettlementOnChain(chain, {
+    txHash,
+    from: authorization.from,
+    nonce: authorization.nonce,
+  });
+
+  if (onchain === "settled") {
+    return { settled: true, payer: authorization.from, transaction: txHash };
+  }
+  if (onchain === "not_settled") {
+    return { settled: false, reason: `facilitator /settle failed: ${facilitReason}` };
+  }
+  return {
+    settled: false,
+    ambiguous: true,
+    reason: `facilitator /settle failed and on-chain status could not be confirmed: ${facilitReason}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// On-chain settlement confirmation
+// ---------------------------------------------------------------------------
+
+// authorizationState(address,bytes32) — EIP-3009, returns whether a nonce was used.
+const AUTHORIZATION_STATE_SELECTOR = "0xe94a0102";
+
+function leftPad32(hexNo0x: string): string {
+  return hexNo0x.padStart(64, "0").slice(-64);
+}
+
+async function rpcCall(
+  rpcUrl: string,
+  method: string,
+  params: unknown[],
+  timeoutMs: number
+): Promise<unknown> {
+  const res = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const body = (await res.json()) as { result?: unknown; error?: { message?: string } };
+  if (body.error) throw new Error(body.error.message ?? "RPC error");
+  return body.result;
+}
+
+/**
+ * Confirm whether a specific EIP-3009 authorization was consumed on-chain.
+ *
+ * Order of evidence:
+ *   1. If a tx hash was returned, fetch its receipt: status 0x1 → settled,
+ *      status 0x0 → reverted (not settled).
+ *   2. Otherwise call the token's `authorizationState(from, nonce)`. Once a
+ *      transferWithAuthorization executes this flips — and stays — true, giving
+ *      a definitive per-payment signal independent of the facilitator.
+ *
+ * Returns "unknown" when no RPC is configured or unreachable, so the caller
+ * never mistakes an infrastructure failure for a payment denial.
+ */
+async function confirmSettlementOnChain(
+  chain: FacilitatorChainInfo,
+  params: { txHash?: string; from: string; nonce: string }
+): Promise<"settled" | "not_settled" | "unknown"> {
+  if (!chain.rpcUrl) return "unknown";
+  const timeoutMs = 8000;
+
+  try {
+    if (params.txHash) {
+      const receipt = (await rpcCall(
+        chain.rpcUrl,
+        "eth_getTransactionReceipt",
+        [params.txHash],
+        timeoutMs
+      )) as { status?: string } | null;
+      if (receipt) {
+        return receipt.status === "0x1" ? "settled" : "not_settled";
+      }
+      // Receipt not found — tx may still be pending; fall through to nonce check.
+    }
+
+    const data =
+      AUTHORIZATION_STATE_SELECTOR +
+      leftPad32(params.from.replace(/^0x/, "")) +
+      leftPad32(params.nonce.replace(/^0x/, ""));
+
+    const result = (await rpcCall(
+      chain.rpcUrl,
+      "eth_call",
+      [{ to: chain.asset, data }, "latest"],
+      timeoutMs
+    )) as string | undefined;
+
+    if (typeof result === "string" && result.length >= 3) {
+      return result.slice(-1) === "1" ? "settled" : "not_settled";
+    }
+    return "not_settled";
+  } catch (err) {
+    console.warn(
+      `[mdf:payment:x402] on-chain settlement check failed: ${(err as Error).message}`
     );
-    return { verified: false, reason: "oracle pubkey mismatch" };
+    return "unknown";
   }
-
-  // 2. Verify ES256K signature (using configured pubkey, not the response one)
-  const sigValid = verifyOracleSignature(p, verdict.signature, matchedPubkey);
-  if (!sigValid) {
-    console.error(
-      `[mdf:payment:oracle] signature verification failed — ` +
-      `verdict ts=${p.verified_at}, resource=${p.resource_uri}, ` +
-      `tx=${p.tx_hash?.slice(0, 10)}…`
-    );
-    return { verified: false, reason: "oracle signature invalid" };
-  }
-
-  // 3. Enforce verified === true (boolean)
-  // TODO: Once all 3 oracle replicas are populated, gate on peer_consensus
-  // reaching the configured threshold (e.g. "2/3" or higher). Currently with
-  // only 1/3 replicas running, we accept the aggregator's verified=true as-is.
-  if (p.verified !== true) {
-    console.warn(`[mdf:payment:oracle] oracle returned verified=false: ${p.reason ?? "no reason"}`);
-    return { verified: false, reason: p.reason ?? "oracle rejected payment" };
-  }
-
-  // 4. Enforce verified_at freshness
-  const age = Math.floor(Date.now() / 1000) - p.verified_at;
-  if (age > config.max_verdict_age_seconds) {
-    console.warn(`[mdf:payment:oracle] verdict too old: ${age}s > ${config.max_verdict_age_seconds}s`);
-    return { verified: false, reason: `verdict too old (${age}s)` };
-  }
-
-  // 5. Enforce resource_uri matches
-  if (p.resource_uri !== params.resource_uri) {
-    console.warn(`[mdf:payment:oracle] resource_uri mismatch: expected ${params.resource_uri}, got ${p.resource_uri}`);
-    return { verified: false, reason: "resource_uri mismatch" };
-  }
-
-  // 6. Enforce session_nonce matches
-  if (p.session_nonce !== params.session_nonce) {
-    console.warn(`[mdf:payment:oracle] session_nonce mismatch`);
-    return { verified: false, reason: "session_nonce mismatch" };
-  }
-
-  // 7. Enforce amount and currency match
-  if (p.amount !== params.amount) {
-    console.warn(`[mdf:payment:oracle] amount mismatch: expected ${params.amount}, got ${p.amount}`);
-    return { verified: false, reason: "amount mismatch" };
-  }
-  if (p.currency.toUpperCase() !== params.currency.toUpperCase()) {
-    console.warn(`[mdf:payment:oracle] currency mismatch: expected ${params.currency}, got ${p.currency}`);
-    return { verified: false, reason: "currency mismatch" };
-  }
-
-  // 8. Enforce chain_id matches (Base Mainnet = "8453")
-  if (p.chain_id !== params.chain_id) {
-    console.warn(`[mdf:payment:oracle] chain_id mismatch: expected ${params.chain_id}, got ${p.chain_id}`);
-    return { verified: false, reason: "chain_id mismatch" };
-  }
-
-  return { verified: true, payer: p.payer };
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,21 +951,76 @@ export async function verifyL402(
 }
 
 // ---------------------------------------------------------------------------
-// Main verifier — x402 path with oracle integration
+// x402 chain registry and verifier
 // ---------------------------------------------------------------------------
 
 const CHAIN_ID_MAP: Record<string, string> = {
   base: "8453",
+  base_sepolia: "84532",
   ethereum: "1",
 };
 
-function x402ChainId(chain: string | null | undefined): string | null {
-  if (!chain) return null;
-  return CHAIN_ID_MAP[chain.toLowerCase()] ?? null;
-}
+/**
+ * x402 V1 network names. x402-rs resolves these to CAIP-2 chain ids; only
+ * networks listed here can be offered on the x402 rail.
+ */
+const X402_NETWORK_MAP: Record<string, string> = {
+  base: "base",
+  base_sepolia: "base-sepolia",
+};
 
 function isLightningChain(chain: string | null | undefined): boolean {
   return chain?.toLowerCase() === "lightning";
+}
+
+/**
+ * Resolve the facilitator-side metadata for an MDF chain, or null when the
+ * chain is not an x402 chain / has no configured asset.
+ */
+export function x402ChainInfo(
+  chain: string | null | undefined,
+  facilitatorConfig: FacilitatorConfig | null
+): FacilitatorChainInfo | null {
+  if (!chain || !facilitatorConfig) return null;
+  const key = chain.toLowerCase();
+  const network = X402_NETWORK_MAP[key];
+  const chainId = CHAIN_ID_MAP[key];
+  const chainCfg = facilitatorConfig.chains[key];
+  if (!network || !chainId || !chainCfg) return null;
+  return {
+    network,
+    chainId,
+    asset: chainCfg.asset,
+    decimals: chainCfg.decimals,
+    extra: chainCfg.extra,
+    rpcUrl: chainCfg.rpc_url,
+  };
+}
+
+/**
+ * Build the standard x402 V1 `PaymentRequirements` for an offer. Field names
+ * are camelCase per the x402 wire format (MDF's own 402 body uses snake_case).
+ */
+function buildPaymentRequirements(
+  offer: { amount: string },
+  resource: string,
+  loaded: LoadedConfig,
+  chainInfo: FacilitatorChainInfo,
+  config: FacilitatorConfig
+): Record<string, unknown> {
+  const requirements: Record<string, unknown> = {
+    scheme: config.scheme,
+    network: chainInfo.network,
+    maxAmountRequired: toAtomicUnits(offer.amount, chainInfo.decimals),
+    resource,
+    description: `MDF access: ${resource}`,
+    mimeType: "text/markdown",
+    payTo: loaded.walletAddress ?? "",
+    maxTimeoutSeconds: config.max_timeout_seconds,
+    asset: chainInfo.asset,
+  };
+  if (chainInfo.extra) requirements.extra = chainInfo.extra;
+  return requirements;
 }
 
 /**
@@ -1107,9 +1028,9 @@ function isLightningChain(chain: string | null | undefined): boolean {
  *
  * This mirrors the branch that selects the verifier: `lightning` is served by
  * the L402 flow (invoice + macaroon), while chains in CHAIN_ID_MAP (base,
- * ethereum) are served by the x402 flow. Any chain with no known rail returns
- * null so the caller can omit the field rather than assert a mapping that may
- * not hold.
+ * base_sepolia, ethereum) are served by the x402 flow. Any chain with no known
+ * rail returns null so the caller can omit the field rather than assert a
+ * mapping that may not hold.
  */
 function railForChain(chain: string | null | undefined): "x402" | "l402" | null {
   const c = chain?.toLowerCase();
@@ -1119,23 +1040,22 @@ function railForChain(chain: string | null | undefined): "x402" | "l402" | null 
 }
 
 /**
- * Verify an x402 payment proof for a given request.
+ * Verify and settle an x402 payment for a request.
  *
- * When the oracle is configured and the chain is non-lightning:
- *   - Delegates to the Acurast oracle for on-chain receipt verification
- *   - Requires a session_nonce (issued in the prior 402 response)
- *
- * When oracle is not configured, falls back to stub mode (structural validation only).
+ * The client submits a standard base64 `PaymentPayload` in the `X-PAYMENT`
+ * header. The server builds `PaymentRequirements` from the offer it issued,
+ * calls the facilitator's `/verify` then `/settle`, and — on any /settle
+ * error — confirms on-chain before concluding the payment failed.
  */
 export async function verifyPayment(
   urlPath: string,
   paymentHeader: string | null | undefined,
   loaded: LoadedConfig
 ): Promise<VerificationResult> {
-  const { config, oracleConfig } = loaded;
+  const { config, facilitatorConfig } = loaded;
   const requiresToken = pathRequiresToken(urlPath, config);
-  const priceEntry    = requiredPriceEntry(urlPath, config);
-  const required      = priceEntry.amount;
+  const priceEntry = requiredPriceEntry(urlPath, config);
+  const required = priceEntry.amount;
 
   // Free content
   if (parseFloat(required) === 0) {
@@ -1155,175 +1075,180 @@ export async function verifyPayment(
       status: "no_proof",
       proof: null,
       l402Credential: null,
-      reason: `payment required: ${priceEntry.amount} ${priceEntry.currency ?? config.pricing.default.currency ?? ""}`.trim(),
+      reason: `payment required: ${required} ${priceEntry.currency ?? config.pricing.default.currency ?? ""}`.trim(),
       requiresToken,
       rail: "none",
     };
   }
 
-  const proof = parsePaymentHeader(paymentHeader.trim());
-
-  if (!chainAccepted(proof.chain, config)) {
-    logX402(urlPath, proof, "rejected");
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: `chain '${proof.chain ?? "unspecified"}' not accepted`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  if (!currencyAccepted(proof.currency, config)) {
-    logX402(urlPath, proof, "rejected");
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: `currency '${proof.currency ?? "unspecified"}' not accepted`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  if (!amountSufficient(proof.amount, required)) {
-    logX402(urlPath, proof, "rejected");
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: `amount ${proof.amount ?? "unspecified"} insufficient for required ${required}`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  // Lightning paths are handled by L402 flow — no oracle needed
-  if (isLightningChain(proof.chain)) {
-    logX402(urlPath, proof, "stub_approved");
+  // Lightning prices are served by the L402 flow, not x402.
+  if (isLightningChain(priceEntry.chain)) {
     return {
       status: "stub_approved",
-      proof,
+      proof: null,
       l402Credential: null,
       reason: "lightning chain — handled by L402 flow",
       requiresToken,
-      rail: "x402",
+      rail: "l402",
     };
   }
 
-  // Non-lightning EVM chain — use oracle if configured
-  if (!oracleConfig) {
-    logX402(urlPath, proof, "stub_approved");
+  const proof = parseX402PaymentHeader(paymentHeader.trim());
+  if (!proof) {
     return {
-      status: "stub_approved",
-      proof,
+      status: "rejected",
+      proof: null,
       l402Credential: null,
-      reason: "stub mode: oracle not configured, structural validation only",
+      reason: "malformed X-PAYMENT header (expected base64 x402 PaymentPayload)",
       requiresToken,
       rail: "x402",
     };
   }
 
-  // Validate nonce
-  if (!proof.nonce) {
+  if (!facilitatorConfig) {
+    return {
+      status: "error",
+      proof,
+      l402Credential: null,
+      reason: "x402 pricing configured but no [facilitator] block is available",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  const chainInfo = x402ChainInfo(priceEntry.chain, facilitatorConfig);
+  if (!chainInfo) {
+    return {
+      status: "error",
+      proof,
+      l402Credential: null,
+      reason: `no facilitator chain config for '${priceEntry.chain ?? "unspecified"}'`,
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  if (proof.scheme !== facilitatorConfig.scheme) {
     logX402(urlPath, proof, "rejected");
     return {
       status: "rejected",
       proof,
       l402Credential: null,
-      reason: "session_nonce required — obtain via initial 402 response",
+      reason: `scheme '${proof.scheme}' not accepted (expected '${facilitatorConfig.scheme}')`,
       requiresToken,
       rail: "x402",
     };
   }
 
-  const nonceRecord = nonceStore.get(proof.nonce);
-  if (!nonceRecord) {
-    logX402(urlPath, proof, "rejected");
-    nonceStore.delete(proof.nonce);
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: "unknown or expired session_nonce",
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  nonceStore.delete(proof.nonce);
-
-  if (Date.now() > nonceRecord.expires_at) {
+  if (proof.network.toLowerCase() !== chainInfo.network.toLowerCase()) {
     logX402(urlPath, proof, "rejected");
     return {
       status: "rejected",
       proof,
       l402Credential: null,
-      reason: "session_nonce expired",
+      reason: `network '${proof.network}' does not match offer '${chainInfo.network}'`,
       requiresToken,
       rail: "x402",
     };
   }
 
-  // Cross-check nonce record against the proof
-  if (nonceRecord.resource_uri !== urlPath) {
+  if (proof.to.toLowerCase() !== (loaded.walletAddress ?? "").toLowerCase()) {
     logX402(urlPath, proof, "rejected");
     return {
       status: "rejected",
       proof,
       l402Credential: null,
-      reason: "session_nonce bound to different resource",
+      reason: "payment recipient does not match offer pay_to",
       requiresToken,
       rail: "x402",
     };
   }
 
-  const chainId = x402ChainId(proof.chain);
-  if (!chainId) {
-    logX402(urlPath, proof, "rejected");
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: `unknown chain_id for chain '${proof.chain}'`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  // Oracle verification
-  if (!proof.txHash) {
-    logX402(urlPath, proof, "rejected");
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: "txHash required for on-chain verification",
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  const oracleResult = await verifyX402WithOracle(
-    {
-      tx_hash: proof.txHash,
-      chain_id: chainId,
-      amount: required,
-      currency: proof.currency ?? config.pricing.default.currency ?? "USDC",
-      resource_uri: `${config.site.url.replace(/\/$/, "")}${urlPath}`,
-      session_nonce: proof.nonce,
-    },
-    oracleConfig
+  const resource = `${config.site.url.replace(/\/$/, "")}${urlPath}`;
+  const requirements = buildPaymentRequirements(
+    priceEntry,
+    resource,
+    loaded,
+    chainInfo,
+    facilitatorConfig
   );
+  const request: X402VerifyRequest = {
+    x402Version: 1,
+    paymentPayload: proof.envelope ?? {},
+    paymentRequirements: requirements,
+  };
 
-  if (!oracleResult.verified) {
+  let verify: VerifyOutcome;
+  try {
+    verify = await facilitatorVerify(request, facilitatorConfig);
+  } catch (err) {
+    logX402(urlPath, proof, "error");
+    return {
+      status: "error",
+      proof,
+      l402Credential: null,
+      reason: `facilitator /verify unreachable: ${(err as Error).message}`,
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  if (!verify.ok) {
+    // A retry of an already-settled authorization fails /verify (the EIP-3009
+    // nonce is consumed), so confirm on-chain before treating this as a
+    // rejection — otherwise a real, settled payment would be denied.
+    const onchain = await confirmSettlementOnChain(chainInfo, {
+      from: proof.from,
+      nonce: proof.nonce,
+    });
+    if (onchain === "settled") {
+      logX402(urlPath, proof, "approved");
+      return {
+        status: "approved",
+        proof,
+        l402Credential: null,
+        reason: "x402: previously settled authorization confirmed on-chain",
+        requiresToken,
+        rail: "x402",
+        settlement: { payer: proof.from, transaction: "" },
+      };
+    }
     logX402(urlPath, proof, "rejected");
     return {
       status: "rejected",
       proof,
       l402Credential: null,
-      reason: oracleResult.reason ?? "oracle rejected payment",
+      reason: verify.reason ?? "facilitator rejected payment",
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  let settle: SettleOutcome;
+  try {
+    settle = await facilitatorSettle(request, facilitatorConfig, chainInfo, {
+      from: proof.from,
+      nonce: proof.nonce,
+    });
+  } catch (err) {
+    logX402(urlPath, proof, "error");
+    return {
+      status: "error",
+      proof,
+      l402Credential: null,
+      reason: `facilitator /settle unreachable: ${(err as Error).message}`,
+      requiresToken,
+      rail: "x402",
+    };
+  }
+
+  if (!settle.settled) {
+    logX402(urlPath, proof, settle.ambiguous ? "error" : "rejected");
+    return {
+      status: settle.ambiguous ? "error" : "rejected",
+      proof,
+      l402Credential: null,
+      reason: settle.reason ?? "settlement failed",
       requiresToken,
       rail: "x402",
     };
@@ -1334,9 +1259,13 @@ export async function verifyPayment(
     status: "approved",
     proof,
     l402Credential: null,
-    reason: "x402: on-chain payment verified by oracle",
+    reason: "x402: payment verified and settled via facilitator",
     requiresToken,
     rail: "x402",
+    settlement: {
+      payer: settle.payer ?? proof.from,
+      transaction: settle.transaction ?? "",
+    },
   };
 }
 
@@ -1351,7 +1280,8 @@ export async function verifyPayment(
  * WWW-Authenticate header. This is async because invoice creation requires
  * a call to Alby Hub.
  *
- * For x402 paths: synchronous, same behaviour as before.
+ * For x402 paths: emits the MDF 0.2.0 superset fields (pay_to, asset, scheme,
+ * max_timeout_seconds, extra) alongside the original MDF fields.
  */
 export async function build402Response(
   urlPath: string,
@@ -1360,7 +1290,6 @@ export async function build402Response(
   resourceUrl?: string
 ): Promise<{ status: 402; headers: Record<string, string>; body: string }> {
   const { config } = loaded;
-  const price = requiredPrice(urlPath, config);
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json; charset=utf-8",
@@ -1384,29 +1313,31 @@ export async function build402Response(
   const resource =
     resourceUrl ?? `${config.site.url.replace(/\/$/, "")}${urlPath}`;
 
-  // Generate session nonce for x402 (non-lightning) paths. expires_at is
-  // derived from the same expiry the nonce is bound to, so an offer and its
-  // nonce can never disagree about the validity window.
-  let sessionNonce: string | undefined;
-  let offerExpiresAt: string | undefined;
-  if (!isLightningChain(priceEntry.chain)) {
-    const nonce = randomUUID();
-    const nonceTtlSeconds = config.lightning?.invoice_expiry_seconds ?? 3600;
-    const nonceExpiryMs = Date.now() + nonceTtlSeconds * 1000;
-    nonceStore.set(nonce, {
-      resource_uri: urlPath,
-      amount: priceEntry.amount,
-      currency: priceEntry.currency ?? config.pricing.default.currency ?? "USDC",
-      chain_id: x402ChainId(priceEntry.chain) ?? "8453",
-      expires_at: nonceExpiryMs,
-    });
-    sessionNonce = nonce;
-    offerExpiresAt = new Date(nonceExpiryMs).toISOString();
-  }
-
   // The rail for this offer, derived from the same chain->rail mapping that
   // selects the verifier at payment time.
   const offerRail = railForChain(priceEntry.chain);
+
+  // x402 superset fields (MDF 0.2.0) — required when this offer is on the
+  // x402 rail, so the 402 body is directly usable as x402 PaymentRequirements
+  // without a translation layer. expires_at shares the offer's validity
+  // window with max_timeout_seconds rather than tracking a second lifetime.
+  const chainInfo =
+    offerRail === "x402" ? x402ChainInfo(priceEntry.chain, loaded.facilitatorConfig) : null;
+
+  let x402Fields: Record<string, unknown> = {};
+  let offerExpiresAt: string | undefined;
+  if (offerRail === "x402" && config.facilitator) {
+    x402Fields = {
+      ...(loaded.walletAddress ? { pay_to: loaded.walletAddress } : {}),
+      ...(chainInfo ? { asset: chainInfo.asset } : {}),
+      scheme: config.facilitator.scheme,
+      max_timeout_seconds: config.facilitator.max_timeout_seconds,
+      ...(chainInfo?.extra ? { extra: chainInfo.extra } : {}),
+    };
+    offerExpiresAt = new Date(
+      Date.now() + config.facilitator.max_timeout_seconds * 1000
+    ).toISOString();
+  }
 
   // source_bytes — stat the content file serveContent would resolve for this
   // urlPath (the markdown source file's size). A 402 can be reached for a URL
@@ -1436,7 +1367,7 @@ export async function build402Response(
       ...(offerRail ? { rail: offerRail } : {}),
       accepted_chains: config.payment?.accepted_chains ?? [],
       accepted_currencies: config.payment?.accepted_currencies ?? [],
-      ...(sessionNonce ? { session_nonce: sessionNonce } : {}),
+      ...x402Fields,
       ...(offerExpiresAt ? { expires_at: offerExpiresAt } : {}),
       ...(l402Challenge ? { lightning_invoice: headers["WWW-Authenticate"] } : {}),
     },

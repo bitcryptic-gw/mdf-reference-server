@@ -18,7 +18,7 @@ import { ensureDataDir } from "./feed/events.ts";
 import { initWatcher, startWatcher } from "./feed/watcher.ts";
 import { emitEvent } from "./feed/events.ts";
 import { serveContent } from "./content/handler.ts";
-import { verifyPayment, verifyL402, build402Response, startNonceSweep, verifyX402WithOracle, lookupNonce, consumeNonce } from "./payment/payment.ts";
+import { verifyPayment, verifyL402, build402Response } from "./payment/payment.ts";
 import {
   validateToken,
   handleAuthRequest,
@@ -70,9 +70,6 @@ emitEvent(
 // ---------------------------------------------------------------------------
 
 tokenStore.startSweep();
-
-// Nonce store sweep (x402 oracle handshake)
-startNonceSweep();
 
 // ---------------------------------------------------------------------------
 // Request size limit
@@ -151,7 +148,7 @@ function toResponse(result: {
  * (feed-event log). Config and secrets are startup-time only — if they were
  * broken the process would not be running, so they are not checked here.
  *
- * External payment deps (Alby Hub for L402, Acurast oracle for x402) are
+ * External payment deps (Alby Hub for L402, the x402 facilitator) are
  * deliberately NOT checked: they are only touched on the payment paths, and
  * their outage should not take a healthy content-serving instance out of the
  * Caddy pool.
@@ -242,7 +239,20 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // ── 3.5 Pay endpoint ──────────────────────────────────────────────────────
-  if (method === "POST" && urlPath === "/mdf/pay") {
+  //
+  // High-tier token issuance. The client sends a standard x402 PaymentPayload
+  // in the X-PAYMENT header. The JSON body identifies the resource being paid
+  // for, since the payment endpoint is a single fixed URL.
+  //
+  //   POST /mdf/pay
+  //   X-PAYMENT: <base64 x402 PaymentPayload>
+  //   { "resource": "/private/internals" }   (absolute URL also accepted)
+  const payEndpoint = loaded.config.payment?.endpoint;
+  const isPayEndpoint =
+    urlPath === "/mdf/pay" ||
+    (!!payEndpoint && payEndpoint.startsWith("/") && urlPath === payEndpoint);
+
+  if (method === "POST" && isPayEndpoint) {
     try {
       const body = await readBody(req);
       if (body === null) {
@@ -258,82 +268,42 @@ async function handleRequest(req: Request): Promise<Response> {
         return jsonError(400, "Invalid JSON body");
       }
 
-      const requiredFields = ["tx_hash", "chain_id", "amount", "currency", "resource_uri", "session_nonce"] as const;
-      for (const f of requiredFields) {
-        const v = parsed[f];
-        if (typeof v !== "string" || v.trim().length === 0) {
-          logRequest(method, urlPath, 400, Date.now() - start);
-          return jsonError(400, `Missing or invalid field: ${f}`);
-        }
-      }
-
-      const txHash = parsed.tx_hash as string;
-      const chainId = parsed.chain_id as string;
-      const amount = parsed.amount as string;
-      const currency = parsed.currency as string;
-      const resourceUri = parsed.resource_uri as string;
-      const sessionNonce = parsed.session_nonce as string;
-
-      const nonceRecord = lookupNonce(sessionNonce);
-      if (!nonceRecord) {
-        consumeNonce(sessionNonce);
+      const resource = typeof parsed.resource === "string" ? parsed.resource : null;
+      if (!resource) {
         logRequest(method, urlPath, 400, Date.now() - start);
-        return jsonError(400, "Unknown or expired session_nonce");
+        return jsonError(400, "Missing or invalid field: resource");
       }
 
-      if (Date.now() > nonceRecord.expires_at) {
-        consumeNonce(sessionNonce);
-        logRequest(method, urlPath, 400, Date.now() - start);
-        return jsonError(400, "Session nonce expired");
-      }
-
-      let bodyPath: string;
+      let payPath: string;
       try {
-        bodyPath = new URL(resourceUri).pathname;
+        payPath = new URL(resource).pathname;
       } catch {
-        bodyPath = resourceUri;
+        payPath = resource.startsWith("/") ? resource : `/${resource}`;
       }
-      if (nonceRecord.resource_uri !== bodyPath) {
-        consumeNonce(sessionNonce);
+
+      const xPayment = req.headers.get("x-payment");
+      if (!xPayment) {
         logRequest(method, urlPath, 400, Date.now() - start);
-        return jsonError(400, "Session nonce bound to different resource");
+        return jsonError(400, "Missing X-PAYMENT header");
       }
 
-      consumeNonce(sessionNonce);
+      const result = await verifyPayment(payPath, xPayment, loaded);
 
-      if (!loaded.oracleConfig) {
-        logRequest(method, urlPath, 500, Date.now() - start);
-        return jsonError(500, "Oracle not configured");
+      if (result.status === "error") {
+        logRequest(method, urlPath, 503, Date.now() - start, { reason: result.reason });
+        return jsonError(503, result.reason);
       }
 
-      const oracleResult = await verifyX402WithOracle(
-        {
-          tx_hash: txHash,
-          chain_id: chainId,
-          amount,
-          currency,
-          resource_uri: resourceUri,
-          session_nonce: sessionNonce,
-        },
-        loaded.oracleConfig
-      );
-
-      if (!oracleResult.verified) {
-        logRequest(method, urlPath, 402, Date.now() - start, { reason: oracleResult.reason });
-        return new Response(JSON.stringify({
-          error: "Payment verification failed",
-          reason: oracleResult.reason ?? "verification failed",
-        }), {
-          status: 402,
-          headers: { "Content-Type": "application/json; charset=utf-8" },
-        });
+      if (result.status !== "approved" && result.status !== "stub_approved") {
+        const response402 = await build402Response(payPath, result, loaded);
+        logRequest(method, urlPath, 402, Date.now() - start, { reason: result.reason });
+        return toResponse(response402);
       }
 
-      const pathFromUri = bodyPath;
       const tokenResult = issueToken(
-        pathFromUri,
-        oracleResult.payer ?? txHash,
-        txHash,
+        payPath,
+        result.settlement?.payer ?? result.proof?.from ?? "unknown",
+        result.settlement?.transaction ?? "unknown",
         loaded
       );
 
@@ -347,6 +317,7 @@ async function handleRequest(req: Request): Promise<Response> {
         token: tokenResult.token,
         expires_at: new Date(tokenResult.expiresAt).toISOString(),
         ttl_seconds: tokenResult.ttlSeconds,
+        ...(result.settlement ? { payment: result.settlement } : {}),
       }), {
         status: 200,
         headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -369,6 +340,10 @@ async function handleRequest(req: Request): Promise<Response> {
   const paymentHeader = req.headers.get("x-payment");
   const authHeader = req.headers.get("authorization") ?? "";
 
+  // Settlement metadata from an x402 payment, echoed back as a
+  // Payment-Response header so the caller can verify on-chain independently.
+  let x402Settlement: { payer: string; transaction: string } | undefined;
+
   // ── 4. Payment verification ───────────────────────────────────────────────
   if (authHeader.toLowerCase().startsWith("l402 ")) {
     // L402: agent submitting a Lightning preimage proof
@@ -381,6 +356,15 @@ async function handleRequest(req: Request): Promise<Response> {
   } else {
     // x402: agent submitting EVM payment proof, or no proof at all
     const paymentResult = await verifyPayment(urlPath, paymentHeader, loaded);
+
+    // Upstream dependency failure (facilitator/RPC). Not a payment denial —
+    // surface it as 503 so the client does not treat it as a hard 402.
+    if (paymentResult.status === "error") {
+      logRequest(method, urlPath, 503, Date.now() - start, { reason: paymentResult.reason });
+      return jsonError(503, paymentResult.reason);
+    }
+
+    if (paymentResult.settlement) x402Settlement = paymentResult.settlement;
 
     if (paymentResult.requiresToken) {
       const tokenResult = validateToken(authHeader, urlPath);
@@ -411,6 +395,12 @@ async function handleRequest(req: Request): Promise<Response> {
   });
 
   const res = toResponse(content);
+  if (x402Settlement) {
+    res.headers.set(
+      "Payment-Response",
+      Buffer.from(JSON.stringify({ success: true, ...x402Settlement })).toString("base64")
+    );
+  }
   return res;
 }
 

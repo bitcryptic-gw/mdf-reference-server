@@ -37,9 +37,10 @@ echo "=== /premium/deep-dive — no payment ==="
 curl -s http://localhost:3000/premium/deep-dive
 
 echo ""
-echo "=== /premium/deep-dive — stub payment ==="
+echo "=== /premium/deep-dive — malformed X-PAYMENT (expect 402) ==="
+# The x402 path expects a base64 standard PaymentPayload, not custom JSON.
 curl -s -w "\nstatus:%{http_code}" \
-  -H 'X-Payment: {"chain":"base","currency":"USDC","amount":"1.0000","txHash":"0xabc","from":"0xuser"}' \
+  -H 'X-PAYMENT: not-a-valid-payment-payload' \
   -H "Accept: text/markdown" \
   http://localhost:3000/premium/deep-dive | head -8
 

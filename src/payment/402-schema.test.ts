@@ -85,10 +85,24 @@ async function fetchSchema(): Promise<unknown | null> {
 
 function makeLoaded(chain: "base" | "lightning"): LoadedConfig {
   const isLn = chain === "lightning";
+  const facilitator = {
+    url: "https://facilitator.example",
+    scheme: "exact",
+    max_timeout_seconds: 300,
+    timeout_ms: 15000,
+    chains: {
+      base: {
+        asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        decimals: 6,
+        extra: { name: "USD Coin", version: "2" },
+      },
+    },
+  };
   return {
     contentDir: "/nonexistent-in-test",
     walletAddress: "0xDEAD",
     mdfJson: "{}",
+    facilitatorConfig: facilitator,
     config: {
       site: { url: "https://example.com", name: "Test" },
       content: { dir: "/nonexistent-in-test", dialect: "commonmark", frontmatter: true, math: false },
@@ -107,6 +121,7 @@ function makeLoaded(chain: "base" | "lightning"): LoadedConfig {
       },
       signals: { ai_train: false, ai_input: true, search: true, human_only: false },
       dashboard: { enabled: false, port: 9090 },
+      facilitator,
     } as LoadedConfig["config"],
   };
 }
@@ -172,10 +187,20 @@ async function main(): Promise<void> {
     assertEquals(body.payment.amount, "1.0000", "amount should be unchanged");
     assertEquals(body.payment.currency, "USDC", "currency should be unchanged");
 
-    // expires_at derived from the same window as session_nonce
+    // MDF 0.2.0 x402 superset fields
+    assertEquals(body.payment.pay_to, "0xDEAD", "pay_to should be the wallet address");
+    assertEquals(
+      body.payment.asset,
+      "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "asset should be the token contract address"
+    );
+    assertEquals(body.payment.scheme, "exact", "scheme should be emitted");
+    assertEquals(body.payment.max_timeout_seconds, 300, "max_timeout_seconds should be emitted");
+
+    // session_nonce handshake is gone for x402
     assert(
-      typeof body.payment.session_nonce === "string" && body.payment.session_nonce.length > 0,
-      "x402 offer should carry a session_nonce"
+      body.payment.session_nonce === undefined,
+      "x402 offer should carry no session_nonce"
     );
     assert(
       typeof body.payment.expires_at === "string" &&
@@ -206,8 +231,11 @@ async function main(): Promise<void> {
     assertEquals(body.payment.amount, "0.00000001", "amount should be unchanged");
     assertEquals(body.resource, resourceUrl, "resource should echo the requested URL");
 
-    // No session_nonce on a lightning offer, so no expires_at either
+    // No x402 superset fields on a lightning offer
     assert(body.payment.session_nonce === undefined, "lightning offers carry no session_nonce");
+    assert(body.payment.pay_to === undefined, "lightning offers carry no pay_to");
+    assert(body.payment.asset === undefined, "lightning offers carry no asset");
+    assert(body.payment.scheme === undefined, "lightning offers carry no x402 scheme");
     assert(body.payment.expires_at === undefined, "lightning offers carry no expires_at");
 
     assert(validate(body), "lightning 402 body should validate against mdf-402.schema.json");
