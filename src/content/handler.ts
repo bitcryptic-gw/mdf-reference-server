@@ -61,6 +61,40 @@ export function resolveContentPath(
   return null;
 }
 
+/**
+ * The byte length of the rendered-HTML representation of a resource — the
+ * `source_bytes` value. This is deliberately not the markdown body or file
+ * size: `source_bytes` reports the cost of the HTML alternative an agent would
+ * otherwise fetch, per CONCEPT.md's Response Value Signalling and
+ * MCP-GATEWAY.md §4. HTML is generated here from the markdown source, so it
+ * cannot be read from disk. Returns undefined when no content file resolves, so
+ * a 402 on a URL with no content omits the field rather than erroring.
+ */
+export function htmlSourceBytesForPath(
+  urlPath: string,
+  loaded: LoadedConfig
+): number | undefined {
+  const filePath = resolveContentPath(urlPath, loaded.contentDir);
+  if (!filePath) return undefined;
+
+  let rawContent: string;
+  try {
+    rawContent = readFileSync(filePath, "utf8");
+  } catch {
+    return undefined;
+  }
+
+  try {
+    const { content: markdownBody, data: frontmatter } = matter(rawContent);
+    return Buffer.byteLength(
+      renderHtml(deriveTitle(markdownBody, frontmatter, urlPath), markdownBody),
+      "utf8"
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Pricing lookup
 // ---------------------------------------------------------------------------
@@ -143,6 +177,27 @@ function computeEtag(content: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// HTML representation
+// ---------------------------------------------------------------------------
+
+function deriveTitle(
+  markdownBody: string,
+  frontmatter: Record<string, unknown>,
+  urlPath: string
+): string {
+  return (
+    (frontmatter.title as string | undefined) ??
+    markdownBody.match(/^#\s+(.+)$/m)?.[1] ??
+    urlPath.split("/").pop() ??
+    "Untitled"
+  );
+}
+
+function renderHtml(title: string, markdownBody: string): string {
+  return HTML_TEMPLATE(title, marked.parse(markdownBody) as string);
+}
+
+// ---------------------------------------------------------------------------
 // MDF response headers
 // ---------------------------------------------------------------------------
 
@@ -222,9 +277,7 @@ export function serveContent(
   const { content: markdownBody, data: frontmatter } = matter(rawContent);
 
   // Determine title — frontmatter.title, first H1, or filename
-  const title: string =
-    frontmatter.title ??
-    (markdownBody.match(/^#\s+(.+)$/m)?.[1] ?? urlPath.split("/").pop() ?? "Untitled");
+  const title = deriveTitle(markdownBody, frontmatter as Record<string, unknown>, urlPath);
 
   // ETag from raw file content (frontmatter included)
   const etag = computeEtag(rawContent);
@@ -246,6 +299,12 @@ export function serveContent(
   // strip it for HTML (it's already parsed).
   const markdownForResponse = config.content.frontmatter ? rawContent : markdownBody;
 
+  // The HTML representation is rendered regardless of what this request will
+  // actually be served, because source_bytes reports its byte length — the
+  // size of the HTML alternative this resource negotiates against.
+  const html = renderHtml(title, markdownBody);
+  const sourceBytes = Buffer.byteLength(html, "utf8");
+
   const baseHeaders: Record<string, string> = {
     ETag: etag,
     "Cache-Control": "no-cache",
@@ -257,22 +316,18 @@ export function serveContent(
       status: 200,
       headers: {
         ...baseHeaders,
-        ...mdfHeaders(urlPath, Buffer.byteLength(markdownForResponse, "utf8"), config),
+        ...mdfHeaders(urlPath, sourceBytes, config),
         "Content-Type": "text/markdown; charset=utf-8",
       },
       body: markdownForResponse,
     };
   }
 
-  // Render HTML
-  const htmlBody = marked.parse(markdownBody) as string;
-  const html = HTML_TEMPLATE(title, htmlBody);
-
   return {
     status: 200,
     headers: {
       ...baseHeaders,
-      ...mdfHeaders(urlPath, Buffer.byteLength(html, "utf8"), config),
+      ...mdfHeaders(urlPath, sourceBytes, config),
       "Content-Type": "text/html; charset=utf-8",
     },
     body: html,

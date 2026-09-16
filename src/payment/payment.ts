@@ -1,8 +1,7 @@
 import { createHash, createHmac, timingSafeEqual, randomBytes } from "crypto";
-import { statSync } from "fs";
 import type { LoadedConfig } from "../config/loader.ts";
 import type { FacilitatorConfig, FacilitatorChainConfig } from "../config/schema.ts";
-import { resolveContentPath } from "../content/handler.ts";
+import { htmlSourceBytesForPath } from "../content/handler.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1339,18 +1338,11 @@ export async function build402Response(
     ).toISOString();
   }
 
-  // source_bytes — stat the content file serveContent would resolve for this
-  // urlPath (the markdown source file's size). A 402 can be reached for a URL
-  // with no content file, so omit the field rather than erroring.
-  let sourceBytes: number | undefined;
-  const contentFilePath = resolveContentPath(urlPath, loaded.contentDir);
-  if (contentFilePath) {
-    try {
-      sourceBytes = statSync(contentFilePath).size;
-    } catch {
-      sourceBytes = undefined;
-    }
-  }
+  // source_bytes — the byte length of this resource's rendered-HTML
+  // representation (the alternative an agent would otherwise fetch), computed
+  // the same way serveContent renders it. A 402 can be reached for a URL with
+  // no content file, so omit the field rather than erroring.
+  const sourceBytes = htmlSourceBytesForPath(urlPath, loaded);
 
   const body = JSON.stringify({
     error: "Payment Required",
