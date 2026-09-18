@@ -80,8 +80,16 @@ echo "=== dashboard /health ==="
 curl -s http://localhost:3001/health
 
 echo ""
-echo "=== 404 ==="
+echo "=== 404 — unknown path under non-zero default pricing (expect 404, not 402) ==="
 curl -s -o /dev/null -w "status:%{http_code}\n" http://localhost:3000/does-not-exist
+
+echo ""
+echo "=== 404 — unknown path under a paid section (expect 404, not 402) ==="
+curl -s -o /dev/null -w "status:%{http_code}\n" http://localhost:3000/premium/does-not-exist
+
+echo ""
+echo "=== 404 — unknown path under a \$0 section (expect 404) ==="
+curl -s -o /dev/null -w "status:%{http_code}\n" http://localhost:3000/docs/does-not-exist
 
 echo ""
 echo "=== server log (last 10 lines) ==="

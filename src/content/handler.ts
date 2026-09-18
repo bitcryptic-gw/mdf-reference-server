@@ -240,6 +240,18 @@ function notFound(urlPath: string, wantsMarkdown: boolean): ServeResult {
   };
 }
 
+/**
+ * Build the 404 response for a path with no content, honouring content
+ * negotiation. Used by the router's pre-payment existence gate so an unknown
+ * path is never advertised as a priced resource.
+ */
+export function serveNotFound(
+  urlPath: string,
+  acceptHeader: string | null | undefined
+): ServeResult {
+  return notFound(urlPath, prefersMarkdown(acceptHeader));
+}
+
 // ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------

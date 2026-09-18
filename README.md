@@ -6,7 +6,7 @@ A self-hostable server that serves markdown natively to AI agents via HTTP conte
 
 **Live demo:** https://mdf-demo.bitcryptic.com  
 **Spec:** https://github.com/bitcryptic-gw/mdf  
-**Status:** v0.2.1 — L402 (Lightning) and x402 (EVM) payment verification are both live. x402 verification and settlement are delegated to a standard x402 facilitator's `/verify` and `/settle` endpoints; see [open milestones](#status)
+**Status:** v0.2.2 — L402 (Lightning) and x402 (EVM) payment verification are both live. x402 verification and settlement are delegated to a standard x402 facilitator's `/verify` and `/settle` endpoints; see [open milestones](#status)
 
 ![mdf-server dashboard](docs/dashboard.png)
 
