@@ -21,6 +21,7 @@ import { serveFeed } from "./feed/handler.ts";
 import { serveContent, serveNotFound, resolveContentPath } from "./content/handler.ts";
 import { verifyPayment, verifyL402, build402Response } from "./payment/payment.ts";
 import { validateToken, handleAuthRequest, issueToken } from "./auth/auth.ts";
+import { SERVER_VERSION } from "./version.ts";
 import type { LoadedConfig } from "./config/loader.ts";
 
 // ---------------------------------------------------------------------------
@@ -107,6 +108,13 @@ function toResponse(result: {
  *
  * Cheap by design — access checks only, no writes, no network I/O — since
  * Caddy polls this frequently.
+ *
+ * The body is JSON carrying the server's *release* version (`version`) so a
+ * deploy can be confirmed by asking the running process directly, rather than
+ * inferring it from behaviour. `status` preserves the old healthy/unhealthy
+ * signal; the HTTP status code remains the authoritative probe. Note this is
+ * the release version, not the MDF protocol version (`mdf_version` /
+ * `X-MDF-Version`).
  */
 function isHealthy(loaded: LoadedConfig): boolean {
   try {
@@ -120,11 +128,14 @@ function isHealthy(loaded: LoadedConfig): boolean {
 
 function healthResponse(loaded: LoadedConfig): Response {
   const ok = isHealthy(loaded);
-  const body = ok ? "OK" : "UNAVAILABLE";
+  const body = JSON.stringify({
+    status: ok ? "ok" : "unavailable",
+    version: SERVER_VERSION,
+  });
   return new Response(body, {
     status: ok ? 200 : 503,
     headers: {
-      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
     },
   });

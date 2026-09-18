@@ -1,6 +1,6 @@
 {
   "name": "mdf-server",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "MDF — Markdown First reference implementation",
   "type": "module",
   "scripts": {
@@ -11,7 +11,8 @@
     "test:handler": "bun run src/content/handler.test.ts",
     "test:source-bytes": "bun run src/source-bytes.test.ts",
     "test:router": "bun run src/router.test.ts",
-    "test": "bun run test:config && bun run test:402 && bun run test:handler && bun run test:source-bytes && bun run test:router"
+    "test:health": "bun run src/health.test.ts",
+    "test": "bun run test:config && bun run test:402 && bun run test:handler && bun run test:source-bytes && bun run test:router && bun run test:health"
   },
   "dependencies": {
     "@noble/secp256k1": "^2.2.3",
