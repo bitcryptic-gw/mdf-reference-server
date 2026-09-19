@@ -1,6 +1,6 @@
 {
   "name": "mdf-server",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "MDF — Markdown First reference implementation",
   "type": "module",
   "scripts": {
