@@ -15,11 +15,12 @@
     "test": "bun run test:config && bun run test:402 && bun run test:handler && bun run test:source-bytes && bun run test:router && bun run test:health"
   },
   "dependencies": {
+    "@noble/hashes": "2.4.0",
     "@noble/secp256k1": "^2.2.3",
-    "js-yaml": "^4.1.0",
-    "zod": "^3.23.8",
     "gray-matter": "^4.0.3",
-    "marked": "^18.0.0"
+    "js-yaml": "^4.1.0",
+    "marked": "^18.0.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",

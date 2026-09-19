@@ -2,6 +2,7 @@ import { readFileSync, existsSync } from "fs";
 import { resolve, isAbsolute } from "path";
 import yaml from "js-yaml";
 import { MdfConfigSchema, type MdfConfig, type FacilitatorConfig } from "./schema.ts";
+import { isValidEip55Address } from "./wallet.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -223,6 +224,23 @@ function validateStartupConstraints(
           "non-zero pricing requires a wallet address — set via /run/secrets/wallet_address, MDF_WALLET env var, or payment.wallet in config"
         );
       }
+    }
+  }
+
+  // Wallet format: strict EIP-55 checksum once any pricing is non-zero. A
+  // present-but-malformed wallet with nothing priced is a warning only, so a
+  // free-only site can carry a stale/placeholder value without failing to boot.
+  if (walletAddress && !isValidEip55Address(walletAddress)) {
+    // Never echo more than the first 6 characters of a resolved value.
+    const prefix = walletAddress.slice(0, 6);
+    if (hasNonZeroPrice(config)) {
+      errors.push(
+        `payment.wallet is not a valid EIP-55 checksummed address (value starts with '${prefix}') — expected 0x + 40 hex digits with checksum casing, and not the zero address`
+      );
+    } else {
+      console.warn(
+        `[mdf:config] payment.wallet is set but is not a valid EIP-55 checksummed address (value starts with '${prefix}') — nothing is priced, so this is a warning only`
+      );
     }
   }
 

@@ -21,6 +21,15 @@ import { tmpdir } from "os";
 import { join } from "path";
 import yaml from "js-yaml";
 import { loadConfig } from "./loader.ts";
+import { isValidEip55Address, toEip55Checksum } from "./wallet.ts";
+
+// Valid EIP-55 checksummed wallets for priced fixtures. The strict validator
+// added for Vikunja #9 rejects placeholder/unchecksummed values as soon as any
+// pricing is non-zero, so these fixtures can no longer use "0xDEAD"/"n/a".
+const WALLET_A = "0x1111111111111111111111111111111111111111";
+const WALLET_B = "0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF";
+// The live demo wallet, checked in B0 to prove the validator accepts production.
+const WALLET_LIVE = "0xa7D911138322aF8823642beA2b174dFaC2725fB7";
 
 // ---------------------------------------------------------------------------
 // Test harness (same shape as 402-schema.test.ts / handler.test.ts)
@@ -198,9 +207,9 @@ test("wallet resolves from MDF_WALLET env var when set", () => {
       },
     },
     ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: "0xFromEnv" }, () => {
+      withEnv({ MDF_WALLET: WALLET_B }, () => {
         const loaded = loadConfig(yamlPath);
-        assert(loaded.walletAddress === "0xFromEnv", "wallet should resolve from MDF_WALLET");
+        assert(loaded.walletAddress === WALLET_B, "wallet should resolve from MDF_WALLET");
       });
     }
   );
@@ -214,7 +223,7 @@ test("wallet falls back to the inline config value when no env var is set", () =
         endpoint: "/mdf/pay",
         accepted_chains: ["base"],
         accepted_currencies: ["USDC"],
-        wallet: "0xFromInline",
+        wallet: WALLET_A,
       },
       facilitator: {
         url: "https://x402.bitcryptic.com",
@@ -224,7 +233,7 @@ test("wallet falls back to the inline config value when no env var is set", () =
     ({ yamlPath }) => {
       withEnv({ MDF_WALLET: undefined }, () => {
         const loaded = loadConfig(yamlPath);
-        assert(loaded.walletAddress === "0xFromInline", "wallet should fall back to the inline value");
+        assert(loaded.walletAddress === WALLET_A, "wallet should fall back to the inline value");
       });
     }
   );
@@ -238,7 +247,7 @@ test("MDF_WALLET env var takes precedence over the inline config value", () => {
         endpoint: "/mdf/pay",
         accepted_chains: ["base"],
         accepted_currencies: ["USDC"],
-        wallet: "0xFromInline",
+        wallet: WALLET_A,
       },
       facilitator: {
         url: "https://x402.bitcryptic.com",
@@ -246,10 +255,10 @@ test("MDF_WALLET env var takes precedence over the inline config value", () => {
       },
     },
     ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: "0xFromEnv" }, () => {
+      withEnv({ MDF_WALLET: WALLET_B }, () => {
         const loaded = loadConfig(yamlPath);
         assert(
-          loaded.walletAddress === "0xFromEnv",
+          loaded.walletAddress === WALLET_B,
           "env var should win over the inline value per the documented precedence order"
         );
       });
@@ -295,7 +304,7 @@ test("throws when an x402 chain is priced but no [facilitator] block is configur
         endpoint: "/mdf/pay",
         accepted_chains: ["base"],
         accepted_currencies: ["USDC"],
-        wallet: "0xDEAD",
+        wallet: WALLET_A,
       },
     },
     ({ yamlPath }) => {
@@ -316,7 +325,7 @@ test("throws when an x402 chain is priced but the facilitator has no asset entry
         endpoint: "/mdf/pay",
         accepted_chains: ["base"],
         accepted_currencies: ["USDC"],
-        wallet: "0xDEAD",
+        wallet: WALLET_A,
       },
       facilitator: { url: "https://x402.bitcryptic.com", chains: {} },
     },
@@ -338,7 +347,7 @@ test("loads cleanly when the facilitator has a matching chain asset entry", () =
         endpoint: "/mdf/pay",
         accepted_chains: ["base"],
         accepted_currencies: ["USDC"],
-        wallet: "0xDEAD",
+        wallet: WALLET_A,
       },
       facilitator: {
         url: "https://x402.bitcryptic.com",
@@ -370,7 +379,7 @@ test("lightning-only pricing does not require a [facilitator] block", () => {
         endpoint: "/mdf/pay",
         accepted_chains: ["lightning"],
         accepted_currencies: ["BTC"],
-        wallet: "n/a",
+        wallet: WALLET_A,
       },
       lightning: {
         api_url: "https://alby.example.com",
@@ -461,7 +470,7 @@ test("throws when [auth] is configured but no priced section meets its threshold
         endpoint: "/mdf/pay",
         accepted_chains: ["base"],
         accepted_currencies: ["USDC"],
-        wallet: "0xDEAD",
+        wallet: WALLET_A,
       },
       facilitator: {
         url: "https://x402.bitcryptic.com",
@@ -500,10 +509,10 @@ test("emits the wallet in mdf.json's payment object once resolved", () => {
       },
     },
     ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: "0xDEAD" }, () => {
+      withEnv({ MDF_WALLET: WALLET_A }, () => {
         const loaded = loadConfig(yamlPath);
         const mdfJson = JSON.parse(loaded.mdfJson);
-        assert(mdfJson.payment.wallet === "0xDEAD", "mdf.json payment.wallet should be the resolved wallet");
+        assert(mdfJson.payment.wallet === WALLET_A, "mdf.json payment.wallet should be the resolved wallet");
         assert(
           mdfJson.payment.endpoint === "https://example.com/mdf/pay",
           "root-relative payment endpoint should resolve against site.url"
@@ -528,12 +537,126 @@ test("resolves an already-absolute https:// endpoint unchanged", () => {
       },
     },
     ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: "0xDEAD" }, () => {
+      withEnv({ MDF_WALLET: WALLET_A }, () => {
         const loaded = loadConfig(yamlPath);
         const mdfJson = JSON.parse(loaded.mdfJson);
         assert(
           mdfJson.payment.endpoint === "https://pay.elsewhere.com/mdf/pay",
           "an absolute https:// endpoint should be passed through unchanged"
+        );
+      });
+    }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Wallet validation (Vikunja #9)
+// ---------------------------------------------------------------------------
+
+console.log("\nWallet validation\n");
+
+test("accepts a valid EIP-55 checksummed address", () => {
+  assert(isValidEip55Address(WALLET_A), "all-digit checksummed address should be valid");
+  assert(isValidEip55Address(WALLET_B), "letter-containing checksummed address should be valid");
+});
+
+test("accepts the live production wallet captured in B0", () => {
+  assert(isValidEip55Address(WALLET_LIVE), "live demo wallet must pass the validator");
+});
+
+test("toEip55Checksum normalises an unchecksummed address to canonical form", () => {
+  assert(
+    toEip55Checksum(WALLET_LIVE.toLowerCase()) === WALLET_LIVE,
+    "lowercase input should normalise back to the canonical checksum form"
+  );
+});
+
+test("rejects a single flipped-case character", () => {
+  const flipped = WALLET_B.replace(/[A-F]/, (c) => (c === "A" ? "a" : c.toLowerCase()));
+  assert(flipped !== WALLET_B, "fixture flip must actually change the string");
+  assert(!isValidEip55Address(flipped), "flipped-case address must be rejected");
+});
+
+test("rejects all-lowercase and all-uppercase forms", () => {
+  assert(!isValidEip55Address(WALLET_B.toLowerCase()), "all-lowercase must be rejected");
+  assert(!isValidEip55Address(WALLET_B.toUpperCase()), "all-uppercase must be rejected");
+});
+
+test("rejects wrong length, missing 0x, and non-hex characters", () => {
+  assert(!isValidEip55Address(WALLET_B.slice(0, -1)), "39 hex digits must be rejected");
+  assert(!isValidEip55Address(WALLET_B + "0"), "41 hex digits must be rejected");
+  assert(!isValidEip55Address(WALLET_B.slice(2)), "missing 0x must be rejected");
+  assert(!isValidEip55Address("0x" + "g".repeat(40)), "non-hex characters must be rejected");
+});
+
+test("rejects the zero address", () => {
+  assert(!isValidEip55Address("0x" + "0".repeat(40)), "zero address must be rejected");
+});
+
+test("priced config with a bad wallet refuses to start", () => {
+  withTempDir(
+    {
+      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
+      payment: {
+        endpoint: "/mdf/pay",
+        accepted_chains: ["base"],
+        accepted_currencies: ["USDC"],
+      },
+      facilitator: {
+        url: "https://x402.bitcryptic.com",
+        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
+      },
+    },
+    ({ yamlPath }) => {
+      withEnv({ MDF_WALLET: "0xDEADBEEF" }, () => {
+        assertThrows(() => loadConfig(yamlPath), "EIP-55", "priced with malformed wallet");
+      });
+    }
+  );
+});
+
+test("unpriced config with a bad wallet warns only", () => {
+  withTempDir(
+    {
+      payment: {
+        endpoint: "/mdf/pay",
+        accepted_chains: ["base"],
+        accepted_currencies: ["USDC"],
+        wallet: "not-an-address",
+      },
+    },
+    ({ yamlPath }) => {
+      withEnv({ MDF_WALLET: undefined }, () => {
+        const loaded = loadConfig(yamlPath);
+        assert(
+          loaded.walletAddress === "not-an-address",
+          "malformed wallet should still resolve when nothing is priced"
+        );
+      });
+    }
+  );
+});
+
+test("trailing newline on a wallet secret is trimmed, not treated as invalid", () => {
+  withTempDir(
+    {
+      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
+      payment: {
+        endpoint: "/mdf/pay",
+        accepted_chains: ["base"],
+        accepted_currencies: ["USDC"],
+      },
+      facilitator: {
+        url: "https://x402.bitcryptic.com",
+        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
+      },
+    },
+    ({ yamlPath }) => {
+      withEnv({ MDF_WALLET: WALLET_LIVE + "\n" }, () => {
+        const loaded = loadConfig(yamlPath);
+        assert(
+          loaded.walletAddress === WALLET_LIVE,
+          "trailing newline should be trimmed before validation"
         );
       });
     }
