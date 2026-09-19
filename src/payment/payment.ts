@@ -753,7 +753,11 @@ export async function createL402Challenge(
 
   if (!config.lightning) return null;
 
-  const { api_url, api_token, invoice_expiry_seconds, token_secret } = config.lightning;
+  const { api_url, invoice_expiry_seconds } = config.lightning;
+  // loader.ts resolves (and requires) both whenever [lightning] is configured;
+  // the schema fields are optional so the resolution lives in exactly one place.
+  const api_token = config.lightning.api_token!;
+  const token_secret = config.lightning.token_secret!;
   const required = requiredPrice(urlPath, config);
   const amountSats = usdToSats(required);
   const expiry = invoice_expiry_seconds ?? 300;
@@ -839,7 +843,9 @@ export async function verifyL402(
     };
   }
 
-  const { api_url, api_token, token_secret } = config.lightning;
+  const { api_url } = config.lightning;
+  const api_token = config.lightning.api_token!;
+  const token_secret = config.lightning.token_secret!;
 
   // Step 2+3: Verify and decode macaroon
   let payload: MacaroonPayload;

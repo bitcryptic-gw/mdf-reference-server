@@ -330,7 +330,11 @@ export function loadConfig(configPath = "./mdf.yaml"): LoadedConfig {
   // delegated to a standard facilitator's /verify and /settle endpoints.
   const facilitatorConfig: FacilitatorConfig | null = config.facilitator ?? null;
 
-  // Resolve lightning secrets — only if lightning block is present in config
+  // Resolve lightning secrets — only if a [lightning] block is present.
+  // The schema's api_token/token_secret fields are optional and inert (Vikunja
+  // #27): this resolution is the single source of truth, so a placeholder left
+  // in mdf.yaml is never read, and a missing file/env secret still refuses to
+  // start.
 if (config.lightning) {
   const apiToken = resolveSecret("alby_api_token", "MDF_ALBY_TOKEN", undefined);
   if (!apiToken) {

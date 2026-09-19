@@ -99,9 +99,12 @@ const DashboardSchema = z.object({
 
 const LightningSchema = z.object({
   api_url: z.string().url(),
-  api_token: z.string().min(1),
+  // api_token / token_secret are optional and inert: when present they are
+  // never read or logged. loader.ts resolves both from a mounted secret file
+  // or env var and throws if they cannot be resolved (Vikunja #27).
+  api_token: z.string().optional(),
   invoice_expiry_seconds: z.number().int().min(60).default(300),
-  token_secret: z.string().min(32),
+  token_secret: z.string().optional(),
 });
 
 /**

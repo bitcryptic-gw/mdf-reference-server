@@ -367,11 +367,9 @@ test("loads cleanly when the facilitator has a matching chain asset entry", () =
 
 test("lightning-only pricing does not require a [facilitator] block", () => {
   // hasX402Price excludes chain === "lightning" — a lightning-only priced
-  // site should never demand a facilitator config. LightningSchema requires
-  // api_token/token_secret inline (min 1 / min 32 chars) just to parse, even
-  // though loader.ts always overwrites both from file/env afterward — see
-  // the note below on the two negative-path tests for why that inline value
-  // is schema-required but loader-ignored.
+  // site should never demand a facilitator config. Since Vikunja #27 the
+  // LightningSchema fields are optional, so this config carries no inline
+  // api_token/token_secret at all and resolution comes from the environment.
   withTempDir(
     {
       pricing: { default: { amount: "0.00000001", currency: "BTC", chain: "lightning" } },
@@ -383,8 +381,6 @@ test("lightning-only pricing does not require a [facilitator] block", () => {
       },
       lightning: {
         api_url: "https://alby.example.com",
-        api_token: "inline-placeholder",
-        token_secret: "inline-placeholder-padded-to-32ch",
       },
     },
     ({ yamlPath }) => {
@@ -398,7 +394,7 @@ test("lightning-only pricing does not require a [facilitator] block", () => {
           );
           assert(
             loaded.config.lightning?.api_token === "test-token",
-            "MDF_ALBY_TOKEN should override the inline placeholder"
+            "resolved api_token should come from the environment"
           );
         }
       );
@@ -406,46 +402,60 @@ test("lightning-only pricing does not require a [facilitator] block", () => {
   );
 });
 
-// NOTE on the two tests below: the schema requires api_token (min 1 char)
-// and token_secret (min 32 chars) inline just to satisfy LightningSchema
-// (schema.ts:100-105), but loader.ts's secret-resolution call passes
-// `undefined` as resolveSecret's inline-value argument for both fields
-// (loader.ts:317, :324) rather than the config's own inline value — so
-// whatever placeholder satisfies the schema is never actually consulted
-// here, and the "secret not found" throw *is* reachable: a schema-valid
-// placeholder plus no file/env still throws. The placeholder is dead
-// weight from the loader's perspective, but required by the schema; worth
-// its own follow-up (see Vikunja) on whether the schema should relax those
-// fields to optional so the requirement lives in one place, but that's a
-// design decision, not fixed here.
-test("throws when [lightning] is configured but alby_api_token cannot be resolved", () => {
+// The test harness cannot write /run/secrets (root-owned), so secret-file
+// resolution is exercised via the MDF_* env vars that share resolveSecret's
+// precedence chain — the same stand-in used by the wallet-precedence tests.
+
+test("lightning block with no inline fields and a resolvable secret loads", () => {
   withTempDir(
     {
       lightning: {
         api_url: "https://alby.example.com",
-        api_token: "schema-placeholder-not-actually-consulted",
-        token_secret: "x".repeat(32),
       },
     },
     ({ yamlPath }) => {
-      withEnv({ MDF_ALBY_TOKEN: undefined, MDF_LIGHTNING_SECRET: "x".repeat(32) }, () => {
+      withEnv(
+        { MDF_ALBY_TOKEN: "resolved-token", MDF_LIGHTNING_SECRET: "y".repeat(32) },
+        () => {
+          const loaded = loadConfig(yamlPath);
+          assert(
+            loaded.config.lightning?.api_token === "resolved-token",
+            "api_token should resolve with no inline field present"
+          );
+          assert(
+            loaded.config.lightning?.token_secret === "y".repeat(32),
+            "token_secret should resolve with no inline field present"
+          );
+        }
+      );
+    }
+  );
+});
+
+test("throws when [lightning] has no inline fields and nothing resolvable", () => {
+  withTempDir(
+    {
+      lightning: {
+        api_url: "https://alby.example.com",
+      },
+    },
+    ({ yamlPath }) => {
+      withEnv({ MDF_ALBY_TOKEN: undefined, MDF_LIGHTNING_SECRET: undefined }, () => {
         assertThrows(
           () => loadConfig(yamlPath),
           "alby_api_token secret not found",
-          "lightning configured with no alby token resolvable via file or env"
+          "lightning configured with nothing resolvable via file or env"
         );
       });
     }
   );
 });
 
-test("throws when [lightning] is configured but lightning_token_secret cannot be resolved", () => {
+test("throws when the lightning token secret alone cannot be resolved", () => {
   withTempDir(
     {
       lightning: {
         api_url: "https://alby.example.com",
-        api_token: "test-token",
-        token_secret: "schema-placeholder-padded-to-32-chars!!",
       },
     },
     ({ yamlPath }) => {
@@ -454,6 +464,57 @@ test("throws when [lightning] is configured but lightning_token_secret cannot be
           () => loadConfig(yamlPath),
           "lightning_token_secret not found",
           "lightning configured with no token secret resolvable via file or env"
+        );
+      });
+    }
+  );
+});
+
+test("legacy inline placeholders still parse and remain inert", () => {
+  // Both live hosts carry inline placeholders in mdf.yaml. They must keep
+  // parsing, but must never be read: the resolved value is the env secret.
+  withTempDir(
+    {
+      lightning: {
+        api_url: "https://alby.example.com",
+        api_token: "inline-placeholder",
+        token_secret: "inline-placeholder-padded-to-32ch",
+      },
+    },
+    ({ yamlPath }) => {
+      withEnv(
+        { MDF_ALBY_TOKEN: "env-token", MDF_LIGHTNING_SECRET: "z".repeat(32) },
+        () => {
+          const loaded = loadConfig(yamlPath);
+          assert(
+            loaded.config.lightning?.api_token === "env-token",
+            "inline placeholder must not win over the resolved secret"
+          );
+          assert(
+            loaded.config.lightning?.token_secret === "z".repeat(32),
+            "inline token_secret must not win over the resolved secret"
+          );
+        }
+      );
+    }
+  );
+});
+
+test("legacy inline placeholders alone do not satisfy secret resolution", () => {
+  withTempDir(
+    {
+      lightning: {
+        api_url: "https://alby.example.com",
+        api_token: "inline-placeholder",
+        token_secret: "inline-placeholder-padded-to-32ch",
+      },
+    },
+    ({ yamlPath }) => {
+      withEnv({ MDF_ALBY_TOKEN: undefined, MDF_LIGHTNING_SECRET: undefined }, () => {
+        assertThrows(
+          () => loadConfig(yamlPath),
+          "alby_api_token secret not found",
+          "inline placeholder must be inert and not satisfy resolution"
         );
       });
     }

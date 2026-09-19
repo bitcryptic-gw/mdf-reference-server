@@ -64,7 +64,9 @@ curl https://mdf-demo.bitcryptic.com/feed.xml
 
 ## Configuration
 
-All server configuration lives in `mdf.yaml`. Secrets are resolved at startup in precedence order — from `/run/secrets/<name>` files, then `MDF_*` environment variables, then any value in `mdf.yaml`. In the provided Compose setup the wallet address is mounted as `/run/secrets/wallet_address` (a file, never an env var); the Alby and Lightning-token secrets are mounted the same way. A non-zero price with no resolvable wallet, or a configured Lightning block with no token secrets, aborts startup with a descriptive error.
+All server configuration lives in `mdf.yaml`. Secrets are resolved at startup in precedence order — from `/run/secrets/<name>` files, then `MDF_*` environment variables, then any value in `mdf.yaml`. In the provided Compose setup the wallet address is mounted as `/run/secrets/wallet_address` (a file, never an env var); the Alby and Lightning-token secrets are mounted the same way.
+
+Startup validation fails closed: a non-zero price with no resolvable wallet, or a configured Lightning block with no resolvable token secrets, aborts startup with a descriptive error. When any price is non-zero, the resolved wallet must be a valid **EIP-55 checksummed** address (mixed-case, matching its own keccak-256 checksum) — all-lowercase, all-uppercase, wrong-length, non-hex, and zero addresses are rejected. The `[lightning]` block's `api_token` and `token_secret` fields are optional and, if present, **inert** — they are never read or logged; the server resolves both from the secret file or env var and refuses to start if neither resolves.
 
 ```yaml
 site:

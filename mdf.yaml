@@ -74,8 +74,10 @@ dashboard:
 lightning:
   api_url: http://10.61.21.97:8021/api
   invoice_expiry_seconds: 3600
-  api_token: "placeholder-value-replaced-by-secret-at-runtime"
-  token_secret: "placeholder-value-replaced-by-secret-at-runtime-xx"
+  # api_token and token_secret are optional and, if present, inert — never read
+  # or logged. The server resolves them at startup from /run/secrets/<name>
+  # (preferred) or the MDF_ALBY_TOKEN / MDF_LIGHTNING_SECRET env vars, and
+  # refuses to start if [lightning] is configured but neither resolves.
 
 # x402 facilitator — any service exposing the standard /verify and /settle
 # endpoints. MDF delegates all x402 verification and settlement to it.
