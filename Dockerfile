@@ -1,11 +1,17 @@
-# Stage 1: install production dependencies
-FROM oven/bun:1-alpine AS deps
+# Pinned to the host toolchain (Bun 1.3.14) by exact tag AND index digest, so
+# the image cannot float to a newer Bun whose lockfile format the host cannot
+# read (0.2.4: oven/bun:1-alpine resolved to 1.4.2 while the host is 1.3.14,
+# forcing the lockfile-version override to be dropped). The digest is the
+# multi-arch manifest-list digest, so linux/amd64 and linux/arm64 stay pinned
+# together. 1.3.14-alpine matches the previous base variant and provides
+# su-exec via apk.
+FROM oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0 AS deps
 WORKDIR /app
 COPY package.json bun.lock ./
 RUN bun install --production --frozen-lockfile
 
 # Stage 2: production image
-FROM oven/bun:1-alpine
+FROM oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0
 
 RUN apk add --no-cache su-exec
 WORKDIR /app
