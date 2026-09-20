@@ -1306,6 +1306,14 @@ export async function build402Response(
   const headers: Record<string, string> = {
     "Content-Type": "application/json; charset=utf-8",
     "X-MDF-Version": "1",
+    // A 402 is a per-request payment offer: an L402 invoice must be unique per
+    // request, and an x402 offer carries request-bound payment parameters.
+    // `no-store` is the explicit guard against any shared cache storing and
+    // replaying an offer to a second agent. A 402 is not heuristically
+    // cacheable, so `no-store` is hardening rather than a live fault fix — but
+    // it is set here, in the one builder every 402 (content paths and
+    // /mdf/pay, x402 and L402) passes through, so a new route cannot forget it.
+    "Cache-Control": "no-store",
   };
 
   // Attempt L402 challenge if lightning is configured
