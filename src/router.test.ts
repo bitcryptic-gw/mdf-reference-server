@@ -268,11 +268,14 @@ await test("free conditional request still returns 304", async () => {
   assertEquals(second.status, 304, "free conditional 304");
 });
 
-await test("free-route source_bytes match the 0.2.4 baseline", async () => {
+await test("free-route source_bytes match the current content baseline", async () => {
   const root = await request("/", { headers: { Accept: "text/markdown" } });
   const docs = await request("/docs/getting-started", { headers: { Accept: "text/markdown" } });
   assertEquals(root.status, 200, "root is free");
-  assertEquals(root.headers.get("x-mdf-source-bytes"), "1241", "root source_bytes");
+  // / moved 1241 -> 1239 when the demo content page prices were corrected in
+  // content/index.md (commit b2172c5): "$100.00" -> "$0.10" removes exactly 2
+  // bytes of rendered HTML; "$1.00" -> "$0.01" is length-neutral.
+  assertEquals(root.headers.get("x-mdf-source-bytes"), "1239", "root source_bytes");
   assertEquals(docs.headers.get("x-mdf-source-bytes"), "1003", "docs source_bytes");
 });
 
