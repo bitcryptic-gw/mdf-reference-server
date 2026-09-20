@@ -245,6 +245,54 @@ test("frontmatter stripped from HTML render", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Caching semantics (0.2.5)
+// ---------------------------------------------------------------------------
+
+console.log("\nCaching semantics\n");
+
+test("free 200 keeps no-cache and its validators", () => {
+  const result = serveContent("/docs/getting-started", "text/markdown", null, loaded);
+  assertEquals(result.status, 200, "status");
+  assertEquals(result.headers["Cache-Control"], "no-cache", "free cache-control");
+  assert(result.headers["ETag"]?.startsWith('"'), "free ETag present");
+  assert(!!result.headers["Last-Modified"], "free Last-Modified present");
+});
+
+test("paid 200 is private, no-store with no validators (markdown)", () => {
+  const result = serveContent("/premium/deep-dive", "text/markdown", null, loaded);
+  assertEquals(result.status, 200, "status");
+  assertEquals(result.headers["Cache-Control"], "private, no-store", "paid cache-control");
+  assert(!result.headers["ETag"], "paid response must carry no ETag validator");
+  assert(!result.headers["Last-Modified"], "paid response must carry no Last-Modified");
+});
+
+test("paid 200 is private, no-store with no validators (HTML)", () => {
+  const result = serveContent("/premium/deep-dive", "text/html", null, loaded);
+  assertEquals(result.status, 200, "status");
+  assertEquals(result.headers["Cache-Control"], "private, no-store", "paid cache-control");
+  assert(!result.headers["ETag"], "paid response must carry no ETag validator");
+});
+
+test("paid resource never answers 304 on any If-None-Match", () => {
+  const wildcard = serveContent("/premium/deep-dive", "text/markdown", "*", loaded);
+  assertEquals(wildcard.status, 200, "wildcard If-None-Match on a paid resource must be 200");
+  const shaped = serveContent("/premium/deep-dive", "text/markdown", '"ede980c43b5b3632"', loaded);
+  assertEquals(shaped.status, 200, "quoted If-None-Match on a paid resource must be 200");
+  assertEquals(shaped.headers["Cache-Control"], "private, no-store", "paid stays no-store");
+});
+
+test("free resource still answers 304 on a matching If-None-Match", () => {
+  const first = serveContent("/docs/getting-started", "text/markdown", null, loaded);
+  const second = serveContent(
+    "/docs/getting-started",
+    "text/markdown",
+    first.headers["ETag"],
+    loaded
+  );
+  assertEquals(second.status, 304, "free conditional still 304");
+});
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 

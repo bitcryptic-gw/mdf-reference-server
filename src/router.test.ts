@@ -64,7 +64,9 @@ function makeLoaded(): LoadedConfig {
       pricing: {
         default: { amount: "0.0001", currency: "USDC", chain: "base" },
         sections: {
+          "/": { amount: "0.0000", currency: null, chain: null },
           "/docs/**": { amount: "0.0000", currency: null, chain: null },
+          "/micropayment/**": { amount: "0.00000001", currency: "BTC", chain: "lightning" },
           "/premium/**": { amount: "1.0000", currency: "USDC", chain: "base" },
           "/private/**": { amount: "100.00", currency: "USDC", chain: "base" },
         },
@@ -155,6 +157,123 @@ await test("existing free content returns 200", async () => {
 await test("non-GET on an unknown content path is still 405, not 404", async () => {
   const res = await request("/premium/does-not-exist", { method: "POST" });
   assertEquals(res.status, 405, "POST unknown content path is 405");
+});
+
+// ---------------------------------------------------------------------------
+// Caching safety on the payment path (0.2.5)
+//
+// A 402 is a per-request payment offer and must never be stored by a shared
+// cache; a paid 200 must be impossible for a shared cache to store or serve;
+// and an unpaid conditional request to a priced route must always get 402,
+// never 304. These run the real router so the ordering is asserted end to end.
+// ---------------------------------------------------------------------------
+
+console.log("\n402 responses are no-store on every priced route and rail\n");
+
+await test("x402 priced route: 402 no-store (markdown)", async () => {
+  const res = await request("/premium/deep-dive", { headers: { Accept: "text/markdown" } });
+  assertEquals(res.status, 402, "status");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+await test("x402 priced route: 402 no-store (HTML)", async () => {
+  const res = await request("/premium/deep-dive", { headers: { Accept: "text/html" } });
+  assertEquals(res.status, 402, "status");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+await test("L402/lightning priced route: 402 no-store (markdown)", async () => {
+  const res = await request("/micropayment/intro", { headers: { Accept: "text/markdown" } });
+  assertEquals(res.status, 402, "status");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+await test("L402/lightning priced route: 402 no-store (HTML)", async () => {
+  const res = await request("/micropayment/intro", { headers: { Accept: "text/html" } });
+  assertEquals(res.status, 402, "status");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+console.log("\nPayment failures are no-store\n");
+
+await test("malformed X-PAYMENT on an x402 route is a no-store 402", async () => {
+  const res = await request("/premium/deep-dive", {
+    headers: { Accept: "text/markdown", "X-PAYMENT": "not-base64-not-json" },
+  });
+  assertEquals(res.status, 402, "status");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+await test("malformed L402 credential is a no-store 402", async () => {
+  const res = await request("/micropayment/intro", {
+    headers: { Accept: "text/markdown", Authorization: "L402 nonsense" },
+  });
+  assertEquals(res.status, 402, "status");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+await test("an X-PAYMENT attempt against a lightning offer is rejected, not approved", async () => {
+  const res = await request("/micropayment/intro", {
+    headers: { Accept: "text/markdown", "X-PAYMENT": "garbage" },
+  });
+  assertEquals(res.status, 402, "lightning offer must demand L402, never serve on X-PAYMENT");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+await test("/mdf/pay with no X-PAYMENT returns a no-store 400", async () => {
+  const res = await request("/mdf/pay", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ resource: "/premium/deep-dive" }),
+  });
+  assertEquals(res.status, 400, "status");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+console.log("\nUnpaid conditional requests never 304 on a priced route\n");
+
+await test("unpaid If-None-Match on a priced route returns 402, not 304", async () => {
+  const res = await request("/premium/deep-dive", {
+    headers: { Accept: "text/markdown", "If-None-Match": "*" },
+  });
+  assertEquals(res.status, 402, "status");
+  assert(res.status !== 304, "must never be 304 without payment");
+  assertEquals(res.headers.get("cache-control"), "no-store", "cache-control");
+});
+
+await test("unpaid far-future If-Modified-Since on a priced route returns 402, not 304", async () => {
+  const res = await request("/premium/deep-dive", {
+    headers: { Accept: "text/markdown", "If-Modified-Since": "Tue, 01 Jan 2999 00:00:00 GMT" },
+  });
+  assertEquals(res.status, 402, "status");
+  assert(res.status !== 304, "must never be 304 without payment");
+});
+
+console.log("\nFree-route behaviour and source_bytes unchanged\n");
+
+await test("free 200 keeps no-cache and its validators", async () => {
+  const res = await request("/docs/getting-started", { headers: { Accept: "text/markdown" } });
+  assertEquals(res.status, 200, "status");
+  assertEquals(res.headers.get("cache-control"), "no-cache", "free cache-control");
+  assert(!!res.headers.get("etag"), "free ETag present");
+  assert(!!res.headers.get("last-modified"), "free Last-Modified present");
+});
+
+await test("free conditional request still returns 304", async () => {
+  const first = await request("/docs/getting-started", { headers: { Accept: "text/markdown" } });
+  const etag = first.headers.get("etag") ?? "";
+  const second = await request("/docs/getting-started", {
+    headers: { Accept: "text/markdown", "If-None-Match": etag },
+  });
+  assertEquals(second.status, 304, "free conditional 304");
+});
+
+await test("free-route source_bytes match the 0.2.4 baseline", async () => {
+  const root = await request("/", { headers: { Accept: "text/markdown" } });
+  const docs = await request("/docs/getting-started", { headers: { Accept: "text/markdown" } });
+  assertEquals(root.status, 200, "root is free");
+  assertEquals(root.headers.get("x-mdf-source-bytes"), "1241", "root source_bytes");
+  assertEquals(docs.headers.get("x-mdf-source-bytes"), "1003", "docs source_bytes");
 });
 
 // ---------------------------------------------------------------------------
