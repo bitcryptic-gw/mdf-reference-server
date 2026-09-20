@@ -22,9 +22,9 @@ MDF uses price as a unified access policy signal across four tiers:
 | Price | Tier | Meaning |
 |-------|------|---------|
 | $0.00 | Open | Serve immediately, no payment required |
-| ~$0.0001 (1 sat) | Micropayment | Capability signal; offsets serving costs |
-| $1.00+ | Premium | Gated content; bearer token issued on payment |
-| $100.00+ | Private | High-value access; token scope-limited to paying path |
+| ~$0.001 (1 sat) | Micropayment | Capability signal; offsets serving costs |
+| $0.01+ | Premium | Gated content; paid directly per request, no token issued |
+| $0.10+ | Private | High-value access; token scope-limited to paying path |
 
 Each tier uses the same HTTP content negotiation mechanism — `Accept: text/markdown` — and the same L402 payment flow. Only the price changes.
 

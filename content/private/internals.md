@@ -4,7 +4,7 @@ title: Internal Architecture Notes
 
 # Internal Architecture Notes
 
-This document is priced at $100.00 per fetch. At this tier, payment triggers bearer token issuance rather than direct content delivery.
+This document is priced at $0.10. At this tier, payment issues a bearer token rather than delivering content directly: the token is scoped to `/private/`, valid for 24 hours, and reusable across requests to that scope.
 
 ## Token-based access
 
