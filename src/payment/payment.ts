@@ -213,7 +213,7 @@ async function albyGetInvoice(
  * appropriate for a reference implementation. A production deployment may wish
  * to adopt the full macaroon specification for delegation and attenuation support.
  */
-function createMacaroon(
+export function createMacaroon(
   paymentHash: string,
   pathScope: string,
   ttlSeconds: number,
