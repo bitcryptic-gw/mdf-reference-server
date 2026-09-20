@@ -27,11 +27,11 @@ pricing:
       currency: "BTC"
       chain: "lightning"
     /premium/**:
-      amount: "1.0000"
+      amount: "0.01"
       currency: USDC
       chain: base
     /private/**:
-      amount: "100.00"
+      amount: "0.10"
       currency: USDC
       chain: base
     # Base Sepolia testnet tier — exercises x402 end-to-end with testnet funds.
