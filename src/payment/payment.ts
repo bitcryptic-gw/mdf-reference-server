@@ -121,10 +121,16 @@ interface AlbyInvoiceStatus {
 
 /**
  * Create a Lightning invoice via Alby Hub.
- * Amount is in satoshis. Description is shown in the payer's wallet.
+ *
+ * `amountMsat` is in **millisatoshis**. Alby Hub's `POST /api/invoices` takes
+ * `amount` in msat and rejects any value that is not a whole number of
+ * satoshis (a multiple of 1000 msat) with HTTP 500 "the amount must be a whole
+ * number of satoshis". Verified live 2026-09-20: sending 1000 yields a 1-sat
+ * invoice (`lnbc10n`) and sending 100000 yields a 100-sat invoice (`lnbc1u`).
+ * Description is shown in the payer's wallet.
  */
 async function albyCreateInvoice(
-  amountSats: number,
+  amountMsat: number,
   description: string,
   expirySeconds: number,
   apiUrl: string,
@@ -137,7 +143,7 @@ async function albyCreateInvoice(
       "Authorization": `Bearer ${apiToken}`,
     },
     body: JSON.stringify({
-      amount: amountSats,
+      amount: amountMsat,
       description,
       expiry: expirySeconds,
     }),
@@ -445,23 +451,43 @@ function pathScope(urlPath: string): string {
   return parts.length > 0 ? `/${parts[0]}` : "/";
 }
 
+/** Fixed reference rate: 1 BTC ≈ 100,000 USD → 1 USD ≈ 1,000 sats. */
+const SATS_PER_USD = 1000;
+
+/** 1 satoshi = 1,000 millisatoshis. */
+const MSAT_PER_SAT = 1000;
+
 /**
- * Convert a USD amount string to satoshis using a rough fixed rate.
+ * Convert a USD amount string to an exact, possibly fractional, satoshi value
+ * using a rough fixed rate.
  *
  * TODO: Replace with a live rate feed (e.g. Coingecko or a self-hosted price
  * oracle) once the implementation is production-ready. The fixed rate is
  * acceptable for the reference implementation and demo purposes.
  *
- * At time of writing: 1 BTC ≈ 100,000 USD → 1 USD ≈ 1,000 sats
+ * Deliberately does NOT round: rounding belongs at the invoice boundary
+ * (`satsToMsat`), where it must round *up* so the publisher is never
+ * underpaid. Keeping this exact makes that rounding testable and keeps the
+ * advertised price and the invoiced amount derived from the same number.
  */
-function usdToSats(usdAmount: string): number {
+export function usdToSats(usdAmount: string): number {
   const usd = parseFloat(usdAmount);
-  if (isNaN(usd)) return 0;
-  // 1 sat = $0.001 USD at $100k/BTC
-  // Math.max(1, ...) enforces a 1 sat floor — for the micropayment tier
-  // (amount: "0.00000001" BTC) this arithmetic lands on exactly 1 sat,
-  // which is correct. Replace the fixed rate with a live feed for production.
-  return Math.max(1, Math.ceil(usd * 1000));
+  if (!Number.isFinite(usd) || usd < 0) return 0;
+  return usd * SATS_PER_USD;
+}
+
+/**
+ * Convert a satoshi value to the millisatoshi amount Alby Hub's invoice API
+ * expects, rounding **up** to a whole satoshi (Alby requires a multiple of
+ * 1000 msat) with a 1-satoshi floor so an invoice is never zero.
+ *
+ * Rounding up means a fractional price (e.g. a sub-satoshi micropayment) still
+ * produces a payable whole-satoshi invoice and the publisher is never
+ * underpaid. The value returned is what `albyCreateInvoice` sends.
+ */
+export function satsToMsat(sats: number): number {
+  if (!Number.isFinite(sats) || sats <= 0) return MSAT_PER_SAT;
+  return Math.ceil(sats) * MSAT_PER_SAT;
 }
 
 // ---------------------------------------------------------------------------
@@ -759,13 +785,18 @@ export async function createL402Challenge(
   const api_token = config.lightning.api_token!;
   const token_secret = config.lightning.token_secret!;
   const required = requiredPrice(urlPath, config);
-  const amountSats = usdToSats(required);
+  // Alby Hub invoices in millisatoshis and requires a whole number of
+  // satoshis. `usdToSats` yields the (possibly fractional) satoshi value for
+  // the advertised price; `satsToMsat` rounds it up to a whole satoshi and
+  // converts to msat, so the invoice matches the advertised amount and is
+  // never under-charged.
+  const amountMsat = satsToMsat(usdToSats(required));
   const expiry = invoice_expiry_seconds ?? 300;
 
   let invoice: AlbyInvoice;
   try {
     invoice = await albyCreateInvoice(
-      amountSats,
+      amountMsat,
       `MDF access: ${urlPath}`,
       expiry,
       api_url,

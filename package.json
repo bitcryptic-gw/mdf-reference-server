@@ -8,11 +8,12 @@
     "dev": "bun --watch src/index.ts",
     "test:config": "bun run src/config/loader.test.ts",
     "test:402": "bun run src/payment/402-schema.test.ts",
+    "test:l402": "bun run src/payment/l402-invoice.test.ts",
     "test:handler": "bun run src/content/handler.test.ts",
     "test:source-bytes": "bun run src/source-bytes.test.ts",
     "test:router": "bun run src/router.test.ts",
     "test:health": "bun run src/health.test.ts",
-    "test": "bun run test:config && bun run test:402 && bun run test:handler && bun run test:source-bytes && bun run test:router && bun run test:health"
+    "test": "bun run test:config && bun run test:402 && bun run test:l402 && bun run test:handler && bun run test:source-bytes && bun run test:router && bun run test:health"
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",
