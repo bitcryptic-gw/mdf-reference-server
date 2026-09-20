@@ -291,11 +291,20 @@ export function serveContent(
   // Determine title — frontmatter.title, first H1, or filename
   const title = deriveTitle(markdownBody, frontmatter as Record<string, unknown>, urlPath);
 
+  // Pricing decides caching semantics. A free resource is cacheable and
+  // revalidated with validators; a paid resource must never be stored by a
+  // shared cache, so it carries no validators and is never answered 304.
+  const isPriced = parseFloat(priceForPath(urlPath, config).amount) > 0;
+
   // ETag from raw file content (frontmatter included)
   const etag = computeEtag(rawContent);
 
-  // Conditional GET — 304 Not Modified
-  if (ifNoneMatch && ifNoneMatch === etag) {
+  // Conditional GET — 304 Not Modified. Free resources only. Payment is
+  // verified by the router before this handler is reached; this guard is
+  // defence in depth so a mis-ordered caller still cannot turn a priced
+  // resource into a 304 (a shared cache revalidating a stored paid body and
+  // receiving 304 would serve that body to a caller who never paid).
+  if (!isPriced && ifNoneMatch && ifNoneMatch === etag) {
     return {
       status: 304,
       headers: {
@@ -317,11 +326,19 @@ export function serveContent(
   const html = renderHtml(title, markdownBody);
   const sourceBytes = Buffer.byteLength(html, "utf8");
 
-  const baseHeaders: Record<string, string> = {
-    ETag: etag,
-    "Cache-Control": "no-cache",
-    "Last-Modified": new Date(statSync(filePath).mtimeMs).toUTCString(),
-  };
+  const baseHeaders: Record<string, string> = isPriced
+    ? {
+        // A paid 200: impossible for a shared cache to store or serve.
+        // `no-store` also stops the paying client's own HTTP cache, which is
+        // acceptable — an agent that wants to keep what it paid for keeps the
+        // body itself. `private` alone would be the looser alternative.
+        "Cache-Control": "private, no-store",
+      }
+    : {
+        ETag: etag,
+        "Cache-Control": "no-cache",
+        "Last-Modified": new Date(statSync(filePath).mtimeMs).toUTCString(),
+      };
 
   if (wantsMarkdown) {
     return {

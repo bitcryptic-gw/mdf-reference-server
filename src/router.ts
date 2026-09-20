@@ -71,11 +71,15 @@ function logRequest(
 // Response helpers
 // ---------------------------------------------------------------------------
 
-function jsonError(status: number, message: string): Response {
-  return new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-  });
+function jsonError(status: number, message: string, noStore = false): Response {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json; charset=utf-8",
+  };
+  // Payment paths pass noStore so a failed payment attempt (malformed or
+  // rejected X-PAYMENT, facilitator error surfaced to the client) can never be
+  // stored by a shared cache — same guard the 402 builder applies.
+  if (noStore) headers["Cache-Control"] = "no-store";
+  return new Response(JSON.stringify({ error: message }), { status, headers });
 }
 
 function toResponse(result: {
@@ -223,7 +227,7 @@ export async function handleRequest(
       const body = await readBody(req);
       if (body === null) {
         logRequest(method, urlPath, 413, Date.now() - start);
-        return jsonError(413, "Request body too large");
+        return jsonError(413, "Request body too large", true);
       }
 
       let parsed: Record<string, unknown>;
@@ -231,13 +235,13 @@ export async function handleRequest(
         parsed = JSON.parse(body);
       } catch {
         logRequest(method, urlPath, 400, Date.now() - start);
-        return jsonError(400, "Invalid JSON body");
+        return jsonError(400, "Invalid JSON body", true);
       }
 
       const resource = typeof parsed.resource === "string" ? parsed.resource : null;
       if (!resource) {
         logRequest(method, urlPath, 400, Date.now() - start);
-        return jsonError(400, "Missing or invalid field: resource");
+        return jsonError(400, "Missing or invalid field: resource", true);
       }
 
       let payPath: string;
@@ -250,14 +254,14 @@ export async function handleRequest(
       const xPayment = req.headers.get("x-payment");
       if (!xPayment) {
         logRequest(method, urlPath, 400, Date.now() - start);
-        return jsonError(400, "Missing X-PAYMENT header");
+        return jsonError(400, "Missing X-PAYMENT header", true);
       }
 
       const result = await verifyPayment(payPath, xPayment, loaded);
 
       if (result.status === "error") {
         logRequest(method, urlPath, 503, Date.now() - start, { reason: result.reason });
-        return jsonError(503, result.reason);
+        return jsonError(503, result.reason, true);
       }
 
       if (result.status !== "approved" && result.status !== "stub_approved") {
@@ -275,7 +279,7 @@ export async function handleRequest(
 
       if (!tokenResult.ok) {
         logRequest(method, urlPath, 500, Date.now() - start, { reason: tokenResult.reason });
-        return jsonError(500, "Token issuance failed");
+        return jsonError(500, "Token issuance failed", true);
       }
 
       logRequest(method, urlPath, 200, Date.now() - start);
@@ -286,12 +290,16 @@ export async function handleRequest(
         ...(result.settlement ? { payment: result.settlement } : {}),
       }), {
         status: 200,
-        headers: { "Content-Type": "application/json; charset=utf-8" },
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          // The body carries a bearer credential — never cacheable anywhere.
+          "Cache-Control": "no-store",
+        },
       });
     } catch (err) {
       console.error(`[mdf:pay] unexpected error: ${(err as Error).message}`);
       logRequest(method, urlPath, 500, Date.now() - start);
-      return jsonError(500, "Internal error");
+      return jsonError(500, "Internal error", true);
     }
   }
 
@@ -341,7 +349,7 @@ export async function handleRequest(
     // surface it as 503 so the client does not treat it as a hard 402.
     if (paymentResult.status === "error") {
       logRequest(method, urlPath, 503, Date.now() - start, { reason: paymentResult.reason });
-      return jsonError(503, paymentResult.reason);
+      return jsonError(503, paymentResult.reason, true);
     }
 
     if (paymentResult.settlement) x402Settlement = paymentResult.settlement;
