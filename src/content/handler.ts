@@ -226,16 +226,19 @@ function mdfHeaders(
 // ---------------------------------------------------------------------------
 
 function notFound(urlPath: string, wantsMarkdown: boolean): ServeResult {
+  // The 404 body is itself content-negotiated (markdown or HTML), so it
+  // declares the same `Vary: Accept` as a served resource.
+  const vary = { Vary: "Accept" };
   if (wantsMarkdown) {
     return {
       status: 404,
-      headers: { "Content-Type": "text/markdown; charset=utf-8" },
+      headers: { ...vary, "Content-Type": "text/markdown; charset=utf-8" },
       body: `# 404 Not Found\n\nNo content found at \`${urlPath}\`.\n`,
     };
   }
   return {
     status: 404,
-    headers: { "Content-Type": "text/html; charset=utf-8" },
+    headers: { ...vary, "Content-Type": "text/html; charset=utf-8" },
     body: HTML_TEMPLATE("404 Not Found", `<h1>404 Not Found</h1><p>No content found at <code>${escapeHtml(urlPath)}</code>.</p>`),
   };
 }
@@ -296,25 +299,6 @@ export function serveContent(
   // shared cache, so it carries no validators and is never answered 304.
   const isPriced = parseFloat(priceForPath(urlPath, config).amount) > 0;
 
-  // ETag from raw file content (frontmatter included)
-  const etag = computeEtag(rawContent);
-
-  // Conditional GET — 304 Not Modified. Free resources only. Payment is
-  // verified by the router before this handler is reached; this guard is
-  // defence in depth so a mis-ordered caller still cannot turn a priced
-  // resource into a 304 (a shared cache revalidating a stored paid body and
-  // receiving 304 would serve that body to a caller who never paid).
-  if (!isPriced && ifNoneMatch && ifNoneMatch === etag) {
-    return {
-      status: 304,
-      headers: {
-        ETag: etag,
-        "Cache-Control": "no-cache",
-      },
-      body: "",
-    };
-  }
-
   // Determine what markdown content to serve
   // If frontmatter is enabled in config, include it in the markdown response;
   // strip it for HTML (it's already parsed).
@@ -326,8 +310,38 @@ export function serveContent(
   const html = renderHtml(title, markdownBody);
   const sourceBytes = Buffer.byteLength(html, "utf8");
 
+  // Per-representation validator: the ETag identifies the bytes actually
+  // served for this `Accept`, so the markdown and HTML representations of one
+  // URL have different ETags. A conditional request carrying the other
+  // representation's ETag must not match (a shared cache revalidating a stored
+  // markdown body against the HTML ETag, or vice versa, must not get a 304).
+  const etag = computeEtag(wantsMarkdown ? markdownForResponse : html);
+
+  // Every response whose body is chosen by `Accept` declares that choice, so a
+  // shared cache keys on it. Declared here and on the 304 and the negotiated
+  // 404, rather than per branch, so no negotiated response class can omit it.
+  const vary = { Vary: "Accept" };
+
+  // Conditional GET — 304 Not Modified. Free resources only. Payment is
+  // verified by the router before this handler is reached; this guard is
+  // defence in depth so a mis-ordered caller still cannot turn a priced
+  // resource into a 304 (a shared cache revalidating a stored paid body and
+  // receiving 304 would serve that body to a caller who never paid).
+  if (!isPriced && ifNoneMatch && ifNoneMatch === etag) {
+    return {
+      status: 304,
+      headers: {
+        ...vary,
+        ETag: etag,
+        "Cache-Control": "no-cache",
+      },
+      body: "",
+    };
+  }
+
   const baseHeaders: Record<string, string> = isPriced
     ? {
+        ...vary,
         // A paid 200: impossible for a shared cache to store or serve.
         // `no-store` also stops the paying client's own HTTP cache, which is
         // acceptable — an agent that wants to keep what it paid for keeps the
@@ -335,6 +349,7 @@ export function serveContent(
         "Cache-Control": "private, no-store",
       }
     : {
+        ...vary,
         ETag: etag,
         "Cache-Control": "no-cache",
         "Last-Modified": new Date(statSync(filePath).mtimeMs).toUTCString(),

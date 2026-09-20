@@ -276,6 +276,31 @@ await test("free-route source_bytes match the 0.2.4 baseline", async () => {
   assertEquals(docs.headers.get("x-mdf-source-bytes"), "1003", "docs source_bytes");
 });
 
+console.log("\nVary and per-representation ETags end to end\n");
+
+await test("HEAD carries Vary: Accept and a representation ETag", async () => {
+  const res = await request("/docs/getting-started", {
+    method: "HEAD",
+    headers: { Accept: "text/markdown" },
+  });
+  assertEquals(res.status, 200, "HEAD status");
+  assertEquals(res.headers.get("vary"), "Accept", "HEAD Vary");
+  assert(!!res.headers.get("etag"), "HEAD ETag");
+});
+
+await test("cross-representation conditional request does not 304 via the router", async () => {
+  const md = await request("/docs/getting-started", { headers: { Accept: "text/markdown" } });
+  const mdEtag = md.headers.get("etag") ?? "";
+  const cross = await request("/docs/getting-started", {
+    headers: { Accept: "text/html", "If-None-Match": mdEtag },
+  });
+  assertEquals(cross.status, 200, "HTML request with markdown ETag must be 200");
+  const same = await request("/docs/getting-started", {
+    headers: { Accept: "text/markdown", "If-None-Match": mdEtag },
+  });
+  assertEquals(same.status, 304, "markdown request with markdown ETag is 304");
+});
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------

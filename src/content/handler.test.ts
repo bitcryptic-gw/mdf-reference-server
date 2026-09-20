@@ -293,6 +293,71 @@ test("free resource still answers 304 on a matching If-None-Match", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Representation negotiation: Vary + per-representation ETag (0.2.6)
+// ---------------------------------------------------------------------------
+
+console.log("\nRepresentation negotiation\n");
+
+test("markdown and HTML representations have different ETags", () => {
+  const md = serveContent("/docs/getting-started", "text/markdown", null, loaded);
+  const html = serveContent("/docs/getting-started", "text/html", null, loaded);
+  assert(!!md.headers["ETag"], "markdown ETag present");
+  assert(!!html.headers["ETag"], "HTML ETag present");
+  assert(md.headers["ETag"] !== html.headers["ETag"], "ETags must differ per representation");
+});
+
+test("markdown and HTML responses declare Vary: Accept", () => {
+  const md = serveContent("/docs/getting-started", "text/markdown", null, loaded);
+  const html = serveContent("/docs/getting-started", "text/html", null, loaded);
+  assertEquals(md.headers["Vary"], "Accept", "markdown Vary");
+  assertEquals(html.headers["Vary"], "Accept", "HTML Vary");
+});
+
+test("cross-representation conditional request does NOT 304", () => {
+  const md = serveContent("/docs/getting-started", "text/markdown", null, loaded);
+  const html = serveContent("/docs/getting-started", "text/html", null, loaded);
+  const htmlWithMdEtag = serveContent(
+    "/docs/getting-started",
+    "text/html",
+    md.headers["ETag"],
+    loaded
+  );
+  assertEquals(htmlWithMdEtag.status, 200, "HTML must not 304 against the markdown ETag");
+  const mdWithHtmlEtag = serveContent(
+    "/docs/getting-started",
+    "text/markdown",
+    html.headers["ETag"],
+    loaded
+  );
+  assertEquals(mdWithHtmlEtag.status, 200, "markdown must not 304 against the HTML ETag");
+});
+
+test("each representation's own conditional request still 304s", () => {
+  const md = serveContent("/docs/getting-started", "text/markdown", null, loaded);
+  const html = serveContent("/docs/getting-started", "text/html", null, loaded);
+  const md304 = serveContent("/docs/getting-started", "text/markdown", md.headers["ETag"], loaded);
+  const html304 = serveContent("/docs/getting-started", "text/html", html.headers["ETag"], loaded);
+  assertEquals(md304.status, 304, "markdown revalidation");
+  assertEquals(html304.status, 304, "HTML revalidation");
+  assertEquals(md304.headers["Vary"], "Accept", "304 carries Vary");
+});
+
+test("paid 200 declares Vary: Accept and stays private, no-store with no ETag", () => {
+  const paid = serveContent("/premium/deep-dive", "text/html", null, loaded);
+  assertEquals(paid.status, 200, "status");
+  assertEquals(paid.headers["Vary"], "Accept", "paid Vary");
+  assertEquals(paid.headers["Cache-Control"], "private, no-store", "paid cache-control");
+  assert(!paid.headers["ETag"], "paid response carries no ETag");
+});
+
+test("negotiated 404 declares Vary: Accept", () => {
+  const md404 = serveContent("/nope", "text/markdown", null, loaded);
+  const html404 = serveContent("/nope", "text/html", null, loaded);
+  assertEquals(md404.headers["Vary"], "Accept", "markdown 404 Vary");
+  assertEquals(html404.headers["Vary"], "Accept", "HTML 404 Vary");
+});
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 
