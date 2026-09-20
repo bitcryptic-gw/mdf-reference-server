@@ -451,6 +451,19 @@ function pathScope(urlPath: string): string {
   return parts.length > 0 ? `/${parts[0]}` : "/";
 }
 
+/**
+ * True when `urlPath` lies within `scope` on a path-segment boundary.
+ *
+ * A bare `urlPath.startsWith(scope)` would authorise sibling paths whose first
+ * segment merely begins with the scope string — a macaroon scoped `/premium`
+ * would be accepted for `/premiumx/…` or `/premium-other/…`. Require either an
+ * exact match or a following `/`.
+ */
+function pathInScope(urlPath: string, scope: string): boolean {
+  if (scope === "/") return true;
+  return urlPath === scope || urlPath.startsWith(scope + "/");
+}
+
 /** Fixed reference rate: 1 BTC ≈ 100,000 USD → 1 USD ≈ 1,000 sats. */
 const SATS_PER_USD = 1000;
 
@@ -894,8 +907,8 @@ export async function verifyL402(
     };
   }
 
-  // Step 4: Path scope check
-  if (!urlPath.startsWith(payload.path_scope)) {
+  // Step 4: Path scope check (segment boundary, not a bare string prefix)
+  if (!pathInScope(urlPath, payload.path_scope)) {
     logL402(urlPath, payload.payment_hash, "rejected", `scope mismatch: ${payload.path_scope}`);
     return {
       status: "rejected",

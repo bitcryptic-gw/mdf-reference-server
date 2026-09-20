@@ -242,6 +242,19 @@ await test("expired credential is rejected", async () => {
   assert(r.reason.includes("expired"), `reason: ${r.reason}`);
 });
 
+await test("scope is a path-segment boundary, not a bare string prefix", async () => {
+  const c = credentialFor("/premium/deep-dive"); // scope /premium
+  settle(c.paymentHash, c.preimage);
+  const exact = await mute(() => verifyL402("/premium", c.header, loaded));
+  const child = await mute(() => verifyL402("/premium/other", c.header, loaded));
+  const siblingNoSep = await mute(() => verifyL402("/premiumx/secret", c.header, loaded));
+  const siblingDash = await mute(() => verifyL402("/premium-other/x", c.header, loaded));
+  assertEquals(exact.status, "approved", "exact scope accepted");
+  assertEquals(child.status, "approved", "child of scope accepted");
+  assertEquals(siblingNoSep.status, "rejected", "/premiumx must not match scope /premium");
+  assertEquals(siblingDash.status, "rejected", "/premium-other must not match scope /premium");
+});
+
 await test("credential for one paid section cannot be reused on another", async () => {
   const c = credentialFor("/micropayment/intro");
   settle(c.paymentHash, c.preimage);
