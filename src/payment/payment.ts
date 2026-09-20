@@ -1086,13 +1086,20 @@ export async function verifyPayment(
     };
   }
 
-  // Lightning prices are served by the L402 flow, not x402.
+  // Lightning prices are served by the L402 flow, not x402. Reaching this
+  // function at all means the request did not carry an `Authorization: L402`
+  // credential (the router routes those to verifyL402), so a request that got
+  // here with an X-PAYMENT header is attempting x402 against a Lightning offer.
+  // That is not a verification the x402 rail can perform, so it must be
+  // rejected — never approved. Approving it (the former stub_approved) let any
+  // non-empty X-PAYMENT header win a paid 200 (and a conditional 304) without
+  // payment, and would also have let a shared cache store that paid body.
   if (isLightningChain(priceEntry.chain)) {
     return {
-      status: "stub_approved",
+      status: "rejected",
       proof: null,
       l402Credential: null,
-      reason: "lightning chain — handled by L402 flow",
+      reason: "lightning offer — pay via the L402 flow (Authorization: L402), not X-PAYMENT",
       requiresToken,
       rail: "l402",
     };
