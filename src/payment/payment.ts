@@ -464,6 +464,17 @@ function pathInScope(urlPath: string, scope: string): boolean {
   return urlPath === scope || urlPath.startsWith(scope + "/");
 }
 
+/**
+ * Constant-time comparison of two hex-encoded values (length-checked, since
+ * crypto.timingSafeEqual throws on a length mismatch). Used for preimage
+ * comparisons so a byte-by-byte early exit cannot leak the value's prefix.
+ */
+function hexEqual(a: string, b: string): boolean {
+  const ba = Buffer.from(a, "hex");
+  const bb = Buffer.from(b, "hex");
+  return ba.length === bb.length && timingSafeEqual(ba, bb);
+}
+
 /** Fixed reference rate: 1 BTC ≈ 100,000 USD → 1 USD ≈ 1,000 sats. */
 const SATS_PER_USD = 1000;
 
@@ -975,8 +986,9 @@ export async function verifyL402(
 
   // Verify the preimage Alby Hub recorded matches what the agent submitted
   // (belt-and-braces: the hash check above already confirms this, but an
-  // explicit match against the settled record is worth having in the log)
-  if (invoiceStatus.preimage && invoiceStatus.preimage.toLowerCase() !== credential.preimage.toLowerCase()) {
+  // explicit match against the settled record is worth having in the log).
+  // Constant-time: this is a preimage comparison.
+  if (invoiceStatus.preimage && !hexEqual(invoiceStatus.preimage, credential.preimage)) {
     logL402(urlPath, payload.payment_hash, "rejected", "preimage mismatch vs alby record");
     return {
       status: "rejected",
