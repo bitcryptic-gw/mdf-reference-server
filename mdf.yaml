@@ -49,7 +49,7 @@ payment:
 auth:
   endpoint: /mdf/auth
   token_ttl_seconds: 86400
-  price_threshold: "10.00"
+  price_threshold: "0.10"
 
 signals:
   ai_train: false
