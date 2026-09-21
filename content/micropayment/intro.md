@@ -26,7 +26,7 @@ MDF uses price as a unified access policy signal across four tiers:
 | $0.01+ | Premium | Gated content; paid directly per request, no token issued |
 | $0.10+ | Private | High-value access; token scope-limited to paying path |
 
-Each tier uses the same HTTP content negotiation mechanism — `Accept: text/markdown` — and the same L402 payment flow. Only the price changes.
+Each tier uses the same HTTP content negotiation mechanism — `Accept: text/markdown`. The paid tiers each settle over the rail that matches their price: the 1-sat tier uses Bitcoin over Lightning (L402), while the USDC tiers use x402. Only the price changes.
 
 ## How It Works
 
