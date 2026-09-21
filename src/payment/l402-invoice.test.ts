@@ -17,7 +17,14 @@
  * Run with: bun run src/payment/l402-invoice.test.ts
  */
 
-import { build402Response, createL402Challenge, usdToSats, satsToMsat } from "./payment.ts";
+import {
+  build402Response,
+  createL402Challenge,
+  usdToSats,
+  satsToMsat,
+  priceToSats,
+  __resetLightningBreakersForTests,
+} from "./payment.ts";
 import type { VerificationResult } from "./payment.ts";
 import type { LoadedConfig } from "../config/loader.ts";
 
@@ -171,6 +178,37 @@ await test("invalid price yields 0 (never a negative or NaN invoice)", () => {
   assertEquals(usdToSats("-5"), 0, "negative → 0");
 });
 
+console.log("\nCurrency-aware price → satoshi conversion (Vikunja #44)\n");
+
+await test("BTC converts at 1 BTC = 100,000,000 sats", () => {
+  assertEquals(priceToSats("0.00000001", "BTC"), 1, "0.00000001 BTC = 1 sat");
+  assertEquals(priceToSats("0.000001", "BTC"), 100, "0.000001 BTC = 100 sat");
+  assertEquals(priceToSats("1", "BTC"), 100_000_000, "1 BTC = 100,000,000 sat");
+});
+
+await test("USD and USDC use the fixed 1000 sats/USD rate", () => {
+  assertEquals(priceToSats("0.01", "USDC"), 10, "0.01 USDC = 10 sat");
+  assertEquals(priceToSats("0.10", "USDC"), 100, "0.10 USDC = 100 sat");
+  assertEquals(priceToSats("0.0010", "USDC"), 1, "0.0010 USDC = 1 sat");
+  assertEquals(priceToSats("1.0000", "USD"), 1000, "1 USD = 1000 sat");
+});
+
+await test("a BTC price is no longer read at the USD rate", () => {
+  // The latent 100x undercharge: 0.000001 BTC (= 100 sat) used to be read as
+  // 0.000001 USD × 1000 = 0.001 sat → ceil → 1 sat.
+  assertEquals(satsToMsat(priceToSats("0.000001", "BTC")), 100_000, "100 sats not 1");
+});
+
+await test("an unsupported lightning currency is a hard error, not a silent misread", () => {
+  let threw = false;
+  try {
+    priceToSats("1.00", "EUR");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "EUR on the lightning rail must throw");
+});
+
 console.log("\nSatoshi → millisatoshi (round UP to whole satoshi)\n");
 
 await test("exact whole number: 1000 sats → 1,000,000 msat", () => {
@@ -203,7 +241,7 @@ const loaded = makeLoaded();
 await test("/micropayment (0.00000001 BTC = 1 sat) → 1000 msat, not 1", async () => {
   captured.length = 0;
   const res = await createL402Challenge("/micropayment/intro", loaded);
-  assert(res !== null, "challenge issued");
+  assert(res.ok, "challenge issued");
   assertEquals(captured[0].body?.amount, 1000, "sub-satoshi offer invoices 1 whole sat");
   assertEquals(captured[0].url, "http://alby.invalid/api/invoices", "Alby endpoint");
 });
@@ -253,23 +291,44 @@ await test("/micropayment: 402 advertises 0.00000001 BTC = the 1 sat invoiced", 
   assertEquals(captured[0].body?.amount, advertisedSats * 1000, "invoice msat == advertised sats * 1000");
 });
 
-await test("/premium: 402 advertises 1.0000 USDC and the invoice covers it at the fixed rate", async () => {
+// ---------------------------------------------------------------------------
+// Only lightning offers carry an L402 challenge (Vikunja #44)
+// ---------------------------------------------------------------------------
+
+console.log("\nL402 challenge is attached only to lightning offers\n");
+
+await test("an x402 offer carries no L402 header, invoice field or Alby call", async () => {
   captured.length = 0;
   const res = await build402Response("/premium/deep-dive", noProof(), loaded);
-  const body = JSON.parse(res.body) as { payment: { amount: string; currency: string } };
+  assertEquals(res.status, 402, "status");
+  assert(res.headers["WWW-Authenticate"] === undefined, "x402 offer must not carry WWW-Authenticate");
+
+  const body = JSON.parse(res.body) as { payment: { amount: string; currency: string; lightning_invoice?: string } };
   assertEquals(body.payment.amount, "1.0000", "advertised amount");
-  assertEquals(usdToSats(body.payment.amount) * 1000, captured[0].body?.amount, "invoice = advertised sats * 1000");
+  assertEquals(body.payment.currency, "USDC", "advertised currency");
+  assert(body.payment.lightning_invoice === undefined, "x402 offer must not carry lightning_invoice");
+  assertEquals(captured.length, 0, "no Alby invoice must be burned for an x402 offer");
+});
+
+await test("a lightning offer still carries the L402 challenge and invoice field", async () => {
+  captured.length = 0;
+  const res = await build402Response("/micropayment/intro", noProof(), loaded);
+  assert(!!res.headers["WWW-Authenticate"], "lightning offer carries WWW-Authenticate");
+  const body = JSON.parse(res.body) as { payment: { lightning_invoice?: string; rail?: string } };
+  assertEquals(body.payment.rail, "l402", "rail");
+  assert(!!body.payment.lightning_invoice, "lightning_invoice present");
+  assertEquals(captured.length, 1, "exactly one invoice for the lightning offer");
 });
 
 // ---------------------------------------------------------------------------
-// Failure path returns null, does not throw
+// Failure path returns a typed failure, does not throw
 // ---------------------------------------------------------------------------
 
 console.log("\nInvoice creation failure\n");
 
-await test("Alby 500 returns null and does not throw", async () => {
+await test("Alby 500 returns a typed rejected failure with the upstream status", async () => {
   albyStatus = 500;
-  let result: unknown = "unset";
+  let result: Awaited<ReturnType<typeof createL402Challenge>> | "threw" = "threw";
   try {
     result = await createL402Challenge("/micropayment/intro", loaded);
   } catch (err) {
@@ -277,7 +336,28 @@ await test("Alby 500 returns null and does not throw", async () => {
   } finally {
     albyStatus = 200;
   }
-  assertEquals(result, null, "failure yields null");
+  assert(result !== "threw", "did not throw");
+  assert(!result.ok, "failure is not ok");
+  if (!result.ok) {
+    assertEquals(result.failure.category, "rejected", "category");
+    assertEquals(result.failure.upstreamStatus, 500, "upstream status retained");
+    assert(
+      result.failure.upstreamMessage.includes("whole number of satoshis"),
+      "the human-readable upstream reason is retained"
+    );
+  }
+  __resetLightningBreakersForTests();
+});
+
+await test("a suppressed retry does not call Alby while the breaker is open", async () => {
+  albyStatus = 500;
+  await createL402Challenge("/micropayment/intro", loaded);
+  captured.length = 0;
+  const second = await createL402Challenge("/micropayment/intro", loaded);
+  assert(!second.ok && second.suppressed, "second attempt is suppressed");
+  assertEquals(captured.length, 0, "suppressed attempt makes no backend call");
+  albyStatus = 200;
+  __resetLightningBreakersForTests();
 });
 
 restoreFetch();

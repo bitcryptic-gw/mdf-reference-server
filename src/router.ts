@@ -19,7 +19,7 @@ import { accessSync, constants } from "fs";
 import { serveDiscovery } from "./discovery/discovery.ts";
 import { serveFeed } from "./feed/handler.ts";
 import { serveContent, serveNotFound, resolveContentPath } from "./content/handler.ts";
-import { verifyPayment, verifyL402, build402Response } from "./payment/payment.ts";
+import { verifyPayment, verifyL402, build402Response, lightningHealth } from "./payment/payment.ts";
 import { validateToken, handleAuthRequest, issueToken } from "./auth/auth.ts";
 import { SERVER_VERSION } from "./version.ts";
 import type { LoadedConfig } from "./config/loader.ts";
@@ -132,9 +132,19 @@ function isHealthy(loaded: LoadedConfig): boolean {
 
 function healthResponse(loaded: LoadedConfig): Response {
   const ok = isHealthy(loaded);
+  // A degraded lightning rail is surfaced as a `lightning` block while the
+  // top-level status stays "ok" and the HTTP code stays 200. The server is
+  // still serving content — x402 and free routes are unaffected — so returning
+  // non-200 here would let Caddy/Docker health checks pull the whole instance
+  // out of rotation for a rail-local fault. Monitoring alerts on
+  // `lightning.status`. The block is omitted entirely when healthy, keeping the
+  // 0.2.6 `{status, version}` contract byte-compatible.
+  const lightning = lightningHealth(loaded);
+  const degraded = lightning?.status === "degraded";
   const body = JSON.stringify({
     status: ok ? "ok" : "unavailable",
     version: SERVER_VERSION,
+    ...(degraded ? { lightning } : {}),
   });
   return new Response(body, {
     status: ok ? 200 : 503,
@@ -264,9 +274,11 @@ export async function handleRequest(
         return jsonError(503, result.reason, true);
       }
 
-      if (result.status !== "approved" && result.status !== "stub_approved") {
+      if (result.status !== "approved") {
         const response402 = await build402Response(payPath, result, loaded);
-        logRequest(method, urlPath, 402, Date.now() - start, { reason: result.reason });
+        logRequest(method, urlPath, response402.status, Date.now() - start, {
+          reason: result.reason,
+        });
         return toResponse(response402);
       }
 
@@ -336,9 +348,11 @@ export async function handleRequest(
   if (authHeader.toLowerCase().startsWith("l402 ")) {
     // L402: agent submitting a Lightning preimage proof
     const l402Result = await verifyL402(urlPath, authHeader, loaded);
-    if (l402Result.status !== "approved" && l402Result.status !== "stub_approved") {
+    if (l402Result.status !== "approved") {
       const response402 = await build402Response(urlPath, l402Result, loaded, resourceUri);
-      logRequest(method, urlPath, 402, Date.now() - start, { reason: l402Result.reason });
+      logRequest(method, urlPath, response402.status, Date.now() - start, {
+        reason: l402Result.reason,
+      });
       return toResponse(response402);
     }
   } else {

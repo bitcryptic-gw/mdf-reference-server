@@ -105,6 +105,10 @@ const LightningSchema = z.object({
   api_token: z.string().optional(),
   invoice_expiry_seconds: z.number().int().min(60).default(300),
   token_secret: z.string().optional(),
+  // Circuit-breaker tunables for invoice-creation failures. Defaults mean no
+  // mdf.yaml change is required; invalid values refuse to start.
+  breaker_initial_backoff_seconds: z.number().int().min(1).max(3600).default(5),
+  breaker_max_backoff_seconds: z.number().int().min(1).max(86400).default(300),
 });
 
 /**

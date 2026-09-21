@@ -10,6 +10,7 @@ import { initWatcher, startWatcher } from "./feed/watcher.ts";
 import { emitEvent } from "./feed/events.ts";
 import { handleRequest } from "./router.ts";
 import { tokenStore } from "./auth/auth.ts";
+import { shutdownLightningBreakers } from "./payment/payment.ts";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -55,6 +56,26 @@ emitEvent(
 // ---------------------------------------------------------------------------
 
 tokenStore.startSweep();
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown — clear timers so they cannot hold the process open
+// ---------------------------------------------------------------------------
+
+let shuttingDown = false;
+function shutdown(signal: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(
+    JSON.stringify({ ts: new Date().toISOString(), event: "shutdown", signal })
+  );
+  shutdownLightningBreakers();
+  tokenStore.stopSweep();
+  mainServer.stop();
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ---------------------------------------------------------------------------
 // Dashboard server

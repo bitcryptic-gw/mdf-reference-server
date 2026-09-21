@@ -2,6 +2,19 @@ import { createHash, createHmac, timingSafeEqual, randomBytes } from "crypto";
 import type { LoadedConfig } from "../config/loader.ts";
 import type { FacilitatorConfig, FacilitatorChainConfig } from "../config/schema.ts";
 import { htmlSourceBytesForPath } from "../content/handler.ts";
+import {
+  LightningBreaker,
+  type BreakerProbeState,
+  type BreakerSnapshot,
+  type LightningFailure,
+  type LightningFailureCategory,
+} from "./breaker.ts";
+
+export type {
+  BreakerSnapshot,
+  LightningFailure,
+  LightningFailureCategory,
+} from "./breaker.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,7 +88,6 @@ interface MacaroonPayload {
 export type VerificationStatus =
   | "approved"      // proof accepted — serve content
   | "rejected"      // proof invalid — return 402
-  | "stub_approved" // stub mode — structural validation only, no real verification
   | "no_proof"      // no payment header present
   | "error";        // upstream dependency failure — not a payment denial
 
@@ -90,6 +102,104 @@ export interface VerificationResult {
   rail: "x402" | "l402" | "none";
   /** Settlement metadata, present when an x402 payment settled successfully */
   settlement?: { payer: string; transaction: string };
+}
+
+// ---------------------------------------------------------------------------
+// Lightning invoice failure surface
+// ---------------------------------------------------------------------------
+//
+// When invoice creation fails, the client must not be told a lie (a 402
+// advertising a rail that cannot be fulfilled) and the operator must get a
+// machine-readable reason. Failures are categorised backend-agnostically so a
+// future pluggable invoice backend (Vikunja #46) reuses this unchanged.
+
+/** Maximum length of a sanitised upstream message retained for logs. */
+const MAX_UPSTREAM_MESSAGE = 300;
+
+/**
+ * Strip anything that could be a secret from an upstream error message and cap
+ * its length. Defence in depth: the Alby error body should never carry our
+ * token, but no secret may reach a log line, /health or a response body even if
+ * it does. Long hex (preimages, payment hashes, signatures), Bearer/Authorization
+ * values, long opaque token runs and any known secret value are replaced.
+ */
+export function sanitizeUpstreamMessage(
+  input: string,
+  knownSecrets: string[] = []
+): string {
+  let out = typeof input === "string" ? input : String(input ?? "");
+
+  // Keep it a single line so the structured log stays one JSON record.
+  out = out.replace(/[\u0000-\u001f\u007f]+/g, " ");
+
+  // Exact known secrets first (longest first so an overlap cannot leave residue).
+  for (const secret of [...knownSecrets].sort((a, b) => b.length - a.length)) {
+    if (secret && secret.length >= 4) out = out.split(secret).join("[redacted]");
+  }
+
+  out = out
+    .replace(/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [redacted]")
+    .replace(/\bAuthorization\b\s*[:=]\s*["']?[^"',}\s]+/gi, "Authorization: [redacted]")
+    // 64-hex preimages, 32-byte payment hashes, signatures (>= 32 hex chars)
+    .replace(/\b[0-9a-fA-F]{32,}\b/g, "[redacted-hex]")
+    // Long base64/base64url macaroon-ish runs
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, "[redacted]")
+    .trim();
+
+  if (out.length > MAX_UPSTREAM_MESSAGE) {
+    out = `${out.slice(0, MAX_UPSTREAM_MESSAGE)}…`;
+  }
+  return out;
+}
+
+/**
+ * A categorised invoice-backend failure. `message` is only for local debugging;
+ * `failure.upstreamMessage` is the sanitised value safe to log.
+ */
+export class LightningBackendError extends Error {
+  readonly failure: LightningFailure;
+  constructor(failure: LightningFailure) {
+    super(`lightning invoice backend error (${failure.category})`);
+    this.name = "LightningBackendError";
+    this.failure = failure;
+  }
+}
+
+function classifyNetworkError(err: unknown, knownSecrets: string[] = []): LightningFailure {
+  // Connection refused, DNS failure and AbortSignal.timeout() all land here.
+  // A timeout is a form of unreachability, so both map to `unreachable`.
+  const message = (err as Error)?.message ?? String(err);
+  return {
+    category: "unreachable",
+    upstreamStatus: null,
+    upstreamMessage: sanitizeUpstreamMessage(message, knownSecrets),
+  };
+}
+
+function classifyHttpFailure(
+  status: number,
+  body: string,
+  knownSecrets: string[] = []
+): LightningFailure {
+  const category: LightningFailureCategory =
+    status === 401 || status === 403 ? "auth" : "rejected";
+  return {
+    category,
+    upstreamStatus: status,
+    upstreamMessage: sanitizeUpstreamMessage(body, knownSecrets),
+  };
+}
+
+/** Convert any thrown value into a typed failure without leaking raw text. */
+function failureFromError(err: unknown, knownSecrets: string[] = []): LightningFailure {
+  if (err instanceof LightningBackendError) {
+    // Re-sanitise defensively in case known secrets changed since it was thrown.
+    return {
+      ...err.failure,
+      upstreamMessage: sanitizeUpstreamMessage(err.failure.upstreamMessage, knownSecrets),
+    };
+  }
+  return classifyNetworkError(err, knownSecrets);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,29 +244,90 @@ async function albyCreateInvoice(
   description: string,
   expirySeconds: number,
   apiUrl: string,
-  apiToken: string
+  apiToken: string,
+  knownSecrets: string[] = [apiToken]
 ): Promise<AlbyInvoice> {
-  const res = await fetch(`${apiUrl}/invoices`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiToken}`,
-    },
-    body: JSON.stringify({
-      amount: amountMsat,
-      description,
-      expiry: expirySeconds,
-    }),
-    // Hard timeout — don't let a slow Alby Hub stall request handling
-    signal: AbortSignal.timeout(8000),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "(no body)");
-    throw new Error(`Alby Hub invoice creation failed: ${res.status} ${text}`);
+  let res: Response;
+  try {
+    res = await fetch(`${apiUrl}/invoices`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiToken}`,
+      },
+      body: JSON.stringify({
+        amount: amountMsat,
+        description,
+        expiry: expirySeconds,
+      }),
+      // Hard timeout — don't let a slow Alby Hub stall request handling.
+      // This bounds both the request path and the background probe.
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (err) {
+    // Network error, DNS failure or timeout — categorised as unreachable.
+    throw new LightningBackendError(classifyNetworkError(err, knownSecrets));
   }
 
-  return res.json() as Promise<AlbyInvoice>;
+  if (!res.ok) {
+    // Keep the upstream status AND body: the body is the human-readable reason
+    // (e.g. Alby's "the amount must be a whole number of satoshis"). Both are
+    // sanitised before they reach a log line.
+    const text = await res.text().catch(() => "");
+    throw new LightningBackendError(classifyHttpFailure(res.status, text, knownSecrets));
+  }
+
+  try {
+    return (await res.json()) as AlbyInvoice;
+  } catch (err) {
+    throw new LightningBackendError({
+      category: "unknown",
+      upstreamStatus: res.status,
+      upstreamMessage: sanitizeUpstreamMessage(
+        `unparseable invoice response body: ${(err as Error).message}`,
+        knownSecrets
+      ),
+    });
+  }
+}
+
+/**
+ * Lightweight, non-polluting reachability/auth probe for the breaker timer.
+ *
+ * An authenticated read exercises connectivity AND the token (a bare TCP/HTTP
+ * GET would not), and distinguishes `unreachable` (network error/timeout) from
+ * `auth` (401/403). It creates no invoice, so it does not pollute the Alby Hub
+ * invoice/transaction list. It cannot exercise invoice *creation*, so for a
+ * `rejected` category the caller confirms with a real minimal attempt.
+ */
+async function albyReachabilityProbe(
+  apiUrl: string,
+  apiToken: string,
+  knownSecrets: string[]
+): Promise<LightningFailure | null> {
+  let res: Response;
+  try {
+    res = await fetch(`${apiUrl}/transactions?limit=1`, {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${apiToken}` },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (err) {
+    return classifyNetworkError(err, knownSecrets);
+  }
+
+  if (res.status === 401 || res.status === 403) {
+    return {
+      category: "auth",
+      upstreamStatus: res.status,
+      upstreamMessage: "reachability probe rejected (auth)",
+    };
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    return classifyHttpFailure(res.status, body, knownSecrets);
+  }
+  return null;
 }
 
 /**
@@ -478,6 +649,12 @@ function hexEqual(a: string, b: string): boolean {
 /** Fixed reference rate: 1 BTC ≈ 100,000 USD → 1 USD ≈ 1,000 sats. */
 const SATS_PER_USD = 1000;
 
+/** 1 BTC = 100,000,000 satoshis. */
+export const SATS_PER_BTC = 100_000_000;
+
+/** Currencies the lightning rail knows how to price into satoshis. */
+const LIGHTNING_RAIL_CURRENCIES = new Set(["BTC", "USD", "USDC"]);
+
 /** 1 satoshi = 1,000 millisatoshis. */
 const MSAT_PER_SAT = 1000;
 
@@ -498,6 +675,38 @@ export function usdToSats(usdAmount: string): number {
   const usd = parseFloat(usdAmount);
   if (!Number.isFinite(usd) || usd < 0) return 0;
   return usd * SATS_PER_USD;
+}
+
+/**
+ * Convert a priced amount to satoshis, branching on currency.
+ *
+ * A BTC-denominated price converts at 1 BTC = 100,000,000 sats; USD/USDC prices
+ * use the fixed reference rate. The previous code applied the USD rate to every
+ * price, so a BTC price only landed on the right sat value by coincidence
+ * (0.00000001 BTC happened to come out as 1 sat; 0.000001 BTC would have been
+ * invoiced as 1 sat instead of 100 — a 100x undercharge).
+ *
+ * Any other currency is a hard error. The loader rejects it at startup, so this
+ * is unreachable in a running server; it refuses rather than silently misreading
+ * a price.
+ */
+export function priceToSats(
+  amount: string,
+  currency: string | null | undefined
+): number {
+  const value = parseFloat(amount);
+  if (!Number.isFinite(value) || value < 0) return 0;
+  const code = (currency ?? "").toUpperCase();
+  if (code === "BTC") return value * SATS_PER_BTC;
+  if (code === "USD" || code === "USDC") return value * SATS_PER_USD;
+  throw new Error(
+    `unsupported lightning-rail currency: ${currency ?? "(none)"} — expected BTC, USD or USDC`
+  );
+}
+
+/** True when a currency is one the lightning rail can price. */
+export function isLightningRailCurrency(currency: string | null | undefined): boolean {
+  return LIGHTNING_RAIL_CURRENCIES.has((currency ?? "").toUpperCase());
 }
 
 /**
@@ -785,36 +994,168 @@ async function confirmSettlementOnChain(
 }
 
 // ---------------------------------------------------------------------------
+// Lightning circuit breaker registry
+// ---------------------------------------------------------------------------
+//
+// One breaker per loaded config (i.e. per process). State is in-memory: after a
+// restart the breaker starts closed and rediscovers a persisting fault on the
+// first attempt. `__resetLightningBreakersForTests` exists so a test process
+// can isolate cases that share the module-level registry.
+
+let lightningBreakers = new WeakMap<LoadedConfig, LightningBreaker>();
+const activeLightningBreakers = new Set<LightningBreaker>();
+
+function lightningLogSink(entry: Record<string, unknown>): void {
+  // Structured, one JSON record, no secrets (the message is pre-sanitised).
+  console.error(`[mdf:payment:l402] ${JSON.stringify({ ts: new Date().toISOString(), ...entry })}`);
+}
+
+function buildLightningProbe(loaded: LoadedConfig) {
+  return async (state: BreakerProbeState): Promise<LightningFailure | null> => {
+    const lightning = loaded.config.lightning;
+    if (!lightning) return null;
+    const { api_url } = lightning;
+    const apiToken = lightning.api_token ?? "";
+    const secrets = [apiToken, lightning.token_secret ?? ""];
+
+    // Cheap, non-polluting: an authenticated read. Recovers the classic
+    // transient case (unreachable) and the token case (auth) without creating
+    // an invoice.
+    const reachability = await albyReachabilityProbe(api_url, apiToken, secrets);
+    if (reachability) return reachability;
+    if (state.category === "unreachable" || state.category === "auth") return null;
+
+    // `rejected` / `unknown`: reachability cannot prove invoice *creation*
+    // works again, so confirm with one real minimal attempt. This runs only
+    // while the breaker is open (bounded by the backoff cap), so it adds at
+    // most one 1-sat throwaway invoice per probe interval — never on the
+    // request path.
+    try {
+      await albyCreateInvoice(1000, "MDF invoice probe", 60, api_url, apiToken, secrets);
+      return null;
+    } catch (err) {
+      return failureFromError(err, secrets);
+    }
+  };
+}
+
+function getLightningBreaker(loaded: LoadedConfig): LightningBreaker {
+  const existing = lightningBreakers.get(loaded);
+  if (existing) return existing;
+
+  const lightning = loaded.config.lightning;
+  const breaker = new LightningBreaker({
+    initialBackoffMs: (lightning?.breaker_initial_backoff_seconds ?? 5) * 1000,
+    maxBackoffMs: (lightning?.breaker_max_backoff_seconds ?? 300) * 1000,
+    probe: buildLightningProbe(loaded),
+    log: lightningLogSink,
+  });
+  lightningBreakers.set(loaded, breaker);
+  activeLightningBreakers.add(breaker);
+  return breaker;
+}
+
+/** Coarse lightning health for /health, or null when lightning is not configured. */
+export function lightningHealth(loaded: LoadedConfig): BreakerSnapshot | null {
+  if (!loaded.config.lightning) return null;
+  return getLightningBreaker(loaded).snapshot();
+}
+
+/** Seconds until the breaker's next probe, or null when healthy. */
+export function lightningRetryAfterSeconds(loaded: LoadedConfig): number | null {
+  if (!loaded.config.lightning) return null;
+  return getLightningBreaker(loaded).retryAfterSeconds();
+}
+
+/** Clear all breaker timers (graceful shutdown). */
+export function shutdownLightningBreakers(): void {
+  for (const breaker of activeLightningBreakers) breaker.stop();
+  activeLightningBreakers.clear();
+}
+
+/** Test-only: drop all breaker state so cases do not leak into each other. */
+export function __resetLightningBreakersForTests(): void {
+  shutdownLightningBreakers();
+  lightningBreakers = new WeakMap();
+}
+
+// ---------------------------------------------------------------------------
 // L402 invoice creation (called when building the 402 response)
 // ---------------------------------------------------------------------------
+
+/**
+ * Outcome of an L402 challenge attempt. On failure the typed `failure` carries
+ * a category, the upstream status (if any) and a sanitised message — never a
+ * bare `null`, so the caller can stop advertising an unfulfillable rail and
+ * surface a machine-readable reason.
+ */
+export type L402ChallengeOutcome =
+  | { ok: true; wwwAuthenticate: string; paymentHash: string }
+  | { ok: false; failure: LightningFailure; suppressed: boolean };
 
 /**
  * Create a Lightning invoice and a macaroon bound to its payment hash.
  * Returns the WWW-Authenticate header value for the 402 response.
  *
- * Called from build402Response when the request path has a lightning price
- * and the config has lightning credentials available.
+ * Called from build402Response when the request path's offer is on the
+ * lightning rail and lightning credentials are configured.
  */
 export async function createL402Challenge(
   urlPath: string,
   loaded: LoadedConfig
-): Promise<{ wwwAuthenticate: string; paymentHash: string } | null> {
+): Promise<L402ChallengeOutcome> {
   const { config } = loaded;
 
-  if (!config.lightning) return null;
+  if (!config.lightning) {
+    return {
+      ok: false,
+      suppressed: false,
+      failure: {
+        category: "unknown",
+        upstreamStatus: null,
+        upstreamMessage: "lightning not configured",
+      },
+    };
+  }
+
+  const breaker = getLightningBreaker(loaded);
+
+  // While the breaker is open, do not call the backend on every request and do
+  // not log every suppressed attempt — the open/reminder/recovery lines come
+  // from the breaker itself.
+  if (breaker.isOpen()) {
+    return { ok: false, suppressed: true, failure: breaker.lastFailure() };
+  }
 
   const { api_url, invoice_expiry_seconds } = config.lightning;
   // loader.ts resolves (and requires) both whenever [lightning] is configured;
   // the schema fields are optional so the resolution lives in exactly one place.
   const api_token = config.lightning.api_token!;
   const token_secret = config.lightning.token_secret!;
-  const required = requiredPrice(urlPath, config);
+  const priceEntry = requiredPriceEntry(urlPath, config);
+  const secrets = [api_token, token_secret];
+
   // Alby Hub invoices in millisatoshis and requires a whole number of
-  // satoshis. `usdToSats` yields the (possibly fractional) satoshi value for
-  // the advertised price; `satsToMsat` rounds it up to a whole satoshi and
-  // converts to msat, so the invoice matches the advertised amount and is
-  // never under-charged.
-  const amountMsat = satsToMsat(usdToSats(required));
+  // satoshis. `priceToSats` yields the (possibly fractional) satoshi value for
+  // the advertised price by currency; `satsToMsat` rounds it up to a whole
+  // satoshi and converts to msat, so the invoice matches the advertised amount
+  // and is never under-charged.
+  let amountMsat: number;
+  try {
+    amountMsat = satsToMsat(priceToSats(priceEntry.amount, priceEntry.currency));
+  } catch (err) {
+    // The loader rejects unsupported lightning currencies at startup, so this
+    // is defence in depth: fail closed without opening the breaker.
+    return {
+      ok: false,
+      suppressed: false,
+      failure: {
+        category: "rejected",
+        upstreamStatus: null,
+        upstreamMessage: sanitizeUpstreamMessage((err as Error).message),
+      },
+    };
+  }
   const expiry = invoice_expiry_seconds ?? 300;
 
   let invoice: AlbyInvoice;
@@ -824,11 +1165,13 @@ export async function createL402Challenge(
       `MDF access: ${urlPath}`,
       expiry,
       api_url,
-      api_token
+      api_token,
+      secrets
     );
   } catch (err) {
-    console.error(`[mdf:payment:l402] Failed to create invoice: ${(err as Error).message}`);
-    return null;
+    const failure = failureFromError(err, secrets);
+    breaker.recordFailure(failure, { path: urlPath });
+    return { ok: false, suppressed: false, failure };
   }
 
   const macaroon = createMacaroon(
@@ -843,7 +1186,7 @@ export async function createL402Challenge(
 
   logL402(urlPath, invoice.paymentHash, "no_proof", "invoice issued");
 
-  return { wwwAuthenticate, paymentHash: invoice.paymentHash };
+  return { ok: true, wwwAuthenticate, paymentHash: invoice.paymentHash };
 }
 
 // ---------------------------------------------------------------------------
@@ -885,14 +1228,18 @@ export async function verifyL402(
   }
 
   if (!config.lightning) {
-    // Lightning not configured — fall back to stub_approved so the demo
-    // still functions without Alby Hub credentials
-    logL402(urlPath, "(unknown)", "stub_approved", "lightning not configured");
+    // Lightning is not configured, so an L402 credential cannot be verified.
+    // Fail closed: the former stub approved the request on a structural check
+    // alone, which served a lightning-priced route to any well-formed-looking
+    // L402 header. The loader now refuses to start a config with a
+    // lightning-priced route but no [lightning] block, so this path is only
+    // reachable for a free/x402 route carrying an L402 header.
+    logL402(urlPath, "(unknown)", "rejected", "lightning not configured");
     return {
-      status: "stub_approved",
+      status: "rejected",
       proof: null,
       l402Credential: credential,
-      reason: "stub mode: lightning not configured, L402 structural check only",
+      reason: "lightning rail is not configured — L402 cannot be verified",
       requiresToken,
       rail: "l402",
     };
@@ -1341,12 +1688,26 @@ export async function verifyPayment(
 // 402 response builder
 // ---------------------------------------------------------------------------
 
+export interface PaymentResponse {
+  status: 402 | 503;
+  headers: Record<string, string>;
+  body: string;
+}
+
 /**
  * Build the HTTP 402 response body and headers.
  *
- * For L402 paths: also generates a Lightning invoice and returns the
- * WWW-Authenticate header. This is async because invoice creation requires
- * a call to Alby Hub.
+ * An L402 challenge/invoice is attached **only when the route's own offer is on
+ * the lightning rail** — an x402 offer must not advertise a rail it cannot
+ * fulfil (and an unconditional attach burned an Alby invoice per 402). This is
+ * a deliberate single-rail-per-route position for the demo; offering every
+ * configured rail for every priced resource is a separate design item
+ * (Vikunja #47) and is not built here.
+ *
+ * While the lightning rail is degraded (invoice creation failing), the rail is
+ * not advertised: a lightning-only route returns 503 with `Retry-After` (there
+ * is no other rail to pay), and `payment.lightning_unavailable` + the coarse
+ * category is surfaced. The upstream message is never placed in a public body.
  *
  * For x402 paths: emits the MDF 0.2.0 superset fields (pay_to, asset, scheme,
  * max_timeout_seconds, extra) alongside the original MDF fields.
@@ -1356,7 +1717,7 @@ export async function build402Response(
   result: VerificationResult,
   loaded: LoadedConfig,
   resourceUrl?: string
-): Promise<{ status: 402; headers: Record<string, string>; body: string }> {
+): Promise<PaymentResponse> {
   const { config } = loaded;
 
   const headers: Record<string, string> = {
@@ -1367,19 +1728,11 @@ export async function build402Response(
     // `no-store` is the explicit guard against any shared cache storing and
     // replaying an offer to a second agent. A 402 is not heuristically
     // cacheable, so `no-store` is hardening rather than a live fault fix — but
-    // it is set here, in the one builder every 402 (content paths and
-    // /mdf/pay, x402 and L402) passes through, so a new route cannot forget it.
+    // it is set here, in the one builder every 402/503 payment response
+    // (content paths and /mdf/pay, x402 and L402) passes through, so a new
+    // route cannot forget it.
     "Cache-Control": "no-store",
   };
-
-  // Attempt L402 challenge if lightning is configured
-  let l402Challenge: { wwwAuthenticate: string; paymentHash: string } | null = null;
-  if (config.lightning) {
-    l402Challenge = await createL402Challenge(urlPath, loaded);
-    if (l402Challenge) {
-      headers["WWW-Authenticate"] = l402Challenge.wwwAuthenticate;
-    }
-  }
 
   const priceEntry = requiredPriceEntry(urlPath, config);
 
@@ -1392,6 +1745,52 @@ export async function build402Response(
   // The rail for this offer, derived from the same chain->rail mapping that
   // selects the verifier at payment time.
   const offerRail = railForChain(priceEntry.chain);
+
+  // Only a lightning offer gets an L402 challenge. When creation fails, the
+  // breaker is (or has been) opened by createL402Challenge; remember the coarse
+  // category for the degraded body. No upstream message is retained for output.
+  let l402Challenge: { wwwAuthenticate: string; paymentHash: string } | null = null;
+  let lightningDegraded = false;
+  let degradedCategory: LightningFailureCategory | null = null;
+  if (offerRail === "l402" && config.lightning) {
+    const outcome = await createL402Challenge(urlPath, loaded);
+    if (outcome.ok) {
+      l402Challenge = { wwwAuthenticate: outcome.wwwAuthenticate, paymentHash: outcome.paymentHash };
+      headers["WWW-Authenticate"] = outcome.wwwAuthenticate;
+    } else {
+      lightningDegraded = true;
+      degradedCategory = outcome.failure.category;
+    }
+  }
+
+  // A lightning-only offer whose rail is degraded has nothing payable to
+  // advertise. Returning a 402 with no invoice would be the exact unpayable
+  // offer this change exists to remove, so return 503 + Retry-After instead:
+  // the correct semantic for a temporarily unavailable service, and it lets a
+  // client retry on the breaker's own schedule.
+  if (offerRail === "l402" && lightningDegraded) {
+    const retryAfter = lightningRetryAfterSeconds(loaded);
+    if (retryAfter !== null) headers["Retry-After"] = String(retryAfter);
+    const body = JSON.stringify({
+      error: "Lightning temporarily unavailable",
+      reason: "the lightning rail cannot currently issue an invoice; retry later",
+      resource,
+      payment: {
+        endpoint: config.payment?.endpoint
+          ? resolveEndpoint(config.payment.endpoint, config.site.url)
+          : null,
+        amount: priceEntry.amount,
+        currency: priceEntry.currency ?? config.pricing.default.currency,
+        chain: priceEntry.chain ?? null,
+        // Schema-legal (`payment` is additionalProperties: true) and reserved
+        // for the multi-rail case (#47); coarse category only, never the
+        // upstream message.
+        lightning_unavailable: true,
+        lightning_unavailable_category: degradedCategory,
+      },
+    }, null, 2);
+    return { status: 503, headers, body };
+  }
 
   // x402 superset fields (MDF 0.2.0) — required when this offer is on the
   // x402 rail, so the 402 body is directly usable as x402 PaymentRequirements
@@ -1433,12 +1832,20 @@ export async function build402Response(
       amount: priceEntry.amount,
       currency: priceEntry.currency ?? config.pricing.default.currency,
       chain: priceEntry.chain ?? null,
-      ...(offerRail ? { rail: offerRail } : {}),
+      // The lightning rail is only advertised if its challenge was issued. A
+      // degraded lightning rail (multi-rail #47 case) omits it and flags why.
+      ...(offerRail && !lightningDegraded ? { rail: offerRail } : {}),
       accepted_chains: config.payment?.accepted_chains ?? [],
       accepted_currencies: config.payment?.accepted_currencies ?? [],
       ...x402Fields,
       ...(offerExpiresAt ? { expires_at: offerExpiresAt } : {}),
       ...(l402Challenge ? { lightning_invoice: headers["WWW-Authenticate"] } : {}),
+      ...(lightningDegraded
+        ? {
+            lightning_unavailable: true,
+            lightning_unavailable_category: degradedCategory,
+          }
+        : {}),
     },
     ...(result.requiresToken && config.auth
       ? {

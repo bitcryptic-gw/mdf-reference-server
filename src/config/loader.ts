@@ -1,7 +1,12 @@
 import { readFileSync, existsSync } from "fs";
 import { resolve, isAbsolute } from "path";
 import yaml from "js-yaml";
-import { MdfConfigSchema, type MdfConfig, type FacilitatorConfig } from "./schema.ts";
+import {
+  MdfConfigSchema,
+  type MdfConfig,
+  type FacilitatorConfig,
+  type PriceEntry,
+} from "./schema.ts";
 import { isValidEip55Address } from "./wallet.ts";
 
 // ---------------------------------------------------------------------------
@@ -187,6 +192,33 @@ function hasX402Price(config: MdfConfig): boolean {
  * Throws with a descriptive message on any violation.
  */
 /**
+ * Every pricing entry, labelled for error messages. A section is named by its
+ * glob key so an operator can go straight to the offending line.
+ */
+function pricingEntries(config: MdfConfig): Array<{ label: string; entry: PriceEntry }> {
+  const entries: Array<{ label: string; entry: PriceEntry }> = [
+    { label: "pricing.default", entry: config.pricing.default },
+  ];
+  for (const [pattern, entry] of Object.entries(config.pricing.sections ?? {})) {
+    entries.push({ label: `pricing.sections['${pattern}']`, entry });
+  }
+  return entries;
+}
+
+/**
+ * A lightning-priced route: non-zero amount on the `lightning` chain. This is
+ * the exact predicate that selects the L402 rail in payment.ts, and the one
+ * `hasX402Price` excludes. A free (amount 0) lightning entry is not priced and
+ * is not required to have a rail.
+ */
+function isLightningPriced(entry: PriceEntry): boolean {
+  return parseFloat(entry.amount) > 0 && entry.chain?.toLowerCase() === "lightning";
+}
+
+/** Currencies the lightning rail can convert to satoshis (payment.priceToSats). */
+const LIGHTNING_RAIL_CURRENCIES = new Set(["BTC", "USD", "USDC"]);
+
+/**
  * Non-lightning chains carrying a non-zero price. These are the chains for
  * which the x402 rail is selected, and therefore the chains that need a
  * facilitator asset entry.
@@ -277,6 +309,41 @@ function validateStartupConstraints(
     if (!hasAboveThreshold) {
       errors.push(
         `auth.price_threshold is ${config.auth.price_threshold} but no section is priced at or above that amount`
+      );
+    }
+  }
+
+  // Lightning-priced routes must have a [lightning] block, and a currency the
+  // lightning rail can convert. Without this, a minimal or misconfigured
+  // deployment (a lightning-priced route and no [lightning]) served every
+  // lightning-priced route free via the former stub_approved path, and a BTC
+  // price was silently read at the USD rate. The error names the offending
+  // route and never echoes a secret value.
+  for (const { label, entry } of pricingEntries(config)) {
+    if (!isLightningPriced(entry)) continue;
+
+    if (!config.lightning) {
+      errors.push(
+        `${label} is lightning-priced (chain: lightning) but no [lightning] block is configured`
+      );
+    }
+
+    const code = (entry.currency ?? "").toUpperCase();
+    if (!LIGHTNING_RAIL_CURRENCIES.has(code)) {
+      errors.push(
+        `${label} is lightning-priced with unsupported currency '${entry.currency ?? "(none)"}' — lightning prices must be BTC, USD or USDC`
+      );
+    }
+  }
+
+  // Breaker tunables: the cap must not be below the starting delay. The Zod
+  // schema bounds each value; this is the cross-field rule it cannot express.
+  if (config.lightning) {
+    const initial = config.lightning.breaker_initial_backoff_seconds;
+    const max = config.lightning.breaker_max_backoff_seconds;
+    if (max < initial) {
+      errors.push(
+        `lightning.breaker_max_backoff_seconds (${max}) must be >= lightning.breaker_initial_backoff_seconds (${initial})`
       );
     }
   }

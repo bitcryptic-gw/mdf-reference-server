@@ -521,6 +521,176 @@ test("legacy inline placeholders alone do not satisfy secret resolution", () => 
   );
 });
 
+// ---------------------------------------------------------------------------
+// Lightning rail startup constraints (Vikunja #43, #44)
+// ---------------------------------------------------------------------------
+
+console.log("\nLightning rail startup constraints\n");
+
+test("a lightning-priced route with no [lightning] block refuses to start", () => {
+  withTempDir(
+    {
+      pricing: {
+        default: { amount: "0.0000" },
+        sections: { "/micropayment/**": { amount: "0.00000001", currency: "BTC", chain: "lightning" } },
+      },
+      payment: {
+        endpoint: "/mdf/pay",
+        accepted_chains: ["lightning"],
+        accepted_currencies: ["BTC"],
+        wallet: WALLET_A,
+      },
+    },
+    ({ yamlPath }) => {
+      try {
+        loadConfig(yamlPath);
+        throw new Error("expected a lightning-priced route with no [lightning] block to throw");
+      } catch (err) {
+        const message = (err as Error).message;
+        assert(
+          message.includes("/micropayment/**"),
+          `error must name the offending route, got: ${message}`
+        );
+        assert(
+          message.includes("no [lightning] block is configured"),
+          `error must explain the missing block, got: ${message}`
+        );
+        assert(
+          !/token|secret|Bearer/i.test(message),
+          `error must not mention secret material, got: ${message}`
+        );
+      }
+    }
+  );
+});
+
+test("a lightning-priced route with an unsupported currency refuses to start", () => {
+  withTempDir(
+    {
+      pricing: {
+        default: { amount: "0.0000" },
+        sections: { "/micropayment/**": { amount: "1.00", currency: "EUR", chain: "lightning" } },
+      },
+      payment: {
+        endpoint: "/mdf/pay",
+        accepted_chains: ["lightning"],
+        accepted_currencies: ["EUR"],
+        wallet: WALLET_A,
+      },
+      lightning: { api_url: "https://alby.example.com" },
+    },
+    ({ yamlPath }) => {
+      withEnv(
+        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
+        () => {
+          assertThrows(
+            () => loadConfig(yamlPath),
+            "unsupported currency 'EUR'",
+            "lightning rail with a currency it cannot convert"
+          );
+        }
+      );
+    }
+  );
+});
+
+test("a BTC-denominated lightning price is accepted and loads", () => {
+  withTempDir(
+    {
+      pricing: {
+        default: { amount: "0.0000" },
+        sections: { "/micropayment/**": { amount: "0.00000001", currency: "BTC", chain: "lightning" } },
+      },
+      payment: {
+        endpoint: "/mdf/pay",
+        accepted_chains: ["lightning"],
+        accepted_currencies: ["BTC"],
+        wallet: WALLET_A,
+      },
+      lightning: { api_url: "https://alby.example.com" },
+    },
+    ({ yamlPath }) => {
+      withEnv(
+        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
+        () => {
+          const loaded = loadConfig(yamlPath);
+          assert(loaded.config.lightning !== undefined, "lightning config present");
+        }
+      );
+    }
+  );
+});
+
+test("an x402-only config with no [lightning] block still starts", () => {
+  withTempDir(
+    {
+      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
+      payment: {
+        endpoint: "/mdf/pay",
+        accepted_chains: ["base"],
+        accepted_currencies: ["USDC"],
+        wallet: WALLET_A,
+      },
+      facilitator: {
+        url: "https://x402.bitcryptic.com",
+        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
+      },
+    },
+    ({ yamlPath }) => {
+      const loaded = loadConfig(yamlPath);
+      assert(loaded.config.lightning === undefined, "no lightning configured");
+      assert(loaded.facilitatorConfig !== null, "x402 config still loads");
+    }
+  );
+});
+
+test("invalid breaker backoff refuses to start", () => {
+  withTempDir(
+    {
+      lightning: {
+        api_url: "https://alby.example.com",
+        breaker_initial_backoff_seconds: 60,
+        breaker_max_backoff_seconds: 10,
+      },
+    },
+    ({ yamlPath }) => {
+      withEnv(
+        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
+        () => {
+          assertThrows(
+            () => loadConfig(yamlPath),
+            "breaker_max_backoff_seconds",
+            "cap below the starting delay"
+          );
+        }
+      );
+    }
+  );
+});
+
+test("a non-positive breaker backoff fails schema validation", () => {
+  withTempDir(
+    {
+      lightning: {
+        api_url: "https://alby.example.com",
+        breaker_initial_backoff_seconds: 0,
+      },
+    },
+    ({ yamlPath }) => {
+      withEnv(
+        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
+        () => {
+          assertThrows(
+            () => loadConfig(yamlPath),
+            "invalid configuration",
+            "zero initial backoff"
+          );
+        }
+      );
+    }
+  );
+});
+
 test("throws when [auth] is configured but no priced section meets its threshold", () => {
   withTempDir(
     {
