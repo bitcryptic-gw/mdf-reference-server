@@ -843,7 +843,7 @@ export async function createL402Challenge(
 
   logL402(urlPath, invoice.paymentHash, "no_proof", "invoice issued");
 
-  return { wwwAuthenticate, paymentHash: invoice.payment_hash };
+  return { wwwAuthenticate, paymentHash: invoice.paymentHash };
 }
 
 // ---------------------------------------------------------------------------
