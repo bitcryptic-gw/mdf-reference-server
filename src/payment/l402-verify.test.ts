@@ -315,6 +315,36 @@ await test("router: X-PAYMENT alone never satisfies a lightning route", async ()
   assertEquals(res.headers.get("cache-control"), "no-store", "no-store");
 });
 
+// ---------------------------------------------------------------------------
+// Fail closed when lightning is not configured (Vikunja #43)
+// ---------------------------------------------------------------------------
+
+await test("verifyL402 rejects, and the router returns 402 (never 200), when lightning is unconfigured", async () => {
+  const withoutLightning = makeLoaded();
+  delete (withoutLightning.config as { lightning?: unknown }).lightning;
+
+  const c = credentialFor("/micropayment/intro");
+  settle(c.paymentHash, c.preimage);
+
+  const direct = await mute(() => verifyL402("/micropayment/intro", c.header, withoutLightning));
+  assertEquals(
+    direct.status,
+    "rejected",
+    "the former stub_approved is gone — no approval without verification"
+  );
+
+  const res = await mute(() =>
+    handleRequest(
+      new Request("https://example.com/micropayment/intro", {
+        headers: { Accept: "text/markdown", Authorization: c.header },
+      }),
+      withoutLightning
+    )
+  );
+  assert(res.status !== 200 && res.status !== 304, `never 200/304, got ${res.status}`);
+  assertEquals(res.status, 402, "402 for a lightning offer with no configured rail");
+});
+
 restoreFetch();
 
 // ---------------------------------------------------------------------------
