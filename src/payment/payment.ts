@@ -803,30 +803,112 @@ interface X402VerifyRequest {
   paymentRequirements: Record<string, unknown>;
 }
 
-interface VerifyOutcome {
-  ok: boolean;
-  payer?: string;
-  reason?: string;
+/**
+ * The `(from, nonce)` pair the facilitator's /verify accepted on this request.
+ *
+ * Carried from the successful verify into settlement so the on-chain
+ * confirmation on the /settle-error path can only ever check the authorization
+ * that passed /verify in the same request — never a value re-read from the
+ * client, and never reachable when /verify did not return `valid`.
+ */
+interface VerifiedAuthorization {
+  from: string;
+  nonce: string;
 }
 
+/**
+ * Outcome of a facilitator /verify call, as three mutually exclusive cases:
+ *
+ *   - valid   — the facilitator accepted the payment payload. Carries the
+ *               verified `(from, nonce)` so settlement is bound to it.
+ *   - invalid — the facilitator returned a structured x402 verdict of
+ *               `isValid:false` (used/cancelled nonce, expired, under-paid,
+ *               wrong recipient/asset, bad signature). This is a payment
+ *               denial and must surface as 402, NEVER as a 5xx.
+ *   - error   — no structured verdict was available: the facilitator was
+ *               unreachable or timed out, returned a non-200 without an
+ *               `isValid:false` body, or returned something unparseable.
+ *               This is a facilitator-side failure (existing outage
+ *               behaviour, 503), not a statement about the payment.
+ */
+type VerifyOutcome =
+  | { ok: true; payer?: string; authorization: VerifiedAuthorization }
+  | { ok: false; kind: "invalid"; reason: string }
+  | { ok: false; kind: "error"; reason: string };
+
+/** Extract the authorization `(from, nonce)` from an x402 payment envelope. */
+function authorizationFromPayload(payload: unknown): VerifiedAuthorization | null {
+  const auth = (payload as { payload?: { authorization?: { from?: unknown; nonce?: unknown } } })
+    ?.payload?.authorization;
+  if (auth && typeof auth.from === "string" && typeof auth.nonce === "string") {
+    return { from: auth.from, nonce: auth.nonce };
+  }
+  return null;
+}
+
+/**
+ * Call the facilitator's /verify and classify the result.
+ *
+ * x402-rs does not use the HTTP status consistently for payment-validity
+ * outcomes: a used nonce and an invalid signature arrive as HTTP 500, while an
+ * expired or under-paid authorization arrives as HTTP 400 — but all four carry
+ * a structured `{"isValid":false,"invalidReason":…}` body. Keying on that
+ * protocol verdict (rather than the status code or the revert-string text) is
+ * what lets a payment denial (→ 402) be told apart from a facilitator outage
+ * (→ 503) when both can present as a 500.
+ */
 async function facilitatorVerify(
   request: X402VerifyRequest,
   config: FacilitatorConfig
 ): Promise<VerifyOutcome> {
   const { status, json, text } = await facilitatorPost(config, "/verify", request);
-  if (status !== 200) {
-    return { ok: false, reason: `facilitator /verify HTTP ${status}: ${text.slice(0, 200)}` };
-  }
-  if (!json || json.isValid !== true) {
-    const invalidReason = typeof json?.invalidReason === "string" ? json.invalidReason : undefined;
+
+  // Structured payment-invalid verdict — authoritative regardless of HTTP
+  // status. This is what makes a used or expired nonce always 402, never 5xx.
+  if (json && json.isValid === false) {
+    const invalidReason = typeof json.invalidReason === "string" ? json.invalidReason : undefined;
     const details =
-      typeof json?.invalidReasonDetails === "string" ? json.invalidReasonDetails : undefined;
+      typeof json.invalidReasonDetails === "string" ? json.invalidReasonDetails : undefined;
     return {
       ok: false,
+      kind: "invalid",
       reason: `facilitator rejected payment: ${invalidReason ?? "unknown"}${details ? ` (${details})` : ""}`,
     };
   }
-  return { ok: true, payer: typeof json.payer === "string" ? json.payer : undefined };
+
+  // No structured verdict → facilitator-side failure. Never treat this as a
+  // payment denial: an unreachable/broken facilitator must not tell a payer
+  // their (possibly valid) payment was rejected.
+  if (status !== 200) {
+    return {
+      ok: false,
+      kind: "error",
+      reason: `facilitator /verify HTTP ${status}: ${text.slice(0, 200)}`,
+    };
+  }
+  if (!json || json.isValid !== true) {
+    return {
+      ok: false,
+      kind: "error",
+      reason: `facilitator /verify returned an unrecognised response: ${text.slice(0, 200)}`,
+    };
+  }
+  // /verify accepted the payment. Capture the exact authorization it saw so
+  // settlement (and any on-chain confirmation on a /settle error) is bound to
+  // it by construction.
+  const authorization = authorizationFromPayload(request.paymentPayload);
+  if (!authorization) {
+    return {
+      ok: false,
+      kind: "error",
+      reason: "facilitator /verify accepted a payload carrying no authorization",
+    };
+  }
+  return {
+    ok: true,
+    payer: typeof json.payer === "string" ? json.payer : undefined,
+    authorization,
+  };
 }
 
 interface SettleOutcome {
@@ -834,8 +916,6 @@ interface SettleOutcome {
   payer?: string;
   transaction?: string;
   reason?: string;
-  /** True when the facilitator error could not be resolved on-chain. */
-  ambiguous?: boolean;
 }
 
 /**
@@ -845,12 +925,17 @@ interface SettleOutcome {
  * The facilitator can return HTTP 500 for a settlement that actually executed
  * (confirmed Phase 1 behaviour). Treating that as "payment not received" would
  * either double-charge on client retry or deny access after a real payment.
+ *
+ * `verified` is the authorization /verify accepted **in this same request**. It
+ * is passed in rather than re-derived from the client so the on-chain
+ * confirmation can only ever check that exact `(from, nonce)`, and this
+ * function is only reachable from the `verify.ok` branch of `verifyPayment`.
  */
 async function facilitatorSettle(
   request: X402VerifyRequest,
   config: FacilitatorConfig,
   chain: FacilitatorChainInfo,
-  authorization: { from: string; nonce: string }
+  verified: VerifiedAuthorization
 ): Promise<SettleOutcome> {
   let json: Record<string, unknown> | null = null;
   let status = 0;
@@ -890,20 +975,20 @@ async function facilitatorSettle(
 
   const onchain = await confirmSettlementOnChain(chain, {
     txHash,
-    from: authorization.from,
-    nonce: authorization.nonce,
+    from: verified.from,
+    nonce: verified.nonce,
   });
 
+  // On-chain confirmation of this exact authorization is the only way a
+  // /settle error can be recovered. Anything else is a facilitator-side
+  // failure, surfaced as 503 by the caller — never as a payment rejection,
+  // because /verify already accepted this payment in this request.
   if (onchain === "settled") {
-    return { settled: true, payer: authorization.from, transaction: txHash };
-  }
-  if (onchain === "not_settled") {
-    return { settled: false, reason: `facilitator /settle failed: ${facilitReason}` };
+    return { settled: true, payer: verified.from, transaction: txHash };
   }
   return {
     settled: false,
-    ambiguous: true,
-    reason: `facilitator /settle failed and on-chain status could not be confirmed: ${facilitReason}`,
+    reason: `facilitator /settle failed: ${facilitReason}`,
   };
 }
 
@@ -1451,9 +1536,16 @@ function railForChain(chain: string | null | undefined): "x402" | "l402" | null 
  * Verify and settle an x402 payment for a request.
  *
  * The client submits a standard base64 `PaymentPayload` in the `X-PAYMENT`
- * header. The server builds `PaymentRequirements` from the offer it issued,
- * calls the facilitator's `/verify` then `/settle`, and — on any /settle
- * error — confirms on-chain before concluding the payment failed.
+ * header. The server builds `PaymentRequirements` from the offer it issued and
+ * calls the facilitator's `/verify` then `/settle`.
+ *
+ * A `/verify` that rejects the payment (structured `isValid:false`) returns
+ * 402 — the server never approves on the strength of a prior on-chain
+ * settlement (#52). Approval requires a successful `/settle` in this request;
+ * the one exception is a `/settle` error independently confirmed on-chain for
+ * the same authorization (the Phase-1 lost-response recovery). A `/verify`
+ * with no structured verdict (unreachable, timeout, malformed) is a
+ * facilitator failure, surfaced as 503 by the router.
  */
 export async function verifyPayment(
   urlPath: string,
@@ -1609,31 +1701,33 @@ export async function verifyPayment(
   }
 
   if (!verify.ok) {
-    // A retry of an already-settled authorization fails /verify (the EIP-3009
-    // nonce is consumed), so confirm on-chain before treating this as a
-    // rejection — otherwise a real, settled payment would be denied.
-    const onchain = await confirmSettlementOnChain(chainInfo, {
-      from: proof.from,
-      nonce: proof.nonce,
-    });
-    if (onchain === "settled") {
-      logX402(urlPath, proof, "approved");
+    if (verify.kind === "invalid") {
+      // The facilitator rejected the payment: a used or cancelled nonce, an
+      // expired authorization, an under-payment, the wrong recipient or asset,
+      // or a bad signature. Return 402 with a fresh offer — and never approve
+      // on the strength of a prior on-chain settlement. Doing the latter (#52)
+      // let anyone rebuild an X-PAYMENT from public transferWithAuthorization
+      // calldata and replay it forever. Approval now requires a successful
+      // /settle in this same request, or (on a /settle error only) on-chain
+      // confirmation of the exact authorization /verify accepted here.
+      logX402(urlPath, proof, "rejected");
       return {
-        status: "approved",
+        status: "rejected",
         proof,
         l402Credential: null,
-        reason: "x402: previously settled authorization confirmed on-chain",
+        reason: verify.reason,
         requiresToken,
         rail: "x402",
-        settlement: { payer: proof.from, transaction: "" },
       };
     }
-    logX402(urlPath, proof, "rejected");
+    // Facilitator-side failure (unreachable, timeout, or an unrecognised
+    // response) — not a payment denial. Existing outage behaviour: 503.
+    logX402(urlPath, proof, "error");
     return {
-      status: "rejected",
+      status: "error",
       proof,
       l402Credential: null,
-      reason: verify.reason ?? "facilitator rejected payment",
+      reason: verify.reason,
       requiresToken,
       rail: "x402",
     };
@@ -1641,10 +1735,9 @@ export async function verifyPayment(
 
   let settle: SettleOutcome;
   try {
-    settle = await facilitatorSettle(request, facilitatorConfig, chainInfo, {
-      from: proof.from,
-      nonce: proof.nonce,
-    });
+    // Only reachable after /verify returned valid above, and bound to the
+    // exact authorization /verify accepted (verify.authorization).
+    settle = await facilitatorSettle(request, facilitatorConfig, chainInfo, verify.authorization);
   } catch (err) {
     logX402(urlPath, proof, "error");
     return {
@@ -1658,9 +1751,12 @@ export async function verifyPayment(
   }
 
   if (!settle.settled) {
-    logX402(urlPath, proof, settle.ambiguous ? "error" : "rejected");
+    // A /settle that errored and was not recovered on-chain is a
+    // facilitator-side failure, not a payment denial — /verify already
+    // accepted this payment. Surface 503 (existing outage behaviour).
+    logX402(urlPath, proof, "error");
     return {
-      status: settle.ambiguous ? "error" : "rejected",
+      status: "error",
       proof,
       l402Credential: null,
       reason: settle.reason ?? "settlement failed",
