@@ -33,6 +33,13 @@ free of `tskey-`, `TailscaleParams` content, bearer tokens and masked values
 - Secrets are **per-file** mounts (the brief's open question 5 is answered): `wallet_address`,
   `alby_api_token`, `lightning_token_secret` (to be dropped in 0.3.0), and a stale
   `oracle_pubkey` mount (nothing reads it since the oracle was retired; harmless, removable).
+- The container names are `mdf-server-syd` (unraid-syd) and **`MDF-Server-Prod`** (unraid-public,
+  mixed case — use it exactly in commands and checklists). Their tailnet hostnames are the
+  lowercase `mdf-server-syd` / `mdf-server-prod`.
+- **Pre-flight confirmed by Gary (2026-11-11):** `.tailscale_state/tailscaled.state` exists under
+  the mounted `/app/data` on both hosts, last written by the 0.2.9 recreate, and both nodes kept
+  their identity and IP. Node identity therefore survives a recreate, and no host port is needed
+  at any point.
 - `Repository` is digest-pinned — currently the **0.2.9** digest
   `sha256:38571c38532f97f304533b2a9214a569986e589462ccd1f30294e2e23ca3423b`. `<Registry>` still
   names the old repo (`bitcryptic/mdf-server`); cosmetic only, the pull uses `Repository`.
