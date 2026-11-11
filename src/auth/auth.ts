@@ -163,8 +163,13 @@ function pathInScope(urlPath: string, scope: string): boolean {
 /**
  * Issue a bearer token after successful payment verification.
  *
+ * **Only** the router's token-issuance endpoint calls this, and only after
+ * `verifyPayment()` returned `approved` for the same request (0.2.9). There is
+ * deliberately no other entry point: the pre-0.2.9 `handleAuthRequest()` minted
+ * a token for any body-supplied path with no payment at all.
+ *
  * @param urlPath  - The path that was paid for (used to derive scope)
- * @param issuedTo - Wallet address of the payer
+ * @param issuedTo - Wallet address of the payer, from the verified authorization
  * @param txHash   - Transaction hash that funded issuance
  * @param loaded   - Server config
  */
@@ -264,72 +269,4 @@ export function validateToken(
   }
 
   return { ok: true, record };
-}
-
-// ---------------------------------------------------------------------------
-// HTTP handler
-// ---------------------------------------------------------------------------
-
-export interface AuthHandlerResult {
-  status: number;
-  headers: Record<string, string>;
-  body: string;
-}
-
-/**
- * Handle POST /mdf/auth — receives payment proof and issues a bearer token.
- *
- * Request body (JSON):
- *   { "path": "/private/internals", "txHash": "0x...", "from": "0x...", "chain": "base", "currency": "USDC", "amount": "100.00" }
- *
- * This handler is intentionally separate from the payment verifier —
- * the caller (index.ts) runs payment verification first, then calls this
- * if requiresToken is true and verification passed.
- */
-export function handleAuthRequest(
-  body: string,
-  loaded: LoadedConfig
-): AuthHandlerResult {
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(body) as Record<string, unknown>;
-  } catch {
-    return {
-      status: 400,
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ error: "invalid JSON body" }),
-    };
-  }
-
-  const path = typeof parsed.path === "string" ? parsed.path : null;
-  const txHash = typeof parsed.txHash === "string" ? parsed.txHash : "unknown";
-  const from = typeof parsed.from === "string" ? parsed.from : "unknown";
-
-  if (!path) {
-    return {
-      status: 400,
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ error: "missing required field: path" }),
-    };
-  }
-
-  const result = issueToken(path, from, txHash, loaded);
-
-  if (!result.ok) {
-    return {
-      status: 500,
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ error: result.reason }),
-    };
-  }
-
-  return {
-    status: 200,
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify({
-      token: result.token,
-      expires_at: new Date(result.expiresAt).toISOString(),
-      ttl_seconds: result.ttlSeconds,
-    }),
-  };
 }
