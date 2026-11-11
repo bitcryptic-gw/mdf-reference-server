@@ -18,11 +18,12 @@
     "test:rails": "bun run src/payment/rails.test.ts",
     "test:402v2": "bun run src/payment/402v2.test.ts",
     "test:facilitator": "bun run src/payment/facilitator.test.ts",
+    "test:ratelimit": "bun run src/payment/ratelimit.test.ts",
     "test:handler": "bun run src/content/handler.test.ts",
     "test:source-bytes": "bun run src/source-bytes.test.ts",
     "test:router": "bun run src/router.test.ts",
     "test:health": "bun run src/health.test.ts",
-    "test": "bun run test:config && bun run test:assets && bun run test:rails && bun run test:402 && bun run test:402v2 && bun run test:l402 && bun run test:l402-verify && bun run test:breaker && bun run test:l402-failure && bun run test:x402 && bun run test:facilitator && bun run test:auth-pay && bun run test:handler && bun run test:source-bytes && bun run test:router && bun run test:health"
+    "test": "bun run test:config && bun run test:assets && bun run test:rails && bun run test:402 && bun run test:402v2 && bun run test:l402 && bun run test:l402-verify && bun run test:breaker && bun run test:l402-failure && bun run test:x402 && bun run test:facilitator && bun run test:ratelimit && bun run test:auth-pay && bun run test:handler && bun run test:source-bytes && bun run test:router && bun run test:health"
   },
   "dependencies": {
     "@noble/hashes": "2.4.0",

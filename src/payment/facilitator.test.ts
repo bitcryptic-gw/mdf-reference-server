@@ -107,12 +107,15 @@ let calls: Array<{ url: string; body?: unknown }> = [];
 let verify: { status: number; body: unknown } | "throw";
 let settle: Array<{ status: number; body: unknown }> = [];
 let rpc: { result?: unknown } | "throw" = { result: "0x" + "0".repeat(63) + "1" };
+/** Receipt responses consumed per `eth_getTransactionReceipt` call; null = not found. */
+let receipts: Array<{ status: string } | null> = [];
 
 function reset() {
   calls = [];
   verify = { status: 200, body: { isValid: true, payer: PAYER } };
   settle = [{ status: 200, body: { success: true, transaction: "0x" + "ab".repeat(32), network: "eip155:84532", payer: PAYER } }];
   rpc = { result: "0x" + "0".repeat(63) + "1" };
+  receipts = [];
   (globalThis as unknown as { fetch: unknown }).fetch = async (url: unknown, init?: { body?: unknown }) => {
     const u = String(url);
     calls.push({ url: u, body: init?.body });
@@ -132,6 +135,11 @@ function reset() {
     }
     if (u.includes("rpc.example")) {
       if (rpc === "throw") throw new Error("RPC timeout");
+      const call = JSON.parse(String(init?.body ?? "{}")) as { method?: string };
+      if (call.method === "eth_getTransactionReceipt") {
+        const next = receipts.length > 0 ? receipts.shift()! : null;
+        return mk({ status: 200, body: { jsonrpc: "2.0", id: 1, result: next } });
+      }
       return mk({ status: 200, body: { jsonrpc: "2.0", id: 1, ...rpc } });
     }
     throw new Error("unexpected fetch " + u);
@@ -215,33 +223,54 @@ await test("/settle success carries the tx and network", async () => {
   }
 });
 
-await test("settlement_pending is retried exactly once, then succeeds", async () => {
+await test("settlement_pending is never re-posted: the tx is confirmed on-chain instead", async () => {
   reset();
   settle = [
-    { status: 200, body: { success: false, errorReason: "settlement_pending", transaction: "0x" + "cd".repeat(32) } },
-    { status: 200, body: { success: true, transaction: "0x" + "cd".repeat(32), network: "eip155:84532" } },
+    {
+      status: 200,
+      body: { success: false, errorReason: "settlement_pending", transaction: "0x" + "cd".repeat(32) },
+    },
   ];
+  // First receipt poll misses, second shows success.
+  receipts = [null, { status: "0x1" }];
   const v = await facilitatorVerify(FAC, request());
   if (!v.ok) throw new Error("fixture");
-  const s = await facilitatorSettle(FAC, request(), CHAIN, v.authorization);
-  eq(s.settled, true, "the retry settled it");
-  eq(callsTo("/settle").length, 2, "exactly one retry");
+  const s = await facilitatorSettle(FAC, request(), CHAIN, v.authorization, { attempts: 3, intervalMs: 1 });
+  eq(s.settled, true, "confirmed on-chain");
+  eq(callsTo("/settle").length, 1, "exactly one /settle — a retry could hit the other leg and re-broadcast");
+  assert(callsTo("rpc.example").length >= 2, "polled the receipt more than once");
 });
 
-await test("settlement_pending twice is not success", async () => {
+await test("settlement_pending that never confirms fails closed, still without a retry", async () => {
   reset();
   settle = [
-    { status: 200, body: { success: false, errorReason: "settlement_pending" } },
-    { status: 200, body: { success: false, errorReason: "settlement_pending" } },
+    {
+      status: 200,
+      body: { success: false, errorReason: "settlement_pending", transaction: "0x" + "cd".repeat(32) },
+    },
   ];
-  // The on-chain fixture says the nonce is used, so recovery would approve it;
-  // make the nonce unused to assert the failure path.
-  rpc = { result: "0x" + "0".repeat(64) };
+  receipts = [null, null, null];
   const v = await facilitatorVerify(FAC, request());
   if (!v.ok) throw new Error("fixture");
-  const s = await withMutedLogs(() => facilitatorSettle(FAC, request(), CHAIN, v.authorization));
-  eq(s.settled, false, "still pending after one retry is not settled");
-  eq(callsTo("/settle").length, 2, "two attempts, no more");
+  const s = await withMutedLogs(() =>
+    facilitatorSettle(FAC, request(), CHAIN, v.authorization, { attempts: 3, intervalMs: 1 })
+  );
+  eq(s.settled, false, "unconfirmed is not settled");
+  if (!s.settled) eq(s.kind, "error", "an infrastructure failure, not a denial");
+  eq(callsTo("/settle").length, 1, "no second /settle");
+});
+
+await test("settlement_pending without a tx hash fails closed immediately", async () => {
+  reset();
+  settle = [{ status: 200, body: { success: false, errorReason: "settlement_pending" } }];
+  const v = await facilitatorVerify(FAC, request());
+  if (!v.ok) throw new Error("fixture");
+  const s = await withMutedLogs(() =>
+    facilitatorSettle(FAC, request(), CHAIN, v.authorization, { attempts: 2, intervalMs: 1 })
+  );
+  eq(s.settled, false, "nothing to confirm");
+  eq(callsTo("rpc.example").length, 0, "no receipt poll without a hash");
+  eq(callsTo("/settle").length, 1, "one attempt only");
 });
 
 await test("a settle error recovered on-chain is bound to the verified (from, nonce)", async () => {

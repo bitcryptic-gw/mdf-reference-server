@@ -19,9 +19,21 @@
  *  - the one recovery is a `/settle` error, confirmed on-chain for the exact
  *    `(from, nonce)` that `/verify` accepted here, and failing closed to 503.
  *
- * v2 adds one state 0.2.x never had: `settlement_pending` (non-terminal, with a
- * broadcast tx). The upstream resource server retries exactly once, so we do the
- * same, then treat the outcome as settled or as a failure.
+ * v2 adds one state 0.2.x never had: `settlement_pending` — the transaction is
+ * broadcast but the facilitator could not wait for the receipt.
+ *
+ * The upstream resource server responds with a single `/settle` retry, which is
+ * safe for it because one facilitator process owns the pending-settlement store.
+ * **It is not safe behind our round-robin pool**: a retry can land on the other
+ * leg, which has no pending record, so it re-verifies and re-broadcasts. It
+ * cannot double-charge (the EIP-3009 nonce is authoritative) but it burns gas on
+ * a transaction that must revert, and it can report failure for a payment that
+ * did settle (facilitator step-0 §7, measured in the Sepolia acceptance run).
+ *
+ * So this client never retries `/settle`. On `settlement_pending` it reconciles
+ * on-chain against the tx hash the facilitator returned, polling the receipt
+ * for a bounded window, and fails closed if the payment cannot be confirmed.
+ * There is no leg to pin and nothing to re-broadcast.
  */
 
 import type { PaymentRequirement } from "./rails.ts";
@@ -161,41 +173,52 @@ export async function facilitatorSettle(
   config: FacilitatorConfig,
   request: VerifyRequest,
   chain: Eip155ChainInfo,
-  verified: VerifiedAuthorization
+  verified: VerifiedAuthorization,
+  /** Test seam: shortens the receipt-per-poll window. Never set in production. */
+  timing?: { attempts?: number; intervalMs?: number }
 ): Promise<SettleOutcome> {
-  let last: Awaited<ReturnType<typeof post>> | null = null;
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      last = await post(config, "/settle", request);
-    } catch (err) {
-      last = null;
-      if (attempt === 1) {
-        return { settled: false, kind: "error", reason: `facilitator unreachable: ${(err as Error).message}` };
-      }
-      continue;
-    }
-
-    const json = last.json ?? {};
-    if (json.success === true) {
-      return {
-        settled: true,
-        payer: typeof json.payer === "string" ? json.payer : undefined,
-        transaction: typeof json.transaction === "string" ? json.transaction : "",
-        network: typeof json.network === "string" ? json.network : chain.network,
-      };
-    }
-
-    // Non-terminal: the transaction is broadcast but the receipt was not seen.
-    // Retry exactly once, as the upstream resource server does.
-    if (json.errorReason === "settlement_pending" && attempt === 0) continue;
-    break;
+  let res: Awaited<ReturnType<typeof post>> | null;
+  try {
+    res = await post(config, "/settle", request);
+  } catch (err) {
+    res = null;
   }
 
-  const json = last?.json ?? {};
-  const txHash = typeof json.transaction === "string" ? json.transaction : undefined;
+  if (res && res.json && res.json.success === true) {
+    return {
+      settled: true,
+      payer: typeof res.json.payer === "string" ? res.json.payer : undefined,
+      transaction: typeof res.json.transaction === "string" ? res.json.transaction : "",
+      network: typeof res.json.network === "string" ? res.json.network : chain.network,
+    };
+  }
+
+  const json = res?.json ?? {};
+  const txHash = typeof json.transaction === "string" && json.transaction ? json.transaction : undefined;
   const reason =
-    typeof json.errorReason === "string" ? json.errorReason : `settle HTTP ${last?.status ?? 0}`;
+    typeof json.errorReason === "string" ? json.errorReason : `settle HTTP ${res?.status ?? 0}`;
+
+  // Broadcast-but-unconfirmed. Deliberately no second `/settle`: see the note at
+  // the top of this file — behind a round-robin pool the retry can hit the other
+  // leg and re-broadcast. Confirm the transaction we were told about instead.
+  if (json.errorReason === "settlement_pending") {
+    const confirmed = txHash
+      ? await waitForSettlement(chain, txHash, timing)
+      : "unknown";
+    if (confirmed === "settled") {
+      return {
+        settled: true,
+        payer: verified.from,
+        transaction: txHash ?? "",
+        network: chain.network,
+      };
+    }
+    return {
+      settled: false,
+      kind: "error",
+      reason: `settlement pending, not confirmed on-chain (${confirmed})`,
+    };
+  }
 
   // The facilitator may have settled and failed to tell us. Confirm the exact
   // authorization /verify accepted here; fail closed when we cannot.
@@ -213,6 +236,40 @@ export async function facilitatorSettle(
     };
   }
   return { settled: false, kind: "error", reason };
+}
+
+/**
+ * Poll a receipt for a transaction the facilitator says it broadcast.
+ *
+ * Bounded and modest: Base produces a block roughly every 2 s, and a payer is
+ * waiting on this request. Six attempts over ~12 s distinguishes "the receipt is
+ * one block away" from "the broadcast did not land"; the caller turns the latter
+ * into a 503 rather than a false success.
+ */
+export async function waitForSettlement(
+  chain: Eip155ChainInfo,
+  txHash: string,
+  options: { attempts?: number; intervalMs?: number } = {}
+): Promise<"settled" | "not_settled" | "unknown"> {
+  if (!chain.rpcUrl) return "unknown";
+  const attempts = options.attempts ?? 6;
+  const intervalMs = options.intervalMs ?? 2000;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    try {
+      const receipt = (await rpcCall(
+        chain.rpcUrl,
+        "eth_getTransactionReceipt",
+        [txHash],
+        8000
+      )) as { status?: string } | null;
+      if (receipt) return receipt.status === "0x1" ? "settled" : "not_settled";
+    } catch {
+      // RPC trouble: keep trying until the window closes, then report unknown.
+    }
+  }
+  return "unknown";
 }
 
 /**
