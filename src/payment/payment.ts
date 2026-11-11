@@ -613,6 +613,18 @@ function pathRequiresToken(urlPath: string, config: LoadedConfig["config"]): boo
 }
 
 /**
+ * True when `urlPath` falls in a token-access section (its price is at or above
+ * `auth.price_threshold`). Exported for the token-issuance endpoint, which must
+ * refuse to settle a payment for a per-fetch section only to discard it.
+ */
+export function isTokenSection(
+  urlPath: string,
+  config: LoadedConfig["config"]
+): boolean {
+  return pathRequiresToken(urlPath, config);
+}
+
+/**
  * Derive the path scope prefix from a full path.
  * "/premium/deep-dive" → "/premium"
  * "/private/internals" → "/private"

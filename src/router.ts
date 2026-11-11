@@ -8,19 +8,19 @@
  * Request routing order:
  *   1. Discovery  — /mdf.json, /llms.txt
  *   2. Feed       — /feed.xml
- *   3. Auth       — POST /mdf/auth (token issuance)
- *   4. Pay        — POST /mdf/pay (x402 settlement → bearer token)
- *   5. Existence  — 404 for paths with no content, before any pricing
- *   6. Payment    — L402 (Lightning) or x402 (EVM) verification
- *   7. Content    — serve markdown or HTML
+ *   3. Token      — POST <auth.endpoint> / /mdf/pay / /mdf/auth: payment
+ *                   required, then a bearer token for a token-access section
+ *   4. Existence  — 404 for paths with no content, before any pricing
+ *   5. Payment    — L402 (Lightning) or x402 (EVM) verification
+ *   6. Content    — serve markdown or HTML
  */
 
 import { accessSync, constants } from "fs";
 import { serveDiscovery } from "./discovery/discovery.ts";
 import { serveFeed } from "./feed/handler.ts";
 import { serveContent, serveNotFound, resolveContentPath } from "./content/handler.ts";
-import { verifyPayment, verifyL402, build402Response, lightningHealth } from "./payment/payment.ts";
-import { validateToken, handleAuthRequest, issueToken } from "./auth/auth.ts";
+import { verifyPayment, verifyL402, build402Response, lightningHealth, isTokenSection } from "./payment/payment.ts";
+import { validateToken, issueToken } from "./auth/auth.ts";
 import { SERVER_VERSION } from "./version.ts";
 import type { LoadedConfig } from "./config/loader.ts";
 
@@ -200,39 +200,38 @@ export async function handleRequest(
     }
   }
 
-  // ── 3. Auth endpoint ──────────────────────────────────────────────────────
-  if (urlPath === "/mdf/auth" || urlPath === loaded.config.auth?.endpoint) {
+  // ── 3. Token issuance: POST <auth.endpoint> and POST /mdf/pay ─────────────
+  //
+  // Both endpoints issue a bearer token for a token-access section, and both
+  // require a valid payment **in the same request**. There is no other way to
+  // mint a token: `handleAuthRequest()` (0.2.8 and earlier) issued one for any
+  // body-supplied path without checking for a payment, which made the
+  // token-gated tier free (fixed in 0.2.9).
+  //
+  //   POST <auth.endpoint>            (or /mdf/auth)
+  //   POST /mdf/pay                   (or payment.endpoint, the pre-0.2.8 name)
+  //   X-PAYMENT: <base64 x402 PaymentPayload>
+  //   { "resource": "/private/internals" }   (absolute URL also accepted)
+  //
+  // The paid path must be a token-access section; verification and settlement
+  // are the ordinary #52-hardened path (`verifyPayment` → `/verify` →
+  // `/settle`), unchanged by this endpoint. A missing, invalid or replayed
+  // payment yields the normal 402 offer and no token.
+  const authEndpoint = loaded.config.auth?.endpoint;
+  const payEndpoint = loaded.config.payment?.endpoint;
+
+  const isTokenEndpoint =
+    urlPath === "/mdf/auth" ||
+    (!!authEndpoint && authEndpoint.startsWith("/") && urlPath === authEndpoint) ||
+    urlPath === "/mdf/pay" ||
+    (!!payEndpoint && payEndpoint.startsWith("/") && urlPath === payEndpoint);
+
+  if (isTokenEndpoint) {
     if (method !== "POST") {
       logRequest(method, urlPath, 405, Date.now() - start);
       return jsonError(405, "Method Not Allowed — use POST");
     }
 
-    const body = await readBody(req);
-    if (body === null) {
-      logRequest(method, urlPath, 413, Date.now() - start);
-      return jsonError(413, "Request body too large");
-    }
-
-    const result = handleAuthRequest(body, loaded);
-    logRequest(method, urlPath, result.status, Date.now() - start);
-    return toResponse(result);
-  }
-
-  // ── 3.5 Pay endpoint ──────────────────────────────────────────────────────
-  //
-  // High-tier token issuance. The client sends a standard x402 PaymentPayload
-  // in the X-PAYMENT header. The JSON body identifies the resource being paid
-  // for, since the payment endpoint is a single fixed URL.
-  //
-  //   POST /mdf/pay
-  //   X-PAYMENT: <base64 x402 PaymentPayload>
-  //   { "resource": "/private/internals" }   (absolute URL also accepted)
-  const payEndpoint = loaded.config.payment?.endpoint;
-  const isPayEndpoint =
-    urlPath === "/mdf/pay" ||
-    (!!payEndpoint && payEndpoint.startsWith("/") && urlPath === payEndpoint);
-
-  if (method === "POST" && isPayEndpoint) {
     try {
       const body = await readBody(req);
       if (body === null) {
@@ -248,7 +247,16 @@ export async function handleRequest(
         return jsonError(400, "Invalid JSON body", true);
       }
 
-      const resource = typeof parsed.resource === "string" ? parsed.resource : null;
+      // `resource` is the documented field; `path` is accepted as an alias for
+      // the pre-0.2.9 shape. Anything else a client asserts about payment
+      // (`txHash`, `from`, `amount`) is ignored — the payment header is the only
+      // evidence, and the payer comes from the verified authorization.
+      const resource =
+        typeof parsed.resource === "string"
+          ? parsed.resource
+          : typeof parsed.path === "string"
+            ? parsed.path
+            : null;
       if (!resource) {
         logRequest(method, urlPath, 400, Date.now() - start);
         return jsonError(400, "Missing or invalid field: resource", true);
@@ -261,14 +269,21 @@ export async function handleRequest(
         payPath = resource.startsWith("/") ? resource : `/${resource}`;
       }
 
-      const xPayment = req.headers.get("x-payment");
-      if (!xPayment) {
-        logRequest(method, urlPath, 400, Date.now() - start);
-        return jsonError(400, "Missing X-PAYMENT header", true);
+      // A token is only meaningful for a token-access section. Refusing here
+      // keeps a payment for a per-fetch section from being settled and then
+      // discarded, and keeps the endpoint from becoming a general-purpose pay
+      // relay.
+      if (!loaded.config.auth || !isTokenSection(payPath, loaded.config)) {
+        logRequest(method, urlPath, 400, Date.now() - start, {
+          reason: "not a token-access section",
+        });
+        return jsonError(400, "Resource is not a token-access section", true);
       }
 
+      const xPayment = req.headers.get("x-payment");
       const result = await verifyPayment(payPath, xPayment, loaded);
 
+      // Facilitator/RPC failure — not a payment denial, and never a token.
       if (result.status === "error") {
         logRequest(method, urlPath, 503, Date.now() - start, { reason: result.reason });
         return jsonError(503, result.reason, true);
