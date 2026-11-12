@@ -21,6 +21,7 @@ import {
   pad,
   unpad,
 } from "./lnbtc/nip44.ts";
+import { NwcClient } from "./lnbtc/nwc.ts";
 import {
   ALLOWED_NWC_METHODS,
   judgeNwcPermissions,
@@ -326,6 +327,33 @@ await test("RESP replies parse, including NX returning nil", () => {
   eq(parseResp(Buffer.from("-ERR nope\r\n"))?.reply.kind, "error", "error");
   eq(parseResp(Buffer.from(":1\r\n"))?.reply.value, "1", "integer");
   eq(parseResp(Buffer.from("$5\r\nhel")), null, "incomplete bulk returns null");
+});
+
+// ---------------------------------------------------------------------------
+// The client identity (NIP-47: the URI's `secret` IS the client private key)
+// ---------------------------------------------------------------------------
+
+await test("the client authenticates as the URI secret's public key, not a random key", () => {
+  const wallet = "ab".repeat(32);
+  const secret = "11".repeat(32);
+  const uri = `nostr+walletconnect://${wallet}?relay=${encodeURIComponent("wss://relay.example")}&secret=${secret}`;
+
+  const expected = Buffer.from(getPublicKey(Buffer.from(secret, "hex"), true))
+    .subarray(1)
+    .toString("hex");
+
+  const first = new NwcClient({ uri });
+  eq(first.clientPubkey, expected, "the connection signs as the URI's secret");
+
+  // The wallet authorises by public key, so two processes sharing a URI must be
+  // the same identity. A randomly generated key here is silently ignored by the
+  // wallet — the failure that cost a whole acceptance round.
+  const second = new NwcClient({ uri });
+  eq(second.clientPubkey, expected, "a restart keeps the same identity");
+  assert(
+    first.clientPubkey !== new NwcClient({ uri: uri.replace(secret, "22".repeat(32)) }).clientPubkey,
+    "a different secret is a different identity"
+  );
 });
 
 console.log("--------------------------------------------------");

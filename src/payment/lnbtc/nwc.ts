@@ -18,6 +18,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { getPublicKey } from "@noble/secp256k1";
 import { getConversationKey, encrypt, decrypt } from "./nip44.ts";
 import { parseNwcUri, redactNwcUri, type NwcUri } from "./nwc-uri.ts";
 import {
@@ -44,7 +45,11 @@ export class NwcError extends Error {
 export interface NwcClientOptions {
   /** The `nostr+walletconnect://` URI (a file-mounted secret). */
   uri: string;
-  /** A fresh 32-byte secret key for this process. Generated when omitted. */
+  /**
+   * Client signing key. Normally omitted: NIP-47 says the URI's `secret` IS the
+   * client's private key ("The client MUST use this to sign events and encrypt
+   * payloads"). The override exists for tests that need a fixed key.
+   */
   clientSecretKey?: string;
   connectTimeoutMs?: number;
   /** Bound on a single wallet round trip. */
@@ -92,12 +97,23 @@ export class NwcClient {
       throw new NwcError("malformed", `NWC URI is invalid (${parsed.reason})`);
     }
     this.uri = parsed.value;
-    this.clientSecretKey =
-      options.clientSecretKey ?? Buffer.from(randomBytes(32)).toString("hex");
+    // The URI's `secret` is the client key, not a shared password: the wallet
+    // authorises the connection by the public key derived from it. Generating a
+    // random key here made every request come from an unknown author, which the
+    // wallet silently ignores — a failure this comment exists to prevent.
+    this.clientSecretKey = options.clientSecretKey ?? parsed.value.secret;
     this.options = {
       connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
       responseTimeoutMs: options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS,
     };
+  }
+
+  /** The x-only public key this connection authenticates as (NIP-47). */
+  get clientPubkey(): string {
+    // x-only, as every Nostr pubkey is: the compressed key minus its parity byte.
+    return Buffer.from(getPublicKey(Buffer.from(this.clientSecretKey, "hex"), true))
+      .subarray(1)
+      .toString("hex");
   }
 
   /** Redacted form, for logs and health output. */
