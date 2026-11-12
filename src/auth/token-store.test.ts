@@ -275,7 +275,9 @@ function startFakeValkey(password: string): Promise<FakeValkey> {
           socket.write("-NOAUTH Authentication required.\r\n");
           continue;
         }
-        if (upper === "SET") {
+        if (upper === "PING") {
+          socket.write("+PONG\r\n");
+        } else if (upper === "SET") {
           store.set(args[0], args[1]);
           socket.write("+OK\r\n");
         } else if (upper === "GET") {
@@ -330,6 +332,48 @@ await test("the Valkey store authenticates before it writes (AUTH first, then SE
 
     await store.delete("a".repeat(32));
     eq(await store.get("a".repeat(32)), null, "delete removes it");
+  } finally {
+    await fake.close();
+  }
+});
+
+await test("health distinguishes a wrong password from an unreachable store", async () => {
+  const good = await startFakeValkey("right");
+  const bad = await startFakeValkey("right");
+  try {
+    const okStore = new ValkeyTokenStore({ host: "127.0.0.1", port: good.port, password: "right" });
+    eq(await okStore.health(), "ok", "AUTH + PING on the authenticated connection");
+
+    const authStore = new ValkeyTokenStore({ host: "127.0.0.1", port: bad.port, password: "wrong" });
+    eq(await authStore.health(), "auth", "a credential failure is not reported as an outage");
+
+    const deadStore = new ValkeyTokenStore({ host: "127.0.0.1", port: 1, password: "right" });
+    eq(await deadStore.health(), "unreachable", "nothing listening is an outage");
+  } finally {
+    await good.close();
+    await bad.close();
+  }
+});
+
+await test("pending records round-trip, with the signature hash that gates the retry", async () => {
+  const fake = await startFakeValkey("pw");
+  try {
+    const store = new ValkeyTokenStore({ host: "127.0.0.1", port: fake.port, password: "pw" });
+    const key = "eip155:84532:0xabc:0xdef";
+    const record = {
+      signatureHash: "ab".repeat(32),
+      pathScope: "/private/",
+      resourcePath: "/private/internals",
+      createdAt: 1,
+      issued: false,
+    };
+    eq(await store.putPending(key, record, 900), true, "written");
+    const got = await store.getPending(key);
+    eq(got?.signatureHash, record.signatureHash, "read back");
+    eq(got?.issued, false, "still unissued");
+
+    eq(await store.putPending(key, { ...record, issued: true }, 900), true, "marked issued");
+    eq((await store.getPending(key))?.issued, true, "the mark sticks");
   } finally {
     await fake.close();
   }

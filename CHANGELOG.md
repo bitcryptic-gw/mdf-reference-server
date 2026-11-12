@@ -29,11 +29,23 @@ v1 mode, `X-PAYMENT` is not read, and the L402 JSON/HMAC token is gone.
   first and issue second, so a store that is down at issue time would take the
   payer's money and return nothing (observed in Stage B acceptance — one 0.1
   test-USDC payment settled against an unauthenticated store before this fix).
+- **Token issuance is idempotent on the payment.** A settled payment whose token
+  write failed leaves a pending record keyed by `(network, from, nonce)` on
+  eip155 or `(network, payment_hash)` on lnbtc, bound to a hash of the exact
+  `PAYMENT-SIGNATURE` and to the section it was paid for. Retrying the **same**
+  signature on the token endpoint issues the token without verifying or settling
+  again (a 503 carries `Retry-After: 5`); once a token exists the payment is
+  refused, so one payment never buys two credentials, and the same signature
+  cannot be re-targeted at another section.
 - **Trusted-proxy client keying** for the invoice-mint budget: `X-Real-IP` is
   trusted only from `server.trusted_proxies`, must be a single IP literal, and
   `X-Forwarded-For` is never read.
-- **Per-rail `/health`**: `rails[]`, `replay_store`, and the 0.2.7 `lightning`
-  block while that rail is degraded. HTTP stays 200 while a rail is degraded.
+- **Per-rail `/health`**: `rails[]`, `token_store`, `replay_store`, and the 0.2.7
+  `lightning` block while that rail is degraded. HTTP stays 200 while a rail is
+  degraded. Both stores are probed as a request would use them (AUTH plus a
+  cheap command on the authenticated connection) and report
+  `{"status":"unavailable","category":"auth"|"unreachable"}` — a health check
+  that skipped AUTH is how a password failure once looked like a healthy store.
 - **Payment-attempt log** (`payment_attempt`): one JSON line per priced request,
   fixed field set, header names only, coarse outcome classes.
 - **Vendored 402 schema** (`src/payment/schemas/mdf-402.schema.json`, from

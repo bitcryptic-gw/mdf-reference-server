@@ -51,6 +51,41 @@ export interface VerifyResult {
   issueToken?: boolean;
 }
 
+/**
+ * Identity of a payment, for idempotent token issuance.
+ *
+ * eip155: `network:from:nonce` — the nonce lives inside the signed authorization,
+ * so it cannot be claimed by anyone else. lnbtc: `network:payment_hash` — there
+ * is no payer key, and the hash is what a preimage proves.
+ */
+export function paymentIdentity(payload: Record<string, unknown>): {
+  key: string;
+  rail: string;
+} | null {
+  const accepted = payload.accepted as PaymentRequirement | undefined;
+  if (!accepted || typeof accepted.network !== "string") return null;
+  const rail = `${accepted.scheme}/${accepted.network}`;
+
+  if (accepted.network.startsWith("lnbtc:")) {
+    const invoice = (accepted.extra as Record<string, unknown> | undefined)?.invoice;
+    if (typeof invoice !== "string") return null;
+    try {
+      const decoded = decodeBolt11(invoice);
+      return { key: `${accepted.network}:${decoded.paymentHash}`, rail };
+    } catch {
+      return null;
+    }
+  }
+
+  const auth = (payload.payload as { authorization?: { from?: unknown; nonce?: unknown } } | undefined)
+    ?.authorization;
+  if (!auth || typeof auth.from !== "string" || typeof auth.nonce !== "string") return null;
+  return {
+    key: `${accepted.network}:${auth.from.toLowerCase()}:${auth.nonce.toLowerCase()}`,
+    rail,
+  };
+}
+
 export interface RequestContext {
   urlPath: string;
   resourceUrl: string;
@@ -157,6 +192,12 @@ function sourceBytesFor(loaded: LoadedConfig, urlPath: string): number | undefin
 // Verification
 // ---------------------------------------------------------------------------
 
+export interface VerifiedPayment {
+  key: string;
+  rail: string;
+  payer?: string;
+}
+
 export interface VerifyInput {
   loaded: LoadedConfig;
   request: RequestContext;
@@ -164,6 +205,12 @@ export interface VerifyInput {
   paymentSignature: string | null;
   /** Whether an `X-PAYMENT` header was also present (logging only). */
   sawLegacyHeader?: boolean;
+  /**
+   * Runs once the payment is verified and **before it is settled or its replay
+   * key is claimed**. Returns false when the caller could not durably record the
+   * payment; the request then fails closed without spending the payer's money.
+   */
+  onVerifiedPayment?: (payment: VerifiedPayment) => Promise<boolean>;
 }
 
 /**
@@ -213,9 +260,25 @@ export async function verifyPayment(input: VerifyInput): Promise<VerifyResult> {
   const railLabel = `${rail.scheme}/${rail.network}`;
 
   if (rail.network.startsWith("lnbtc:")) {
-    return verifyLnbtc({ loaded, request, payload, accepted, rail, tokenAccess });
+    return verifyLnbtc({
+      loaded,
+      request,
+      payload,
+      accepted,
+      rail,
+      tokenAccess,
+      onVerifiedPayment: input.onVerifiedPayment,
+    });
   }
-  return verifyEip155({ loaded, request, payload, accepted, rail, tokenAccess });
+  return verifyEip155({
+    loaded,
+    request,
+    payload,
+    accepted,
+    rail,
+    tokenAccess,
+    onVerifiedPayment: input.onVerifiedPayment,
+  });
 }
 
 /** The four fields that identify a rail, compared case-insensitively for hex. */
@@ -251,8 +314,9 @@ async function verifyEip155(args: {
   accepted: PaymentRequirement;
   rail: RailConfig;
   tokenAccess: boolean;
+  onVerifiedPayment?: VerifyInput["onVerifiedPayment"];
 }): Promise<VerifyResult> {
-  const { loaded, request, payload, accepted, rail, tokenAccess } = args;
+  const { loaded, request, payload, accepted, rail, tokenAccess, onVerifiedPayment } = args;
   const pool = loaded.pool;
   if (!pool) return { status: "error", reason: "payment_unavailable" };
 
@@ -274,6 +338,17 @@ async function verifyEip155(args: {
     return outcome.kind === "invalid"
       ? { status: "rejected", reason: coarseErrorClass(outcome.reason) }
       : { status: "error", reason: "payment_unavailable" };
+  }
+
+  // Record the payment before money moves: a store that dies between /settle and
+  // the token write would otherwise leave the payer charged and unanswered.
+  if (onVerifiedPayment) {
+    const recorded = await onVerifiedPayment({
+      key: `${accepted.network}:${outcome.authorization.from.toLowerCase()}:${outcome.authorization.nonce.toLowerCase()}`,
+      rail: `${rail.scheme}/${rail.network}`,
+      ...(outcome.payer ? { payer: outcome.payer } : {}),
+    });
+    if (!recorded) return { status: "error", reason: "payment_unavailable" };
   }
 
   const settled = await pool.settle(leg, verifyRequest, {
@@ -303,8 +378,9 @@ async function verifyLnbtc(args: {
   accepted: PaymentRequirement;
   rail: RailConfig;
   tokenAccess: boolean;
+  onVerifiedPayment?: VerifyInput["onVerifiedPayment"];
 }): Promise<VerifyResult> {
-  const { loaded, request, payload, accepted, rail, tokenAccess } = args;
+  const { loaded, request, payload, accepted, rail, tokenAccess, onVerifiedPayment } = args;
   const rt = loaded.lnbtc;
   if (!rt) return { status: "rejected", reason: "unsupported_rail" };
   if (!rt.gate.canOffer()) return { status: "error", reason: "payment_unavailable" };
@@ -353,6 +429,16 @@ async function verifyLnbtc(args: {
   if (typeof preimage !== "string") return { status: "rejected", reason: "invalid_payment" };
   const preimageCheck = preimageMatches(preimage, decoded.paymentHash);
   if (!preimageCheck.ok) return { status: "rejected", reason: "invalid_payment" };
+
+  // Record the payment before the replay key is claimed: the claim is what makes
+  // the preimage single-use, so a failure to record must happen first.
+  if (onVerifiedPayment) {
+    const recorded = await onVerifiedPayment({
+      key: `${rt.network}:${decoded.paymentHash}`,
+      rail: `${rail.scheme}/${rail.network}`,
+    });
+    if (!recorded) return { status: "error", reason: "payment_unavailable" };
+  }
 
   // 3. Single use, durably, across instances.
   const claim = await rt.replay.claim(

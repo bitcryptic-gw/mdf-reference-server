@@ -831,6 +831,8 @@ await test("a store that fails its probe is refused before any payment is settle
     put: async () => true,
     get: async () => null,
     delete: async () => {},
+    putPending: async () => true,
+    getPending: async () => null,
     health: async () => "unavailable",
     close: () => {},
   };
@@ -846,6 +848,8 @@ await test("an unreachable token store denies with 503, never a token", async ()
     put: async () => false,
     get: async () => null,
     delete: async () => {},
+    putPending: async () => true,
+    getPending: async () => null,
     health: async () => "ok",
     close: () => {},
   };
@@ -853,6 +857,152 @@ await test("an unreachable token store denies with 503, never a token", async ()
   const res = await postToken("/mdf/auth", { payment: paymentFor(offer), config });
   assertEquals(res.status, 503, "fail closed when the store refuses the write");
   assert(!("token" in (await res.json())), "no token");
+});
+
+// ---------------------------------------------------------------------------
+// Idempotent token issuance: a settled payment whose token write failed
+// ---------------------------------------------------------------------------
+
+console.log("\nPaid-but-no-token recovery\n");
+
+/** A memory store whose `put` can be made to fail for a window. */
+function flappableStore() {
+  const store = new MemoryTokenStore();
+  const originalPut = store.put.bind(store);
+  let putWorks = true;
+  store.put = async (id, record, ttl) => (putWorks ? originalPut(id, record, ttl) : false);
+  return {
+    store,
+    failWrites(on: boolean) {
+      putWorks = !on;
+    },
+  };
+}
+
+await test("a store that fails after settle answers 503 + Retry-After and no token", async () => {
+  resetMock();
+  const config = makeLoaded();
+  const flap = flappableStore();
+  (config as { tokenStore: unknown }).tokenStore = flap.store;
+
+  const offer = (await (await postToken("/mdf/auth", { config })).json()) as Record<string, unknown>;
+  const payment = paymentFor(offer);
+
+  flap.failWrites(true);
+  const res = await postToken("/mdf/auth", { payment, config });
+  assertEquals(res.status, 503, "the payment settled but the token could not be written");
+  assertEquals(res.headers.get("retry-after"), "5", "the client is told to retry");
+  assert(!("token" in (await res.json())), "no token");
+  assertEquals(callsTo("/settle").length, 1, "settled exactly once");
+});
+
+await test("retrying the same signature once the store is back issues the token, no second settle", async () => {
+  resetMock();
+  const config = makeLoaded();
+  const flap = flappableStore();
+  (config as { tokenStore: unknown }).tokenStore = flap.store;
+
+  const offer = (await (await postToken("/mdf/auth", { config })).json()) as Record<string, unknown>;
+  const payment = paymentFor(offer);
+
+  flap.failWrites(true);
+  assertEquals((await postToken("/mdf/auth", { payment, config })).status, 503, "first attempt fails");
+  assertEquals(callsTo("/settle").length, 1, "settled once");
+
+  flap.failWrites(false);
+  const retry = await postToken("/mdf/auth", { payment, config });
+  assertEquals(retry.status, 200, "the retry issues the token");
+  const body = (await retry.json()) as { token: string };
+  assert(typeof body.token === "string", "a token is returned");
+  assertEquals(callsTo("/settle").length, 1, "the retry does not settle again");
+  assertEquals(callsTo("/verify").length, 1, "the retry does not re-verify either");
+
+  const validated = await validateToken(flap.store, `Bearer ${body.token}`, "/private/internals");
+  assertEquals(validated.ok, true, "the token validates");
+
+  const header = retry.headers.get("payment-response");
+  assert(!!header, "the retry still carries PAYMENT-RESPONSE");
+  const decoded = JSON.parse(Buffer.from(header as string, "base64").toString("utf8"));
+  assertEquals(decoded.transaction, SETTLE_TX, "with the original settlement tx");
+});
+
+await test("a second retry after issuance is rejected, with no further settle", async () => {
+  resetMock();
+  const config = makeLoaded();
+  const flap = flappableStore();
+  (config as { tokenStore: unknown }).tokenStore = flap.store;
+
+  const offer = (await (await postToken("/mdf/auth", { config })).json()) as Record<string, unknown>;
+  const payment = paymentFor(offer);
+  flap.failWrites(true);
+  await postToken("/mdf/auth", { payment, config });
+  flap.failWrites(false);
+  assertEquals((await postToken("/mdf/auth", { payment, config })).status, 200, "issued on retry");
+
+  const third = await postToken("/mdf/auth", { payment, config });
+  assertEquals(third.status, 402, "one payment buys one token");
+  assert(!("token" in (await third.json())), "no second token");
+  assertEquals(callsTo("/settle").length, 1, "still exactly one settle");
+});
+
+await test("a retry that re-targets the payment at another section is refused", async () => {
+  resetMock();
+  const config = makeLoaded();
+  const flap = flappableStore();
+  (config as { tokenStore: unknown }).tokenStore = flap.store;
+
+  // Two token sections, so re-targeting is meaningful.
+  (config.config.pricing.sections as Record<string, unknown>)["/vault/**"] = {
+    access: "token",
+    rails: [rail("100000")],
+  };
+
+  const offer = (await (await postToken("/mdf/auth", { config })).json()) as Record<string, unknown>;
+  const payment = paymentFor(offer);
+  flap.failWrites(true);
+  await postToken("/mdf/auth", { payment, config });
+  flap.failWrites(false);
+
+  const other = await postToken("/mdf/auth", {
+    payment,
+    config,
+    body: { resource: "/vault/notes" },
+  });
+  assertEquals(other.status, 402, "the payment is bound to the section it settled for");
+  assert(!("token" in (await other.json())), "no token for the other section");
+});
+
+await test("a forged payload with someone else's identity cannot use their pending record", async () => {
+  resetMock();
+  const config = makeLoaded();
+  const store = new MemoryTokenStore();
+  (config as { tokenStore: unknown }).tokenStore = store;
+
+  const offer = (await (await postToken("/mdf/auth", { config })).json()) as Record<string, unknown>;
+  const accepted = (offer.accepts as Array<Record<string, unknown>>)[0];
+  const identityPayment = paymentFor(offer);
+
+  // Leave a pending (unissued) record by hand, exactly as a failed issue would.
+  const decoded = JSON.parse(
+    Buffer.from(identityPayment, "base64").toString("utf8")
+  ) as { accepted: Record<string, unknown>; payload: { authorization: { from: string; nonce: string } } };
+  const key = `${accepted.network}:${decoded.payload.authorization.from.toLowerCase()}:${decoded.payload.authorization.nonce.toLowerCase()}`;
+  await store.putPending(
+    key,
+    {
+      signatureHash: "00".repeat(32),
+      pathScope: "/private/",
+      resourcePath: "/private/internals",
+      createdAt: Date.now(),
+      issued: false,
+    },
+    900
+  );
+
+  const forged = await postToken("/mdf/auth", { payment: identityPayment, config });
+  assertEquals(forged.status, 402, "a different signature on the same identity is refused");
+  assert(!("token" in (await forged.json())), "no token");
+  assertEquals(callsTo("/settle").length, 0, "and nothing is settled");
 });
 
 // ---------------------------------------------------------------------------

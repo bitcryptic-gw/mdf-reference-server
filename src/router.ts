@@ -28,9 +28,11 @@ import { serveDiscovery } from "./discovery/discovery.ts";
 import { serveFeed } from "./feed/handler.ts";
 import { serveContent, serveNotFound, resolveContentPath } from "./content/handler.ts";
 import { prefersMarkdown } from "./content/accept.ts";
+import { createHash } from "crypto";
 import {
   buildOfferFor,
   entryFor,
+  paymentIdentity,
   verifyPayment,
   settlementHeader,
   type RequestContext,
@@ -40,8 +42,10 @@ import { render402, renderUnavailable } from "./payment/402.ts";
 import { HEADER } from "./payment/headers.ts";
 import { logAttempt, type AttemptOutcome } from "./payment/attempt-log.ts";
 import { resolveClientKey } from "./payment/client-key.ts";
-import { issueToken, validateToken } from "./auth/token-store.ts";
+import { issueToken, validateToken, type PendingToken } from "./auth/token-store.ts";
+import { decodeHeaderObject, MAX_PAYMENT_HEADER_CHARS } from "./payment/headers.ts";
 import { isLnbtcNetwork, tokenScopeForPath } from "./payment/rails.ts";
+import type { StoreHealth } from "./payment/lnbtc/replay-store.ts";
 import { SERVER_VERSION } from "./version.ts";
 import type { LoadedConfig } from "./config/loader.ts";
 
@@ -199,15 +203,27 @@ function lightningBlock(loaded: LoadedConfig): Record<string, unknown> | null {
   };
 }
 
+/** A store probe as `/health` reports it: ok, or unavailable with the kind. */
+function storeBlock(health: StoreHealth): { status: string; category?: string } {
+  return health === "ok" ? { status: "ok" } : { status: "unavailable", category: health };
+}
+
 async function healthResponse(loaded: LoadedConfig): Promise<Response> {
   const ok = isHealthy(loaded);
   const lightning = lightningBlock(loaded);
 
-  const replay = loaded.replayStore ? await loaded.replayStore.health() : null;
+  // Both stores are probed the way real requests use them (AUTH plus a cheap
+  // command on the authenticated connection). A health check that skips AUTH
+  // reports "ok" while every write fails — that is the shape of the outage that
+  // hid the token store's missing AUTH.
+  const [replay, token] = await Promise.all([
+    loaded.replayStore ? loaded.replayStore.health() : Promise.resolve(null),
+    loaded.tokenStore.health(),
+  ]);
 
   const rails = railStates(loaded).map((state) =>
     // A rail whose only durable dependency is down is degraded, not ok.
-    state.rail.startsWith("lnbtc:") && replay === "unavailable"
+    state.rail.startsWith("lnbtc:") && replay !== null && replay !== "ok"
       ? { ...state, status: "degraded" }
       : state
   );
@@ -216,7 +232,8 @@ async function healthResponse(loaded: LoadedConfig): Promise<Response> {
     status: ok ? "ok" : "unavailable",
     version: SERVER_VERSION,
     rails,
-    ...(replay ? { replay_store: { status: replay } } : {}),
+    token_store: storeBlock(token),
+    ...(replay !== null ? { replay_store: storeBlock(replay) } : {}),
     ...(lightning ? { lightning } : {}),
   });
   return new Response(body, {
@@ -325,6 +342,50 @@ function mimeTypeFor(acceptHeader: string | null | undefined): string {
 // Token issuance endpoint
 // ---------------------------------------------------------------------------
 
+/**
+ * A settled payment's token is written with a short retry, and the payment is
+ * recorded first so a client can retry the *same* `PAYMENT-SIGNATURE` and get the
+ * token without paying twice. Fifteen minutes is the retry window; the payment
+ * is single-use inside it and unretryable after.
+ */
+const PENDING_TTL_SECONDS = 900;
+const WRITE_ATTEMPTS = 3;
+const WRITE_RETRY_MS = 150;
+const RETRY_AFTER_SECONDS = 5;
+
+function signatureHash(paymentSignature: string): string {
+  return createHash("sha256").update(`mdf-payment-signature-v1:${paymentSignature}`).digest("hex");
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Run a store write with a short retry; a flapping store often takes on the second. */
+async function writeWithRetry(write: () => Promise<boolean>): Promise<boolean> {
+  for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt++) {
+    if (await write()) return true;
+    if (attempt < WRITE_ATTEMPTS - 1) await sleep(WRITE_RETRY_MS);
+  }
+  return false;
+}
+
+/** Issue a token with a short retry, returning the issued credential or null. */
+async function issueWithRetry(
+  issue: () => Promise<{ token: string; expiresAt: number; ttlSeconds: number; id: string } | null>
+): Promise<{ token: string; expiresAt: number; ttlSeconds: number; id: string } | null> {
+  for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt++) {
+    const issued = await issue();
+    if (issued) return issued;
+    if (attempt < WRITE_ATTEMPTS - 1) await sleep(WRITE_RETRY_MS);
+  }
+  return null;
+}
+
+function pendingResponse503(): Response {
+  const response = jsonError(503, "token store unavailable", true);
+  response.headers.set("Retry-After", String(RETRY_AFTER_SECONDS));
+  return response;
+}
+
 async function handleTokenEndpoint(
   req: Request,
   loaded: LoadedConfig,
@@ -411,16 +472,194 @@ async function handleTokenEndpoint(
     { "content-type": req.headers.get("content-type") },
     clientKey
   );
-
-  const result = await verifyPayment({ loaded, request: context, paymentSignature, sawLegacyHeader: !!sawLegacy });
-  const attempt = {
+  const pathScope = tokenScopeForPath(payPath);
+  const attemptBase = {
     path: urlPath,
     headers: { paymentSignature, xPayment: sawLegacy },
+    startedAtMs: start,
+    client: clientKey,
+  };
+
+  const respondWithToken = (token: {
+    token: string;
+    expiresAt: number;
+    ttlSeconds: number;
+  }, settlement: PendingToken["settlement"], rail: string | undefined) => {
+    console.log(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        event: "token_issued",
+        id_prefix: token.token.slice(0, 8),
+        path_scope: pathScope,
+        rail: rail ?? "unknown",
+        expires_at: new Date(token.expiresAt).toISOString(),
+      })
+    );
+    const paymentHeader = settlement
+      ? Buffer.from(
+          JSON.stringify({
+            success: true,
+            transaction: settlement.transaction,
+            network: settlement.network,
+            ...(settlement.payer ? { payer: settlement.payer } : {}),
+          }),
+          "utf8"
+        ).toString("base64")
+      : null;
+
+    return new Response(
+      JSON.stringify({
+        token: token.token,
+        expires_at: new Date(token.expiresAt).toISOString(),
+        ttl_seconds: token.ttlSeconds,
+      }),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          // The body carries a bearer credential — never cacheable anywhere.
+          "Cache-Control": "no-store",
+          ...(paymentHeader ? { [HEADER.response]: paymentHeader } : {}),
+        },
+      }
+    );
+  };
+
+  // ── 1. Idempotent retry ───────────────────────────────────────────────────
+  //
+  // If this exact payment already settled here and its token was not written,
+  // issue it now without verifying or settling again. The pending record is the
+  // proof: it can only exist because /verify approved this payment, and the
+  // signature hash makes it unreachable to anyone who cannot reproduce the
+  // signed payload. A payment that already produced a token is refused, so one
+  // payment never buys two credentials.
+  const decoded = paymentSignature
+    ? decodeHeaderObject<Record<string, unknown>>(paymentSignature, MAX_PAYMENT_HEADER_CHARS)
+    : null;
+  const identity = decoded?.ok ? paymentIdentity(decoded.value) : null;
+  const sigHash = paymentSignature ? signatureHash(paymentSignature) : null;
+
+  // The settlement of this attempt, if it has one yet; the retry path uses the
+  // record's copy instead.
+  let pendingSettlement: PendingToken["settlement"] | undefined;
+
+  const issue = () =>
+    issueToken(loaded.tokenStore, {
+      urlPath: payPath,
+      pathScope,
+      issuedTo: pendingSettlement?.payer ?? "unknown",
+      txHash: pendingSettlement?.transaction ?? "unknown",
+      ttlSeconds: loaded.config.auth.token_ttl_seconds,
+    });
+
+  if (identity && sigHash) {
+    const pending = await loaded.tokenStore.getPending(identity.key);
+    if (pending) {
+      const samePayment = pending.signatureHash === sigHash;
+      const sameTarget = pending.pathScope === pathScope;
+
+      if (!samePayment || !sameTarget || pending.issued) {
+        return {
+          response: jsonError(402, "Payment already used", true),
+          attempt: {
+            ...attemptBase,
+            outcome: "replay_rejected",
+            reason: "replay_rejected",
+            rail: identity.rail,
+            status: 402,
+          },
+        };
+      }
+
+      pendingSettlement = pending.settlement;
+      const retried = await issueWithRetry(issue);
+      if (!retried) {
+        return {
+          response: pendingResponse503(),
+          attempt: {
+            ...attemptBase,
+            outcome: "error",
+            reason: "token_store_unavailable",
+            rail: identity.rail,
+            status: 503,
+          },
+        };
+      }
+
+      if (!(await writeWithRetry(() =>
+        loaded.tokenStore.putPending(
+          identity.key,
+          { ...pending, issued: true, issuedTokenId: retried.id },
+          PENDING_TTL_SECONDS
+        )
+      ))) {
+        // The token exists; the idempotency mark did not stick. Say so, so an
+        // operator can see why a retry minted a second token rather than
+        // discovering it as a mystery.
+        console.warn(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            event: "token_pending_mark_failed",
+            payment_key_last16: identity.key.slice(-16),
+            id_prefix: retried.id.slice(0, 8),
+          })
+        );
+      }
+      if (!pending.settlement) {
+        // The store accepted the pre-settlement record but not the settlement
+        // update. The token is still owed; the header cannot be reconstructed.
+        console.warn(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            event: "payment_response_unavailable",
+            payment_key_last16: identity.key.slice(-16),
+          })
+        );
+      }
+
+      return {
+        response: respondWithToken(retried, pending.settlement, identity.rail),
+        attempt: { ...attemptBase, outcome: "settled", rail: identity.rail, status: 200 },
+      };
+    }
+  }
+
+  // ── 2. Verify and settle ──────────────────────────────────────────────────
+  //
+  // The pending record is written *before* settlement (via the hook) so the
+  // payment is recoverable if the store dies immediately after /settle — the gap
+  // a post-settle-only record leaves open.
+  const result = await verifyPayment({
+    loaded,
+    request: context,
+    paymentSignature,
+    sawLegacyHeader: !!sawLegacy,
+    ...(identity && sigHash
+      ? {
+          onVerifiedPayment: async (payment) =>
+            writeWithRetry(() =>
+              loaded.tokenStore.putPending(
+                identity.key,
+                {
+                  signatureHash: sigHash,
+                  pathScope,
+                  resourcePath: payPath,
+                  createdAt: Date.now(),
+                  issued: false,
+                  rail: payment.rail,
+                  ...(payment.payer ? { payer: payment.payer } : {}),
+                },
+                PENDING_TTL_SECONDS
+              )
+            ),
+        }
+      : {}),
+  });
+  const attempt = {
+    ...attemptBase,
     outcome: outcomeFor(result),
     ...(result.reason ? { reason: result.reason } : {}),
     ...(result.rail ? { rail: result.rail } : {}),
-    startedAtMs: start,
-    client: clientKey,
   };
 
   if (result.status === "error") {
@@ -437,52 +676,74 @@ async function handleTokenEndpoint(
     return { response, attempt: { ...attempt, status: response.status } };
   }
 
-  const issued = await issueToken(loaded.tokenStore, {
-    urlPath: payPath,
-    pathScope: tokenScopeForPath(payPath),
-    issuedTo: result.settlement?.payer ?? "unknown",
-    txHash: result.settlement?.transaction ?? "unknown",
-    ttlSeconds: loaded.config.auth.token_ttl_seconds,
-  });
+  // ── 3. Issue, and record what a retry would need ──────────────────────────
+  pendingSettlement = result.settlement
+    ? {
+        transaction: result.settlement.transaction,
+        network: result.settlement.network,
+        ...(result.settlement.payer ? { payer: result.settlement.payer } : {}),
+      }
+    : undefined;
 
+  // Persist the settlement before issuing, so a retry can replay the exact
+  // PAYMENT-RESPONSE (the transaction is only known now, after /settle).
+  if (identity && sigHash && pendingSettlement) {
+    await writeWithRetry(() =>
+      loaded.tokenStore.putPending(
+        identity.key,
+        {
+          signatureHash: sigHash,
+          pathScope,
+          resourcePath: payPath,
+          createdAt: Date.now(),
+          issued: false,
+          settlement: pendingSettlement!,
+          ...(result.rail ? { rail: result.rail } : {}),
+        },
+        PENDING_TTL_SECONDS
+      )
+    );
+  }
+
+  const issued = await issueWithRetry(issue);
   if (!issued) {
-    // Fail closed: an unreachable token store must never produce a credential
-    // the other instance cannot validate.
+    // The payment is settled and recorded; a retry with the same signature will
+    // issue the token once the store recovers.
     return {
-      response: jsonError(503, "token store unavailable", true),
+      response: pendingResponse503(),
       attempt: { ...attempt, status: 503 },
     };
   }
 
-  console.log(
-    JSON.stringify({
-      ts: new Date().toISOString(),
-      event: "token_issued",
-      id_prefix: issued.id.slice(0, 8),
-      path_scope: tokenScopeForPath(payPath),
-      rail: result.rail ?? "unknown",
-      expires_at: new Date(issued.expiresAt).toISOString(),
-    })
-  );
+  if (identity && sigHash) {
+    const pendingRecord: PendingToken = {
+      signatureHash: sigHash,
+      pathScope,
+      resourcePath: payPath,
+      createdAt: Date.now(),
+      issued: true,
+      issuedTokenId: issued.id,
+      ...(pendingSettlement ? { settlement: pendingSettlement } : {}),
+      ...(result.rail ? { rail: result.rail } : {}),
+    };
+    if (
+      !(await writeWithRetry(() =>
+        loaded.tokenStore.putPending(identity.key, pendingRecord, PENDING_TTL_SECONDS)
+      ))
+    ) {
+      console.warn(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          event: "token_pending_mark_failed",
+          payment_key_last16: identity.key.slice(-16),
+          id_prefix: issued.id.slice(0, 8),
+        })
+      );
+    }
+  }
 
-  const paymentHeader = settlementHeader(result);
   return {
-    response: new Response(
-      JSON.stringify({
-        token: issued.token,
-        expires_at: new Date(issued.expiresAt).toISOString(),
-        ttl_seconds: issued.ttlSeconds,
-      }),
-      {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json; charset=utf-8",
-          // The body carries a bearer credential — never cacheable anywhere.
-          "Cache-Control": "no-store",
-          ...(paymentHeader ? { [HEADER.response]: paymentHeader } : {}),
-        },
-      }
-    ),
+    response: respondWithToken(issued, pendingSettlement, result.rail),
     attempt: { ...attempt, status: 200 },
   };
 }

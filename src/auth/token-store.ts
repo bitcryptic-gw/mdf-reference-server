@@ -23,11 +23,17 @@
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { connect } from "node:net";
-import { parseResp, type ValkeyOptions } from "../payment/lnbtc/replay-store.ts";
+import {
+  isAuthError,
+  parseResp,
+  type StoreHealth,
+  type ValkeyOptions,
+} from "../payment/lnbtc/replay-store.ts";
 
 /** Domain separation for the digest, so a token hash cannot collide with a replay key. */
 const TOKEN_HASH_LABEL = "mdf-token-v1:";
 const KEY_PREFIX = "mdf:token:";
+const PENDING_PREFIX = "mdf:pending-token:";
 
 export interface StoredToken {
   /** SHA-256(LABEL || id || secret), hex. Never the token itself. */
@@ -38,18 +44,48 @@ export interface StoredToken {
   txHash: string;
 }
 
+/**
+ * A payment that verified and settled (or is about to) but whose token has not
+ * been written yet.
+ *
+ * Keyed by the payment's identity, and carrying a hash of the exact
+ * `PAYMENT-SIGNATURE` that paid: the retry path issues a token *without*
+ * re-verifying, so it must be impossible to reach it by asserting someone
+ * else's `(from, nonce)`.
+ */
+export interface PendingToken {
+  /** SHA-256 of the raw PAYMENT-SIGNATURE header value. */
+  signatureHash: string;
+  /** Section the token will be scoped to. */
+  pathScope: string;
+  /** The path that was verified, so a retry cannot re-target the token. */
+  resourcePath: string;
+  createdAt: number;
+  /** True once a token has been issued for this payment. */
+  issued: boolean;
+  /** Id of the issued token, so the mark can be audited. */
+  issuedTokenId?: string;
+  /** Rail label, for the issued-token log line on the retry path. */
+  rail?: string;
+  /** Settlement this payment produced, replayed in the retry's header. */
+  settlement?: { transaction: string; network: string; payer?: string };
+  /** Payer, when the rail exposes one (lnbtc does not). */
+  payer?: string;
+}
+
 export interface TokenStore {
   put(id: string, token: StoredToken, ttlSeconds: number): Promise<boolean>;
   get(id: string): Promise<StoredToken | null>;
   delete(id: string): Promise<void>;
+  /** Record a settled payment whose token has not been written yet. */
+  putPending(key: string, record: PendingToken, ttlSeconds: number): Promise<boolean>;
+  getPending(key: string): Promise<PendingToken | null>;
   /**
-   * Cheap reachability probe, used *before* a token payment is settled.
-   *
-   * Mints settle first and issue second, so a store that is down at issue time
-   * costs the payer money and returns nothing. The probe cannot remove the race,
-   * but it removes the common case (store down for the whole request).
+   * Reachability probe (AUTH plus a cheap command), used *before* a payment is
+   * settled and by `/health`. A probe that skips AUTH reports "ok" while every
+   * write fails — which is exactly the outage that hid the missing-AUTH bug.
    */
-  health(): Promise<"ok" | "unavailable">;
+  health(): Promise<StoreHealth>;
   close(): void;
 }
 
@@ -71,6 +107,7 @@ export function digestsEqual(aHex: string, bHex: string): boolean {
 
 export class MemoryTokenStore implements TokenStore {
   private readonly records = new Map<string, StoredToken>();
+  private readonly pending = new Map<string, { record: PendingToken; expiresAt: number }>();
   private readonly now: () => number;
 
   constructor(now: () => number = Date.now) {
@@ -95,12 +132,28 @@ export class MemoryTokenStore implements TokenStore {
     this.records.delete(id);
   }
 
-  async health(): Promise<"ok" | "unavailable"> {
+  async putPending(key: string, record: PendingToken, ttlSeconds: number): Promise<boolean> {
+    this.pending.set(key, { record, expiresAt: this.now() + ttlSeconds * 1000 });
+    return true;
+  }
+
+  async getPending(key: string): Promise<PendingToken | null> {
+    const hit = this.pending.get(key);
+    if (!hit) return null;
+    if (hit.expiresAt <= this.now()) {
+      this.pending.delete(key);
+      return null;
+    }
+    return hit.record;
+  }
+
+  async health(): Promise<StoreHealth> {
     return "ok";
   }
 
   close(): void {
     this.records.clear();
+    this.pending.clear();
   }
 }
 
@@ -152,10 +205,38 @@ export class ValkeyTokenStore implements TokenStore {
     await this.run([["DEL", KEY_PREFIX + id]]);
   }
 
-  /** AUTH + PING on a fresh connection; the same path a write would take. */
-  async health(): Promise<"ok" | "unavailable"> {
+  /** AUTH + PING on a fresh connection; the same path a write takes. */
+  async health(): Promise<StoreHealth> {
     const reply = await this.run([["PING"]]);
-    return reply.kind === "simple" && reply.value === "PONG" ? "ok" : "unavailable";
+    if (reply.kind === "simple" && reply.value === "PONG") return "ok";
+    return isAuthError(reply.value) ? "auth" : "unreachable";
+  }
+
+  async putPending(key: string, record: PendingToken, ttlSeconds: number): Promise<boolean> {
+    const reply = await this.run([
+      [
+        "SET",
+        PENDING_PREFIX + key,
+        JSON.stringify(record),
+        "EX",
+        String(Math.max(1, Math.ceil(ttlSeconds))),
+      ],
+    ]);
+    return reply.kind === "simple" && reply.value === "OK";
+  }
+
+  async getPending(key: string): Promise<PendingToken | null> {
+    const reply = await this.run([["GET", PENDING_PREFIX + key]]);
+    if (reply.kind !== "bulk" || typeof reply.value !== "string") return null;
+    try {
+      const parsed = JSON.parse(reply.value) as PendingToken;
+      if (typeof parsed.signatureHash !== "string" || typeof parsed.pathScope !== "string") {
+        return null;
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
   }
 
   close(): void {

@@ -108,8 +108,16 @@ rail is degraded, so a monitor must look at the body, not the status code.
 | — | — | **new `mdf <host> rail 8453 ok`** | `"rail":"eip155:8453","status":"ok"` |
 | — | — | **new `mdf <host> rail 84532 ok`** | `"rail":"eip155:84532","status":"ok"` |
 | — | — | **new `mdf <host> lnbtc ok`** | `"rail":"lnbtc:000000000019d6689c085ae165831e93","status":"ok"` |
-| — | — | **new `mdf <host> replay store ok`** | inverted `"replay_store":"unavailable"` |
+| — | — | **new `mdf <host> replay store ok`** | inverted `"replay_store":{"status":"unavailable"}` |
+| — | — | **new `mdf <host> token store ok`** | inverted `"token_store":{"status":"unavailable"}` |
 | — | — | **new `mdf <host> mdf.json 0.3.1`** | `"mdf_version": "0.3.1"` on `/mdf.json` |
+
+The store checks now probe the way a request does (AUTH plus a cheap command on
+the authenticated connection) and name the failure kind, so the body reads
+`"token_store":{"status":"unavailable","category":"auth"}` when the password is
+wrong and `…"category":"unreachable"` when nothing answers. The design note's
+flat `"replay_store":"unavailable"` shape is superseded by this one, because a
+category is what makes the failure actionable.
 
 If Kuma has JSON Query with an expected value, prefer
 `$.rails[?(@.rail=='eip155:8453')].status` → `ok`. Keep the `mdf-v2-staging`

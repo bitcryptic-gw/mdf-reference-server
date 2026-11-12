@@ -58,13 +58,20 @@ export function replayTtlSeconds(
 
 export type ClaimResult = "claimed" | "duplicate" | "unavailable";
 
-/** Passive store health for `/health`; never throws. */
-export type StoreHealth = "ok" | "unavailable";
+/**
+ * Store health for `/health`, as the failure *kind*.
+ *
+ * "auth" exists because the worst outage this store ever had was a credential
+ * one: a password-protected Valkey answering NOAUTH looks exactly like an
+ * unreachable store from the outside, and reporting it as a generic outage sent
+ * the first investigation in the wrong direction.
+ */
+export type StoreHealth = "ok" | "unreachable" | "auth";
 
 export interface ReplayStore {
   /** Atomically claim `network:payment_hash` for `ttlSeconds`. */
   claim(network: string, paymentHash: string, ttlSeconds: number): Promise<ClaimResult>;
-  /** Cheap reachability check, cached by the implementation's caller. */
+  /** Reachability probe: AUTH plus a cheap command on the authenticated connection. */
   health(): Promise<StoreHealth>;
   close(): void;
 }
@@ -99,6 +106,11 @@ export class MemoryReplayStore implements ReplayStore {
   size(): number {
     return [...this.keys.values()].filter((exp) => exp > this.now()).length;
   }
+}
+
+/** Does a RESP error mean "you are not authenticated" rather than "no server"? */
+export function isAuthError(message: string | undefined): boolean {
+  return !!message && /^(NOAUTH|WRONGPASS)/.test(message);
 }
 
 /** The scheme's canonical consumption key. Never reformat this. */
@@ -174,20 +186,24 @@ export class ValkeyReplayStore implements ReplayStore {
     }
   }
 
+  /**
+   * AUTH + PING on a fresh connection — the same path a claim takes, because a
+   * probe that skips AUTH or skips the command can report "ok" while every real
+   * write fails.
+   */
   async health(): Promise<StoreHealth> {
-    // PING over a fresh connection: the same cost as one claim, and the only
-    // honest way to answer "is the store reachable". Cached by the caller.
     let socket: Socket | null = null;
     try {
       socket = await this.connect();
       if (this.options.password) {
         const auth = await this.command(socket, ["AUTH", this.options.password]);
-        if (auth.kind === "error") return "unavailable";
+        if (auth.kind === "error") return isAuthError(auth.value) ? "auth" : "unreachable";
       }
       const reply = await this.command(socket, ["PING"]);
-      return reply.kind === "simple" && reply.value === "PONG" ? "ok" : "unavailable";
+      if (reply.kind === "error") return isAuthError(reply.value) ? "auth" : "unreachable";
+      return reply.kind === "simple" && reply.value === "PONG" ? "ok" : "unreachable";
     } catch {
-      return "unavailable";
+      return "unreachable";
     } finally {
       socket?.destroy();
     }

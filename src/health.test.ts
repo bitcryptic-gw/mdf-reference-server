@@ -127,7 +127,15 @@ function makeLoaded(
       payment: { max_timeout_seconds: 300 },
       server: { trusted_proxies: [] },
     } as unknown as LoadedConfig["config"],
-    tokenStore: { put: async () => true, get: async () => null, delete: async () => {}, close: () => {} },
+    tokenStore: {
+      put: async () => true,
+      get: async () => null,
+      delete: async () => {},
+      putPending: async () => true,
+      getPending: async () => null,
+      health: async () => "ok",
+      close: () => {},
+    },
     tokenStoreBackend: "memory",
     facilitator: null,
     pool: null,
@@ -229,6 +237,51 @@ await test("replay_store is reported when lnbtc is configured, and omitted other
     replay_store?: { status: string };
   };
   assertEquals(without.replay_store, undefined, "no lnbtc, no replay_store key");
+});
+
+await test("token_store is always probed, and reports the failure kind", async () => {
+  const healthy = JSON.parse((await getHealth(makeLoaded())).body) as {
+    token_store?: { status: string; category?: string };
+  };
+  assertEquals(healthy.token_store?.status, "ok", "healthy store");
+
+  for (const kind of ["unreachable", "auth"] as const) {
+    const config = makeLoaded();
+    (config as { tokenStore: unknown }).tokenStore = {
+      put: async () => false,
+      get: async () => null,
+      delete: async () => {},
+      putPending: async () => false,
+      getPending: async () => null,
+      health: async () => kind,
+      close: () => {},
+    };
+    const body = JSON.parse((await getHealth(config)).body) as {
+      token_store?: { status: string; category?: string };
+    };
+    assertEquals(body.token_store?.status, "unavailable", `${kind}: unavailable`);
+    assertEquals(body.token_store?.category, kind, `${kind}: the kind is reported`);
+  }
+});
+
+await test("an unavailable replay store degrades the lnbtc rail and says which kind", async () => {
+  const config = makeLoaded({ withLnbtc: true, lnbtcAvailable: true });
+  (config as { replayStore: unknown }).replayStore = {
+    claim: async () => "unavailable",
+    health: async () => "auth",
+    close: () => {},
+  };
+  const body = JSON.parse((await getHealth(config)).body) as {
+    replay_store?: { status: string; category?: string };
+    rails: Array<{ rail: string; status: string }>;
+  };
+  assertEquals(body.replay_store?.status, "unavailable", "store unavailable");
+  assertEquals(body.replay_store?.category, "auth", "an auth failure is named");
+  assertEquals(
+    body.rails.find((r) => r.rail.startsWith("lnbtc:"))?.status,
+    "degraded",
+    "the rail that depends on it is degraded"
+  );
 });
 
 // ---------------------------------------------------------------------------
