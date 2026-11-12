@@ -4,16 +4,11 @@ import { z } from "zod";
 // Primitives
 // ---------------------------------------------------------------------------
 
-const DecimalString = z
-  .string()
-  .regex(/^\d+(\.\d+)?$/, "must be a decimal string e.g. '0.0001'");
-
 const HttpsUri = z
   .string()
   .url()
   .refine((v) => v.startsWith("https://"), "must use https://");
 
-// A URL that is either absolute (https://) or a root-relative path (/foo)
 const EndpointUri = z
   .string()
   .refine(
@@ -21,15 +16,49 @@ const EndpointUri = z
     "must be an absolute https:// URL or a root-relative path starting with /"
   );
 
+/** Atomic integer amount: no sign, decimal point, exponent or separator. */
+const AtomicAmount = z
+  .string()
+  .regex(/^[1-9][0-9]*$/, "must be a positive atomic integer string, e.g. '10000'");
+
+/** CAIP-2 network identifier. */
+const Caip2 = z
+  .string()
+  .regex(/^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/, "must be a CAIP-2 network identifier");
+
+/** A single IP literal (v4 or v6), for the trusted-proxy list. */
+const IpLiteral = z
+  .string()
+  .min(2)
+  .max(45)
+  .refine((v) => /^[0-9a-fA-F:.]+$/.test(v.replace(/^\[|\]$/g, "")), "must be an IP literal, not a hostname");
+
 // ---------------------------------------------------------------------------
-// Sub-schemas
+// Pricing
 // ---------------------------------------------------------------------------
 
-const PriceEntry = z.object({
-  amount: DecimalString,
-  currency: z.string().nullable().optional(),
-  chain: z.string().nullable().optional(),
+const RailSchema = z.object({
+  scheme: z.literal("exact"),
+  network: Caip2,
+  asset: z.string().min(1).max(128),
+  amount: AtomicAmount,
 });
+
+const PriceEntrySchema = z
+  .object({
+    rails: z.array(RailSchema).default([]),
+    access: z.enum(["per_fetch", "token"]).default("per_fetch"),
+  })
+  .strict();
+
+const PricingSchema = z.object({
+  default: PriceEntrySchema,
+  sections: z.record(z.string(), PriceEntrySchema).optional(),
+});
+
+// ---------------------------------------------------------------------------
+// Sections
+// ---------------------------------------------------------------------------
 
 const SiteSchema = z.object({
   url: HttpsUri,
@@ -44,23 +73,9 @@ const ContentSchema = z.object({
   math: z.boolean().default(false),
 });
 
-const PricingSchema = z.object({
-  default: PriceEntry,
-  sections: z.record(z.string(), PriceEntry).optional(),
-});
-
-const PaymentSchema = z.object({
-  endpoint: EndpointUri,
-  accepted_chains: z.array(z.string()).min(1),
-  accepted_currencies: z.array(z.string()).min(1),
-  // wallet is optional here — may be supplied via secret
-  wallet: z.string().optional(),
-});
-
 const AuthSchema = z.object({
   endpoint: EndpointUri,
   token_ttl_seconds: z.number().int().min(60).default(86400),
-  price_threshold: DecimalString,
 });
 
 const SignalsSchema = z.object({
@@ -93,72 +108,103 @@ const DashboardSchema = z.object({
   port: z.number().int().min(1024).max(65535).default(9090),
 });
 
-// ---------------------------------------------------------------------------
-// Root config schema
-// ---------------------------------------------------------------------------
-
-const LightningSchema = z.object({
-  api_url: z.string().url(),
-  // api_token / token_secret are optional and inert: when present they are
-  // never read or logged. loader.ts resolves both from a mounted secret file
-  // or env var and throws if they cannot be resolved (Vikunja #27).
-  api_token: z.string().optional(),
-  invoice_expiry_seconds: z.number().int().min(60).default(300),
-  token_secret: z.string().optional(),
-  // Circuit-breaker tunables for invoice-creation failures. Defaults mean no
-  // mdf.yaml change is required; invalid values refuse to start.
-  breaker_initial_backoff_seconds: z.number().int().min(1).max(3600).default(5),
-  breaker_max_backoff_seconds: z.number().int().min(1).max(86400).default(300),
-});
-
 /**
- * Per-chain data needed to build standard x402 `PaymentRequirements` and to
- * confirm settlement on-chain independently of the facilitator's report.
+ * Valkey, shared by the replay store and (when configured) the token store.
+ *
+ * The password is resolved from `/run/secrets/valkey_password`; it is never a
+ * config value, an env var or an argv entry.
  */
-export const FacilitatorChainSchema = z.object({
-  /** ERC-20 token contract address for this chain, e.g. USDC. */
-  asset: z
-    .string()
-    .regex(/^0x[0-9a-fA-F]{40}$/, "must be a 0x-prefixed 20-byte EVM address"),
-  /** Token decimals, used to convert MDF amounts to atomic units. */
-  decimals: z.number().int().min(0).max(36).default(6),
-  /** Scheme-specific extra data passed through opaquely to the facilitator. */
-  extra: z.record(z.string(), z.unknown()).optional(),
-  /** JSON-RPC endpoint used for on-chain settlement confirmation. */
-  rpc_url: z.string().url().optional(),
-});
-
-export const FacilitatorSchema = z.object({
-  /** Base URL of a standard x402 facilitator exposing /verify and /settle. */
+const ValkeySchema = z.object({
   url: z
     .string()
     .url()
-    .refine((v) => v.startsWith("https://"), "must use https://"),
-  /** x402 scheme name (e.g. "exact"). */
-  scheme: z.string().min(1).default("exact"),
-  /** Offer validity window in seconds, shared by expires_at. */
-  max_timeout_seconds: z.number().int().min(1).max(86400).default(300),
-  /** Per-request HTTP timeout for facilitator calls. */
-  timeout_ms: z.number().int().min(1000).max(60000).default(15000),
-  /** Per-MDF-chain asset metadata, keyed by the MDF chain name. */
-  chains: z.record(z.string(), FacilitatorChainSchema).default({}),
-}).optional();
-
-export const MdfConfigSchema = z.object({
-  site: SiteSchema,
-  content: ContentSchema.default({}),
-  pricing: PricingSchema,
-  payment: PaymentSchema.optional(),
-  auth: AuthSchema.optional(),
-  signals: SignalsSchema.default({}),
-  feed: FeedSchema.optional(),
-  dashboard: DashboardSchema.default({}),
-  lightning: LightningSchema.optional(),
-  facilitator: FacilitatorSchema,
+    .refine((v) => v.startsWith("redis://") || v.startsWith("rediss://"), "must be redis:// or rediss://"),
+  connect_timeout_ms: z.number().int().min(100).max(30000).default(2000),
+  command_timeout_ms: z.number().int().min(100).max(30000).default(2000),
 });
 
+const LightningSchema = z
+  .object({
+    /** Off means no NWC connection is read and no lnbtc rail is declared. */
+    enabled: z.boolean().default(false),
+    /** Concrete lnbtc network. */
+    network: Caip2.default("lnbtc:000000000019d6689c085ae165831e93"),
+    /**
+     * Receiver node pubkey (accepts[].payTo for the lnbtc rail). Optional: when
+     * omitted it is read from `get_info` at startup, and the lnbtc rail stays
+     * unavailable until it is known.
+     */
+    node_pubkey: z
+      .string()
+      .regex(/^(02|03)[0-9a-f]{64}$/, "must be a compressed secp256k1 pubkey (66 lowercase hex)")
+      .optional(),
+    mint: z
+      .object({
+        global_per_minute: z.number().int().min(1).max(100000).default(180),
+        global_burst: z.number().int().min(1).max(100000).default(60),
+        per_client_per_minute: z.number().int().min(1).max(100000).default(24),
+        per_client_burst: z.number().int().min(1).max(100000).default(8),
+      })
+      .default({}),
+    nwc: z
+      .object({
+        connect_timeout_ms: z.number().int().min(500).max(60000).default(5000),
+        response_timeout_ms: z.number().int().min(500).max(120000).default(10000),
+      })
+      .default({}),
+    breaker_initial_backoff_seconds: z.number().int().min(1).max(3600).default(5),
+    breaker_max_backoff_seconds: z.number().int().min(1).max(86400).default(300),
+  })
+  .strict();
+
+const FacilitatorSchema = z
+  .object({
+    /** Ordered v2 legs. The first that answers serves the whole request. */
+    legs: z.array(z.string().url()).min(1),
+    timeout_ms: z.number().int().min(500).max(60000).default(15000),
+    /** JSON-RPC per CAIP-2 network, used by the on-chain confirmations. */
+    rpc: z.record(z.string(), z.string().url()).default({}),
+  })
+  .strict();
+
+// ---------------------------------------------------------------------------
+// Root
+// ---------------------------------------------------------------------------
+
+export const MdfConfigSchema = z
+  .object({
+    site: SiteSchema,
+    content: ContentSchema.default({}),
+    pricing: PricingSchema,
+    auth: AuthSchema.optional(),
+    /**
+     * Explicit, with no default: a silent "memory" would reintroduce tokens that
+     * only work on the instance that minted them.
+     */
+    token_store: z.enum(["valkey", "memory"]),
+    valkey: ValkeySchema.optional(),
+    server: z
+      .object({
+        trusted_proxies: z.array(IpLiteral).default([]),
+      })
+      .default({}),
+    signals: SignalsSchema.default({}),
+    feed: FeedSchema.optional(),
+    dashboard: DashboardSchema.default({}),
+    payment: z
+      .object({
+        /** Offer window for every rail; on lnbtc it is also the invoice expiry. */
+        max_timeout_seconds: z.number().int().min(1).max(86400).default(300),
+      })
+      .default({}),
+    lightning: LightningSchema.optional(),
+    facilitator: FacilitatorSchema.optional(),
+  })
+  .strict();
+
 export type MdfConfig = z.infer<typeof MdfConfigSchema>;
-export type PriceEntry = z.infer<typeof PriceEntry>;
+export type PriceEntry = z.infer<typeof PriceEntrySchema>;
+export type RailConfigInput = z.infer<typeof RailSchema>;
 export type LightningConfig = z.infer<typeof LightningSchema>;
-export type FacilitatorConfig = NonNullable<z.infer<typeof FacilitatorSchema>>;
-export type FacilitatorChainConfig = z.infer<typeof FacilitatorChainSchema>;
+export type FacilitatorConfigInput = z.infer<typeof FacilitatorSchema>;
+export type ValkeyConfig = z.infer<typeof ValkeySchema>;
