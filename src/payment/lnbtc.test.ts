@@ -199,16 +199,16 @@ const DECODED = decodeBolt11(SPEC_INVOICE);
 const PUBKEY = DECODED.signingKey;
 const NOW = DECODED.timestamp + 10;
 
-// NOTE: the spec's own example invoice carries x=75 s while its
-// `PaymentRequirements` example states maxTimeoutSeconds 300, so that pair is
-// not itself a conformant challenge. The requirement below uses the invoice's
-// real expiry; the mismatch case is asserted separately.
+// The spec's example invoice and its `PaymentRequirements` example agree:
+// maxTimeoutSeconds 300. (An earlier version of this suite read the `x` field as
+// one byte and concluded the example carried 75 s, which produced a fictitious
+// upstream discrepancy — see the integer-field regression below.)
 const GOOD: InvoiceRequirements = {
   network: "lnbtc:000000000019d6689c085ae165831e93",
   amountMsat: 25000,
   requestHash: DECODED.descriptionHash!,
   payeePubkey: PUBKEY,
-  maxTimeoutSeconds: 75,
+  maxTimeoutSeconds: 300,
 };
 
 test("a fully matching invoice passes every check", () => {
@@ -220,7 +220,7 @@ test("each binding violation is refused with its own reason", () => {
     ["amount", { ...GOOD, amountMsat: 24000 }, "amount"],
     ["binding", { ...GOOD, requestHash: "b".repeat(64) }, "description hash"],
     ["payee", { ...GOOD, payeePubkey: "02" + "cd".repeat(32) }, "signing key"],
-    ["expiry", { ...GOOD, maxTimeoutSeconds: 300 }, "expiry"],
+    ["expiry", { ...GOOD, maxTimeoutSeconds: 301 }, "expiry"],
     [
       "network",
       { ...GOOD, network: "lnbtc:000000000933ea01ad0ee984209779ba" },
@@ -235,7 +235,7 @@ test("each binding violation is refused with its own reason", () => {
 });
 
 test("an expired or future-dated invoice is refused", () => {
-  const expired = checkInvoice(DECODED, GOOD, DECODED.timestamp + 75 + 61);
+  const expired = checkInvoice(DECODED, GOOD, DECODED.timestamp + 300 + 61);
   eq(expired.ok, false, "expired");
   if (!expired.ok) assert(expired.reason.includes("expired"), "expiry reason");
 
@@ -247,10 +247,32 @@ test("an expired or future-dated invoice is refused", () => {
   eq(checkInvoice(DECODED, GOOD, DECODED.timestamp - 60).ok, true, "inside skew");
 });
 
-test("the scheme's own example pair fails its expiry rule (maxTimeout 300 vs x=75)", () => {
-  const r = checkInvoice(DECODED, { ...GOOD, maxTimeoutSeconds: 300 }, NOW);
-  eq(r.ok, false, "must fail: the invoice expiry is what binds");
-  if (!r.ok) assert(r.reason.includes("expiry"), "reason names expiry");
+test("the scheme's own example pair is conformant: x=300 equals maxTimeoutSeconds 300", () => {
+  eq(DECODED.expirySeconds, 300, "the invoice's real expiry is 300 s");
+  eq(checkInvoice(DECODED, GOOD, NOW).ok, true, "and the requirement agrees");
+});
+
+test("integer tagged fields are read as integers, not as byte-aligned blobs", () => {
+  // Real Alby Hub invoice, 1 sat, minted for this server's request binding. Its
+  // expiry (3600 s) needs 12 bits and therefore three 5-bit words — the case a
+  // byte-wise read gets wrong (it would decode as 28 s) and which no synthetic
+  // fixture had exercised.
+  const ALBY_INVOICE =
+    "lnbc10n1p40tvsfhp54s859kdv24pzffx0k7aljpg5sjvz8pr2whdjcg8wnha380cy292qnp4qvaatmgp3ca5xg889zzpsfhf9sazuzp5smya6es0yp0q02k6h8l66pp5yj6hhk72w3maahqdkh77x302eq4jxf0zr3gpjaym34s2y07vmlfssp5n64pqgqe5s6npj2wm0acmx4dytkthyy8dt3yw7ekdsp8h2pj0y5q9qyysgqcqzp2xqrrssrzjqdqxdc57gqkeea267xhpqfkvtt0e9mk3urjzz7z5gt6nw9adz3fmpapyqqqqqqqyuyqqqqqqqqqq86qqjq6kwxxmvdjml5u237pded9t4uucfaxn56mn3xm70q4cz0z4cfpa35hpc5cjskf45me9s5jmv5ynne6685pnfwhntuwfc0g4m28ypel0gqggprm3";
+  const d = decodeBolt11(ALBY_INVOICE);
+  eq(d.amountMsat, 1000, "1 sat in msat");
+  eq(d.expirySeconds, 3600, "the 12-bit integer field");
+  eq(d.currency, "bc", "mainnet");
+  eq(
+    d.descriptionHash,
+    "ac0f42d9ac554224a4cfb7bbf90514849823846a75db2c20ee9dfb13bf045154",
+    "the request binding it committed to"
+  );
+  eq(d.signingKey, "033bd5ed018e3b4320e728841826e92c3a2e083486c9dd660f205e07aadab9ffad", "signing key");
+  eq(d.paymentHash.slice(-16), "9b8d60a23fccdfd3", "payment hash tail");
+  eq(d.fullyParsed, true, "every field was understood (9 and c included)");
+  assert(d.tags.includes("c"), "min_final_cltv_expiry is a known field (type 24, not 5)");
+  assert(d.tags.includes("9"), "features is '9' (type 5)");
 });
 
 // ---------------------------------------------------------------------------

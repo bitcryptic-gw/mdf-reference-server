@@ -87,6 +87,13 @@ function bech32Decode(input: string): Bech32Decoded {
  * recovered key that is simply the wrong one, so it is asserted against the
  * spec's own test vector.
  */
+/** A tagged field's data as a big-endian integer over 5-bit words. */
+function wordsToInt(words: readonly number[]): number {
+  let value = 0;
+  for (const w of words) value = value * 32 + w;
+  return value;
+}
+
 function wordsToBytes(words: readonly number[], pad = false): Buffer {
   let acc = 0;
   let bits = 0;
@@ -162,15 +169,38 @@ export interface DecodedInvoice {
   tags: string[];
 }
 
+/**
+ * Tagged-field type numbers are the **bech32 charset indices** of the field
+ * letters, not their alphabetical positions: `p`=1, `r`=3, `9`=5, `x`=6,
+ * `d`=13, `s`=16, `n`=19, `h`=23, `c`=24.
+ *
+ * The `c` (min_final_cltv_expiry) entry was originally 5, which is `9`
+ * (features) — a mapping that only showed up when a real wallet invoice carried
+ * a `c` field, at which point that field was treated as unknown and `fullyParsed`
+ * went false.
+ */
 const TAG_NAMES: Record<number, string> = {
   1: "p", // payment hash
-  13: "d", // description
-  23: "h", // description hash
+  3: "r", // routing info
+  5: "9", // features
   6: "x", // expiry
-  19: "n", // payee pubkey
+  13: "d", // description
   16: "s", // payment secret
-  5: "c", // min_final_cltv_expiry
+  19: "n", // payee pubkey
+  23: "h", // description hash
+  24: "c", // min_final_cltv_expiry
 };
+
+/**
+ * Tagged fields whose content is an **integer**, not bytes.
+ *
+ * Their data is a big-endian integer spanning `5 × length` bits, so it is not
+ * byte-aligned and must be reassembled from the 5-bit words directly. Reading
+ * them as bytes silently produced the wrong number for any value needing more
+ * than 8 bits — 3600 s (12 bits) decoded as 28 s, which would have failed every
+ * conformant invoice from a real wallet.
+ */
+const INTEGER_FIELDS = new Set([6 /* x, expiry */, 24 /* c, min_final_cltv */]);
 
 /**
  * Decode a BOLT11 invoice and recover the signing key. Throws on anything
@@ -259,10 +289,12 @@ export function decodeBolt11(invoice: string): DecodedInvoice {
     } else if (type === 23) {
       descriptionHash = wordsToBytes(fieldWords).toString("hex");
     } else if (type === 6) {
-      const bytes = wordsToBytes(fieldWords);
-      expirySeconds = bytes.length === 0 ? 0 : Number("0x" + bytes.toString("hex"));
+      expirySeconds = fieldWords.length === 0 ? 0 : wordsToInt(fieldWords);
     } else if (type === 19) {
       payeePubkeyField = wordsToBytes(fieldWords).toString("hex");
+    } else if (INTEGER_FIELDS.has(type)) {
+      // Read (and thus validate the length of) any other integer field.
+      wordsToInt(fieldWords);
     }
   }
 
