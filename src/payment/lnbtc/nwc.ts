@@ -23,9 +23,9 @@ import { parseNwcUri, redactNwcUri, type NwcUri } from "./nwc-uri.ts";
 import {
   NWC_REQUEST_KIND,
   RelayError,
-  connectAnyRelay,
+  connectAllRelays,
+  firstResponse,
   signEvent,
-  type RelayConnection,
   type RelayOptions,
 } from "./relay.ts";
 
@@ -170,9 +170,22 @@ export class NwcClient {
 
   /** Publish a request and decode its response. */
   private async call(method: string, params: Record<string, unknown>): Promise<unknown> {
-    let connection: RelayConnection | null = null;
     try {
-      connection = await connectAnyRelay(this.uri.relays, this.uri.walletPubkey, this.options);
+      // Publish on every relay in the URI and take the first valid answer: Alby
+      // Hub subscribes to all of them, and one silent relay should not strand a
+      // request that the other would have answered.
+      const { connections, errors } = await connectAllRelays(
+        this.uri.relays,
+        this.uri.walletPubkey,
+        this.options
+      );
+      if (connections.length === 0) {
+        throw new RelayError(
+          "unreachable",
+          `no relay answered (${this.uri.relays.length} tried)` +
+            (errors.length > 0 ? `: ${errors[0].message}` : "")
+        );
+      }
 
       const conversationKey = this.conversationKey();
       const event = signEvent(
@@ -187,7 +200,7 @@ export class NwcClient {
         this.clientSecretKey
       );
 
-      const responseEvent = await connection.request(event, (candidate) => {
+      const responseEvent = await firstResponse(connections, event, (candidate) => {
         const tags = candidate.tags ?? [];
         const matches = tags.some((tag) => tag[0] === "e" && tag[1] === event.id);
         const addressedToUs = tags.some(
@@ -222,8 +235,6 @@ export class NwcClient {
         throw new NwcError(kind, err.message);
       }
       throw new NwcError("malformed", `NWC call failed: ${(err as Error).message}`);
-    } finally {
-      connection?.close();
     }
   }
 }

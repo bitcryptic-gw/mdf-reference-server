@@ -77,7 +77,8 @@ interface WalletBehaviour {
 let behaviour: WalletBehaviour = {};
 let lastRequest: { method?: string; params?: Record<string, unknown> } = {};
 
-async function startRelay(): Promise<{ url: string; stop: () => void }> {
+async function startRelay(relaySilent = false): Promise<{ url: string; stop: () => void; events: () => number }> {
+  let eventCount = 0;
   const server = Bun.serve<{ subId?: string; requestId?: string; clientPubkey?: string }>({
     port: 0,
     fetch(req, srv) {
@@ -103,6 +104,8 @@ async function startRelay(): Promise<{ url: string; stop: () => void }> {
           content: string;
         };
         if (event.kind !== 23194) return;
+        eventCount++;
+        if (relaySilent) return;
 
         const clientPubkey = event.pubkey;
         const encryptionTag = event.tags.find((t) => t[0] === "encryption");
@@ -165,6 +168,7 @@ async function startRelay(): Promise<{ url: string; stop: () => void }> {
   return {
     url: `ws://127.0.0.1:${server.port}`,
     stop: () => server.stop(true),
+    events: () => eventCount,
   };
 }
 
@@ -286,6 +290,51 @@ await test("a response signed by the wrong key is ignored, so the call times out
     "timeout",
     "impostor response must not be accepted"
   );
+});
+
+await test("with two relays, the request is published on both and the first answer wins", async () => {
+  behaviour = {};
+  const silentRelay = await startRelay(true);
+  const liveRelay = await startRelay(false);
+  try {
+    const client = new NwcClient({
+      uri: uri([silentRelay.url, liveRelay.url]),
+      responseTimeoutMs: 5000,
+      connectTimeoutMs: 2000,
+    });
+    const made = await client.makeInvoice({
+      amountMsat: 20_000,
+      descriptionHash: "ef".repeat(32),
+      expirySeconds: 300,
+    });
+    eq(made.paymentHash, "ab".repeat(32), "answered by the live relay");
+    eq(silentRelay.events(), 1, "the silent relay received the request too");
+    eq(liveRelay.events(), 1, "as did the live one");
+  } finally {
+    silentRelay.stop();
+    liveRelay.stop();
+  }
+});
+
+await test("two silent relays still time out rather than hang", async () => {
+  behaviour = {};
+  const a = await startRelay(true);
+  const b = await startRelay(true);
+  try {
+    const client = new NwcClient({
+      uri: uri([a.url, b.url]),
+      responseTimeoutMs: 400,
+      connectTimeoutMs: 1000,
+    });
+    await throwsKind(
+      () => client.makeInvoice({ amountMsat: 20_000, descriptionHash: "ef".repeat(32), expirySeconds: 300 }),
+      "timeout",
+      "both relays silent"
+    );
+  } finally {
+    a.stop();
+    b.stop();
+  }
 });
 
 await test("an unreachable relay is 'unreachable'", async () => {

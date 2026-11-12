@@ -22,11 +22,12 @@
     "test:lnbtc": "bun run src/payment/lnbtc.test.ts",
     "test:lnbtc-nwc": "bun run src/payment/lnbtc-nwc.test.ts",
     "test:nwc-transport": "bun run src/payment/lnbtc-nwc-transport.test.ts",
+    "test:lnbtc-avail": "bun run src/payment/lnbtc-availability.test.ts",
     "test:handler": "bun run src/content/handler.test.ts",
     "test:source-bytes": "bun run src/source-bytes.test.ts",
     "test:router": "bun run src/router.test.ts",
     "test:health": "bun run src/health.test.ts",
-    "test": "bun run test:config && bun run test:assets && bun run test:rails && bun run test:402 && bun run test:402v2 && bun run test:l402 && bun run test:l402-verify && bun run test:breaker && bun run test:l402-failure && bun run test:x402 && bun run test:facilitator && bun run test:ratelimit && bun run test:lnbtc && bun run test:lnbtc-nwc && bun run test:nwc-transport && bun run test:auth-pay && bun run test:handler && bun run test:source-bytes && bun run test:router && bun run test:health"
+    "test": "bun run test:config && bun run test:assets && bun run test:rails && bun run test:402 && bun run test:402v2 && bun run test:l402 && bun run test:l402-verify && bun run test:breaker && bun run test:l402-failure && bun run test:x402 && bun run test:facilitator && bun run test:ratelimit && bun run test:lnbtc && bun run test:lnbtc-nwc && bun run test:nwc-transport && bun run test:lnbtc-avail && bun run test:auth-pay && bun run test:handler && bun run test:source-bytes && bun run test:router && bun run test:health"
   },
   "dependencies": {
     "@noble/ciphers": "2.4.0",

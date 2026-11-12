@@ -329,10 +329,68 @@ export class RelayConnection {
 }
 
 /**
+ * Connect to every relay that answers, in parallel.
+ *
+ * NWC URIs from Alby Hub usually name two relays. Alby Hub subscribes on all of
+ * them, so publishing to one is *usually* enough — but "usually" is a
+ * needless single point of failure: a relay that accepts the socket and then
+ * drops our EVENT, or a partitioned relay, would strand the request. Publishing
+ * the same signed event on every reachable relay and taking the first valid
+ * response costs one extra message and removes that failure mode.
+ */
+export async function connectAllRelays(
+  urls: readonly string[],
+  walletPubkey: string,
+  options: RelayOptions
+): Promise<{ connections: RelayConnection[]; errors: Error[] }> {
+  const settled = await Promise.allSettled(
+    urls.map((url) => RelayConnection.connect(url, walletPubkey, options))
+  );
+  const connections: RelayConnection[] = [];
+  const errors: Error[] = [];
+  for (const result of settled) {
+    if (result.status === "fulfilled") connections.push(result.value);
+    else errors.push(result.reason as Error);
+  }
+  return { connections, errors };
+}
+
+/**
+ * Publish `event` on every connection and resolve with the first response that
+ * passes `accept`. Rejections from the losers are swallowed; if every relay
+ * fails, the first error is surfaced so the caller can categorise it.
+ */
+export async function firstResponse(
+  connections: readonly RelayConnection[],
+  event: NostrEvent,
+  accept: (event: NostrEvent) => boolean
+): Promise<NostrEvent> {
+  if (connections.length === 0) {
+    throw new RelayError("unreachable", "no relay connection is open");
+  }
+  const attempts = connections.map((connection) => connection.request(event, accept));
+  try {
+    return await Promise.any(attempts);
+  } catch (err) {
+    const errors = (err as AggregateError).errors as Error[];
+    const first = errors.find((e) => e instanceof RelayError) ?? errors[0];
+    throw first instanceof RelayError ? first : new RelayError("unreachable", String(first));
+  } finally {
+    // Losers still hold timers and subscriptions; make their rejections handled
+    // and close the sockets.
+    for (const attempt of attempts) attempt.catch(() => {});
+    for (const connection of connections) connection.close();
+  }
+}
+
+/**
  * Connect to the first relay that answers.
  *
- * Connect-time failover only: once a request is published, its answer must come
- * from the same relay, because the request is addressed to that connection.
+ * Retained for callers that want a single pinned connection (diagnostics,
+ * `/supported`-style probes); the NWC client uses `connectAllRelays` +
+ * `firstResponse` so a request is published on every relay. There is no
+ * long-lived socket to reconnect: each call dials fresh, and repeated calls ride
+ * the invoice breaker's timed backoff.
  */
 export async function connectAnyRelay(
   urls: readonly string[],
