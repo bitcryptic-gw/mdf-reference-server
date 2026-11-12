@@ -299,11 +299,18 @@ async function offerResponse(
   });
 
   if (offer.allUnavailable) {
+    // A rate-limited mint carries its own hint; a rail degraded by an outage
+    // borrows the breaker's next probe time, so the client is told when to come
+    // back rather than retrying into the same window.
+    const retryAfterSeconds =
+      offer.retryAfterSeconds ?? loaded.lnbtc?.breakerRuntime?.retryAfterSeconds() ?? undefined;
     return toResponse(
       renderUnavailable({
         resourceUrl: context.resourceUrl,
         error: "payment_unavailable",
-        retryAfterSeconds: offer.retryAfterSeconds,
+        ...(retryAfterSeconds !== undefined && retryAfterSeconds !== null
+          ? { retryAfterSeconds }
+          : {}),
       })
     );
   }

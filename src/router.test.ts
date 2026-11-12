@@ -120,6 +120,16 @@ function makeLnbtc(mode: "available" | "rate_limited" | "degraded"): LnbtcRuntim
     replay: { claim: async () => "claimed", health: async () => "ok", close: () => {} },
     invoiceExpirySeconds: 300,
     breaker: { initialBackoffMs: 5000, maxBackoffMs: 300000 },
+    breakerRuntime: {
+      retryAfterSeconds: () => 7,
+      snapshot: () => ({
+        status: "degraded",
+        since: new Date(0).toISOString(),
+        category: "unreachable",
+        next_retry: new Date(7000).toISOString(),
+      }),
+      stop: () => {},
+    },
   } as unknown as LnbtcRuntime;
 }
 
@@ -517,6 +527,7 @@ await test("an lnbtc-only route with a degraded rail is 503 + Retry-After, not a
   const res = await request("/micropayment/intro", { headers: { Accept: "text/markdown" } });
   assertEquals(res.status, 503, "no rail can be offered");
   assertEquals(res.headers.get("cache-control"), "no-store", "no-store");
+  assertEquals(res.headers.get("retry-after"), "7", "the breaker's next probe is the hint");
 });
 
 await test("an exhausted mint budget omits the lnbtc rail without erroring", async () => {
