@@ -15,12 +15,13 @@
  */
 
 import type { LoadedConfig } from "../config/loader.ts";
-import { pricingView } from "../config/loader.ts";
+import { htmlSourceBytesForPath } from "../content/handler.ts";
 import {
   isFreeEntry,
   isTokenEntry,
   resolvePriceEntry,
   tokenScopeForPath,
+  pricingView,
   type PaymentRequirement,
   type RailConfig,
   type RequirementContext,
@@ -86,7 +87,7 @@ export function entryFor(loaded: LoadedConfig, urlPath: string) {
 export async function buildOfferFor(
   loaded: LoadedConfig,
   request: RequestContext,
-  options: { error?: CoarseError; startedAtMs: number } = { startedAtMs: Date.now() }
+  options: { error?: CoarseError; startedAtMs: number; mimeType?: string } = { startedAtMs: Date.now() }
 ): Promise<{ offer: Offer; doc: PaymentRequiredDoc }> {
   const { entry, tokenAccess } = entryFor(loaded, request.urlPath);
 
@@ -118,7 +119,7 @@ export async function buildOfferFor(
   const doc = buildPaymentRequired({
     resourceUrl: request.resourceUrl,
     serviceName: loaded.config.site.name,
-    mimeType: "text/markdown",
+    mimeType: options.mimeType ?? "text/markdown",
     accepts: offer.accepts,
     error: options.error ?? "payment_required",
     expiresAt: new Date(
@@ -141,10 +142,6 @@ function absoluteEndpoint(loaded: LoadedConfig, endpoint: string): string {
 /** source_bytes is informational; absence must never fail a 402. */
 function sourceBytesFor(loaded: LoadedConfig, urlPath: string): number | undefined {
   try {
-    // Imported lazily to keep this module free of content-handler cycles.
-    const { htmlSourceBytesForPath } = require("../content/handler.ts") as {
-      htmlSourceBytesForPath: (p: string, l: LoadedConfig) => number | undefined;
-    };
     return htmlSourceBytesForPath(urlPath, loaded);
   } catch {
     return undefined;
@@ -185,7 +182,8 @@ export async function verifyPayment(input: VerifyInput): Promise<VerifyResult> {
     MAX_PAYMENT_HEADER_CHARS
   );
   if (!decoded.ok) {
-    return { status: "rejected", reason: decoded.reason === "too_large" ? "invalid_payment" : "invalid_payment" };
+    // Oversized, not base64 or not JSON: all one class to the client.
+    return { status: "rejected", reason: "invalid_payment" };
   }
   const payload = decoded.value;
   if (payload.x402Version !== 2) {
@@ -200,9 +198,11 @@ export async function verifyPayment(input: VerifyInput): Promise<VerifyResult> {
 
   const rail = entry.rails.find((candidate) => matchesRail(candidate, accepted));
   if (!rail) {
-    // The client paid for something we are not offering: wrong network, asset,
-    // amount or payee. Coarse class only.
-    return { status: "rejected", reason: "wrong_recipient" };
+    // The client paid for something we are not offering. Coarse class only, but
+    // split far enough to be actionable: a different network or asset is
+    // "unsupported", a different amount is "wrong_amount", and anything else
+    // (payee, scheme) is "wrong_recipient".
+    return { status: "rejected", reason: classifyRailMismatch(entry.rails, accepted) };
   }
 
   const railLabel = `${rail.scheme}/${rail.network}`;
@@ -219,6 +219,24 @@ export function matchesRail(rail: RailConfig, accepted: PaymentRequirement): boo
   if (rail.network !== accepted.network) return false;
   if (rail.amount !== accepted.amount) return false;
   return rail.asset.toLowerCase() === String(accepted.asset).toLowerCase();
+}
+
+/**
+ * Why an `accepted` requirement matches no configured rail, in the coarse
+ * vocabulary. Every branch names a class the client can act on, and none echoes
+ * a facilitator message.
+ */
+export function classifyRailMismatch(
+  rails: readonly RailConfig[],
+  accepted: PaymentRequirement
+): CoarseError {
+  const sameNetwork = rails.filter((rail) => rail.network === accepted.network);
+  if (sameNetwork.length === 0) return "unsupported_rail";
+  if (!sameNetwork.some((rail) => String(accepted.asset).toLowerCase() === rail.asset.toLowerCase())) {
+    return "unsupported_rail";
+  }
+  if (!sameNetwork.some((rail) => rail.amount === accepted.amount)) return "wrong_amount";
+  return "wrong_recipient";
 }
 
 async function verifyEip155(args: {
@@ -301,7 +319,7 @@ async function verifyLnbtc(args: {
 
   let decoded;
   try {
-    decoded = decodeBolt11(invoice);
+    decoded = (rt.decodeInvoiceFrom ?? decodeBolt11)(invoice);
   } catch {
     return { status: "rejected", reason: "invalid_payment" };
   }

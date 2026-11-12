@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<!--
+  MDF Valkey — shared replay and token store (unraid-private).
+
+  Holds the two pieces of server state that must be shared by every instance
+  behind Caddy's round-robin:
+
+    - the lnbtc replay records (`SET network:payment_hash NX EX ttl`). The scheme
+      requires a restart-durable store shared by every process settling for one
+      receiver; a per-instance store lets the same preimage settle once per
+      instance.
+    - the bearer-token digests for `access: token` sections. Hash-only: the store
+      never holds a token.
+
+  Joins the tailnet as its own node (tag:misc-services via the auth key) and
+  publishes **no host port**: nothing on the LAN can reach it, and the tailnet
+  ACL grants the two demo nodes tcp:6379 and nothing else.
+
+  The password is not in this template, in an env var or in `docker inspect`.
+  It comes from an ACL file mounted read-only (`aclfile`), which is the only way
+  stock Valkey can take a password from a file. The same value goes into the
+  demo nodes' `valkey_password` file and must be rotated in both places at once.
+
+  Apply through the Unraid Docker UI (Docker -> Add Container), not with
+  `docker run`, so `my-mdf-valkey.xml` is regenerated and
+  `net.unraid.docker.managed=dockerman` is set. Pinned by digest.
+-->
+<Container version="2">
+  <Name>mdf-valkey</Name>
+  <Repository>valkey/valkey@sha256:2602ace2be6569bc2bbb06f873776516ab9089821525be34f4305c67eb9db02a</Repository>
+  <Registry>https://hub.docker.com/r/valkey/valkey</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <MyMAC/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/bitcryptic-gw/mdf-reference-server/issues</Support>
+  <Project>https://github.com/bitcryptic-gw/mdf</Project>
+  <ReadMe/>
+  <Overview>Shared Valkey store for the MDF 0.3.0 demo servers: lnbtc replay records and token digests.&#13;
+Tailnet node mdf-valkey (tag:misc-services), no host port, AOF on the data mount, password from a mounted ACL file.&#13;
+Only the demo server nodes may reach tcp:6379 (Tailscale ACL).&#13;
+Losing this store degrades lnbtc and denies token issuance; it never takes content or USDC payments down.&#13;
+</Overview>
+  <Category>Tools:</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/bitcryptic-gw/bitcryptic-blog/main/bc-icon.png</Icon>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Description>Valkey 8.1 for MDF 0.3.0: shared lnbtc replay store and token store. Tailnet-only, no published port, AOF persistence, password from a mounted ACL file.</Description>
+  <Config Name="Valkey config" Target="/etc/valkey/valkey.conf" Default="/mnt/cache/appdata/mdf-valkey/valkey.conf" Mode="ro" Description="Server config file: AOF on, no eviction, ACL file path. Read-only." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/mdf-valkey/valkey.conf</Config>
+  <Config Name="ACL file" Target="/run/secrets/valkey_acl" Default="/mnt/cache/appdata/mdf-valkey/secrets/valkey_acl" Mode="ro" Description="Valkey ACL file holding the default user's password (mode 600). This is the password the demo nodes send as AUTH." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/mdf-valkey/secrets/valkey_acl</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/cache/appdata/mdf-valkey/data" Mode="rw" Description="AOF directory (appendonlydir) and tailnet state. Must be on persistent storage; the replay records are the lnbtc rail's only durable state." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/mdf-valkey/data</Config>
+  <Config Name="ORG_ENTRYPOINT" Target="ORG_ENTRYPOINT" Default="/usr/local/bin/docker-entrypoint.sh" Mode="" Description="Original Docker entrypoint, restored by the Unraid Tailscale hook." Type="Variable" Display="advanced-hide" Required="false" Mask="false">/usr/local/bin/docker-entrypoint.sh</Config>
+  <Config Name="ORG_CMD" Target="ORG_CMD" Default="valkey-server /etc/valkey/valkey.conf" Mode="" Description="Original Docker command, restored by the Unraid Tailscale hook." Type="Variable" Display="advanced-hide" Required="false" Mask="false">valkey-server /etc/valkey/valkey.conf</Config>
+  <TailscaleEnabled>true</TailscaleEnabled>
+  <TailscaleIsExitNode>false</TailscaleIsExitNode>
+  <TailscaleHostname>mdf-valkey</TailscaleHostname>
+  <TailscaleExitNodeIP/>
+  <TailscaleSSH>false</TailscaleSSH>
+  <TailscaleUserspaceNetworking>false</TailscaleUserspaceNetworking>
+  <TailscaleLANAccess>false</TailscaleLANAccess>
+  <TailscaleServe>no</TailscaleServe>
+  <TailscaleWebUI/>
+  <TailscaleDParams/>
+  <TailscaleParams/>
+  <TailscaleRoutes/>
+  <TailscaleAcceptRoutes>false</TailscaleAcceptRoutes>
+  <TailscaleStateDir>/data/.tailscale_state</TailscaleStateDir>
+</Container>

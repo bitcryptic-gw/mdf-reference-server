@@ -79,14 +79,15 @@ export function isTrustedProxy(peer: string, trustedProxies: readonly string[]):
  */
 export function resolveClientKey(params: {
   peer: string | null | undefined;
-  forwardedForHeader?: string | null;
+  /** Value of `X-Real-IP` as sent by the peer, if any. Never X-Forwarded-For. */
+  realIpHeader?: string | null;
   trustedProxies?: readonly string[];
 }): ClientKeyResult {
   const peer = normaliseIp(params.peer);
   const trusted = params.trustedProxies ?? [];
 
   if (peer && trusted.length > 0 && isTrustedProxy(peer, trusted)) {
-    const fromHeader = normaliseIp(params.forwardedForHeader ?? null);
+    const fromHeader = normaliseIp(params.realIpHeader ?? null);
     if (fromHeader) return { key: fromHeader, source: "header" };
   }
 

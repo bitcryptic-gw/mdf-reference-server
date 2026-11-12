@@ -296,7 +296,7 @@ test("the summary states the raw amount of every rail", () => {
   assert(summary.includes("20000"), "raw atomic amount present");
   assert(summary.includes("0.02 USDC"), "human USDC amount present");
   assert(summary.includes("20 sat"), "human sats present");
-  assert(summary.includes("Lightning"), "lightning rail named");
+  assert(summary.includes(LNBTC_MAINNET), "lightning rail named by its CAIP-2 id");
 
   // The validator's rule: every rail's amount must appear.
   for (const r of rails) assert(summary.includes(r.amount), `amount ${r.amount} appears`);

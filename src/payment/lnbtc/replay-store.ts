@@ -58,9 +58,14 @@ export function replayTtlSeconds(
 
 export type ClaimResult = "claimed" | "duplicate" | "unavailable";
 
+/** Passive store health for `/health`; never throws. */
+export type StoreHealth = "ok" | "unavailable";
+
 export interface ReplayStore {
   /** Atomically claim `network:payment_hash` for `ttlSeconds`. */
   claim(network: string, paymentHash: string, ttlSeconds: number): Promise<ClaimResult>;
+  /** Cheap reachability check, cached by the implementation's caller. */
+  health(): Promise<StoreHealth>;
   close(): void;
 }
 
@@ -80,6 +85,10 @@ export class MemoryReplayStore implements ReplayStore {
     if (expiresAt !== undefined && expiresAt > now) return "duplicate";
     this.keys.set(key, now + ttlSeconds * 1000);
     return "claimed";
+  }
+
+  async health(): Promise<StoreHealth> {
+    return "ok";
   }
 
   close(): void {
@@ -158,6 +167,25 @@ export class ValkeyReplayStore implements ReplayStore {
       if (reply.kind === "nil") return "duplicate";
       if (reply.kind === "simple" && reply.value === "OK") return "claimed";
       return "unavailable";
+    } catch {
+      return "unavailable";
+    } finally {
+      socket?.destroy();
+    }
+  }
+
+  async health(): Promise<StoreHealth> {
+    // PING over a fresh connection: the same cost as one claim, and the only
+    // honest way to answer "is the store reachable". Cached by the caller.
+    let socket: Socket | null = null;
+    try {
+      socket = await this.connect();
+      if (this.options.password) {
+        const auth = await this.command(socket, ["AUTH", this.options.password]);
+        if (auth.kind === "error") return "unavailable";
+      }
+      const reply = await this.command(socket, ["PING"]);
+      return reply.kind === "simple" && reply.value === "PONG" ? "ok" : "unavailable";
     } catch {
       return "unavailable";
     } finally {

@@ -1,5 +1,13 @@
 # mdf.yaml — MDF Server Configuration
-# Reference implementation demo configuration
+# Reference implementation demo configuration (spec 0.3.1, x402 v2)
+#
+# A price entry IS the spec's `pricing.*.rails[]` plus `access`. There is no
+# exchange rate anywhere: every rail states its own atomic amount in its own
+# units (micro-USDC on eip155, millisatoshis on lnbtc). `/mdf.json` is generated
+# from this block, so it and the 402's `accepts[]` agree by construction.
+#
+# Secrets are file-mounted only, never config values: /run/secrets/wallet_address,
+# /run/secrets/nwc_uri, /run/secrets/valkey_password.
 
 site:
   url: https://mdf-demo.bitcryptic.com
@@ -13,43 +21,75 @@ content:
   math: false
 
 pricing:
+  # Unknown paths 404 before pricing is consulted, so this is only the fallback
+  # for a path that resolves to real content outside every section below.
   default:
-    amount: "0.0001"
-    currency: USDC
-    chain: base
+    rails:
+      - scheme: exact
+        network: "eip155:8453"
+        asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (Base)
+        amount: "100"                                          # 0.0001 USDC
   sections:
     /:
-      amount: "0.0000"
+      rails: []
     /docs/**:
-      amount: "0.0000"
+      rails: []
     /micropayment/**:
-      amount: "0.00000001"
-      currency: "BTC"
-      chain: "lightning"
+      rails:
+        - scheme: exact
+          network: "lnbtc:000000000019d6689c085ae165831e93"
+          asset: BTC
+          amount: "1000"                                       # 1 sat
     /premium/**:
-      amount: "0.01"
-      currency: USDC
-      chain: base
+      rails:
+        - scheme: exact
+          network: "eip155:8453"
+          asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          amount: "10000"                                      # 0.01 USDC
     /private/**:
-      amount: "0.10"
-      currency: USDC
-      chain: base
-    # Base Sepolia testnet tier — exercises x402 end-to-end with testnet funds.
+      access: token
+      rails:
+        - scheme: exact
+          network: "eip155:8453"
+          asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          amount: "100000"                                     # 0.10 USDC
+    # Base Sepolia tier — exercises the whole x402 path with testnet funds.
     /testnet/**:
-      amount: "0.0010"
-      currency: USDC
-      chain: base_sepolia
-
-payment:
-  endpoint: /mdf/pay
-  accepted_chains: [base, base_sepolia, ethereum, lightning]
-  accepted_currencies: [USDC, USDT, BTC]
-  # wallet: set via /run/secrets/wallet_address or MDF_WALLET env var
+      rails:
+        - scheme: exact
+          network: "eip155:84532"
+          asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"   # USDC (Base Sepolia)
+          amount: "1000"                                       # 0.0010 USDC
+    # The one dual-rail route: Base USDC or Lightning, same content.
+    /showcase/**:
+      rails:
+        - scheme: exact
+          network: "eip155:8453"
+          asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          amount: "20000"                                      # 0.02 USDC (Gary)
+        - scheme: exact
+          network: "lnbtc:000000000019d6689c085ae165831e93"
+          asset: BTC
+          amount: "20000"                                      # 20 sat (Gary)
 
 auth:
   endpoint: /mdf/auth
   token_ttl_seconds: 86400
-  price_threshold: "0.10"
+
+# Explicit, with no default. `memory` is for a single instance only: behind
+# Caddy's round-robin a token minted on one instance is rejected by the other.
+token_store: valkey
+
+valkey:
+  url: "redis://mdf-valkey:6379"
+  connect_timeout_ms: 2000
+  command_timeout_ms: 2000
+
+server:
+  # Trust X-Real-IP only from these peers (Caddy on caddy-linode). Empty = trust
+  # nothing. Never X-Forwarded-For.
+  trusted_proxies:
+    - "100.76.221.87"
 
 signals:
   ai_train: false
@@ -71,29 +111,33 @@ dashboard:
   enabled: true
   port: 9090
 
-lightning:
-  api_url: http://10.61.21.97:8021/api
-  invoice_expiry_seconds: 3600
-  # api_token and token_secret are optional and, if present, inert — never read
-  # or logged. The server resolves them at startup from /run/secrets/<name>
-  # (preferred) or the MDF_ALBY_TOKEN / MDF_LIGHTNING_SECRET env vars, and
-  # refuses to start if [lightning] is configured but neither resolves.
-
-# x402 facilitator — any service exposing the standard /verify and /settle
-# endpoints. MDF delegates all x402 verification and settlement to it.
-facilitator:
-  url: https://x402.bitcryptic.com
-  scheme: exact
+payment:
+  # Offer window for every rail; on lnbtc it is also the BOLT11 expiry, which
+  # the scheme requires to equal maxTimeoutSeconds exactly.
   max_timeout_seconds: 300
+
+lightning:
+  enabled: true
+  network: "lnbtc:000000000019d6689c085ae165831e93"
+  # node_pubkey is the qrcode's payTo. Omitted: it is read from get_info at
+  # startup, so the rail stays unavailable rather than advertising a wrong key.
+  mint:
+    global_per_minute: 180
+    global_burst: 60
+    per_client_per_minute: 24
+    per_client_burst: 8
+  breaker_initial_backoff_seconds: 5
+  breaker_max_backoff_seconds: 300
+
+# x402 v2 facilitator legs, called directly over the tailnet — never the v1
+# pool at x402.bitcryptic.com. The order is per instance and part of the deploy:
+#   mdf-server-syd  → [syd, public]   (this file)
+#   MDF-Server-Prod → [public, syd]   (reverse the two entries on that host)
+facilitator:
+  legs:
+    - "http://mdf-facilitator-syd:8080"
+    - "http://mdf-facilitator-public:8080"
   timeout_ms: 15000
-  chains:
-    base:
-      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC (Base)
-      decimals: 6
-      extra: { name: "USD Coin", version: "2" }
-      rpc_url: "https://mainnet.base.org"
-    base_sepolia:
-      asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"   # USDC (Base Sepolia)
-      decimals: 6
-      extra: { name: "USDC", version: "2" }
-      rpc_url: "https://sepolia.base.org"
+  rpc:
+    "eip155:8453": "https://mainnet.base.org"
+    "eip155:84532": "https://sepolia.base.org"

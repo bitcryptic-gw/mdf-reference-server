@@ -12,13 +12,15 @@
  * for the same URL, so they test the definition rather than re-running the
  * implementation's own arithmetic.
  *
+ * 0.3.x: the field lives in `extensions.mdf.info`, not at the top level.
+ *
  * Run with: bun run src/source-bytes.test.ts
  */
 
 import { join } from "path";
 import { serveContent } from "./content/handler.ts";
-import { build402Response } from "./payment/payment.ts";
-import type { VerificationResult } from "./payment/payment.ts";
+import { buildOfferFor, entryFor } from "./payment/payment.ts";
+import { render402 } from "./payment/402.ts";
 import type { LoadedConfig } from "./config/loader.ts";
 
 let passed = 0;
@@ -48,41 +50,33 @@ function assertEquals(actual: unknown, expected: unknown, msg: string) {
 }
 
 const CONTENT_DIR = join(import.meta.dir, "..", "content");
+const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
 function makeLoaded(): LoadedConfig {
   return {
     contentDir: CONTENT_DIR,
-    walletAddress: "0xDEAD",
+    walletAddress: "0xa7D911138322aF8823642beA2b174dFaC2725fB7",
     mdfJson: "{}",
     config: {
       site: { url: "https://example.com", name: "Test" },
       content: { dir: CONTENT_DIR, dialect: "commonmark", frontmatter: true, math: false },
       pricing: {
-        default: { amount: "0.0001", currency: "USDC", chain: "base" },
+        default: {
+          rails: [{ scheme: "exact", network: "eip155:8453", asset: USDC, amount: "100" }],
+        },
         sections: {
-          "/docs/**": { amount: "0.0000", currency: null, chain: null },
-          "/premium/**": { amount: "1.0000", currency: "USDC", chain: "base" },
+          "/docs/**": { rails: [] },
+          "/premium/**": {
+            rails: [{ scheme: "exact", network: "eip155:8453", asset: USDC, amount: "10000" }],
+          },
         },
       },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-      },
+      token_store: "memory",
       signals: { ai_train: false, ai_input: true, search: true, human_only: false },
       dashboard: { enabled: false, port: 9090 },
+      payment: { max_timeout_seconds: 300 },
+      server: { trusted_proxies: [] },
     } as LoadedConfig["config"],
-  };
-}
-
-function noProof(): VerificationResult {
-  return {
-    status: "no_proof",
-    proof: null,
-    l402Credential: null,
-    reason: "payment required: 1.0000 USDC",
-    requiresToken: false,
-    rail: "none",
   };
 }
 
@@ -94,6 +88,22 @@ function htmlBytes(loaded: LoadedConfig, urlPath: string): number {
 function markdownBytes(loaded: LoadedConfig, urlPath: string): number {
   const res = serveContent(urlPath, "text/markdown", null, loaded);
   return Buffer.byteLength(res.body, "utf8");
+}
+
+async function offerBody(loaded: LoadedConfig, urlPath: string): Promise<string> {
+  entryFor(loaded, urlPath);
+  const { doc } = await buildOfferFor(
+    loaded,
+    {
+      urlPath,
+      resourceUrl: `https://example.com${urlPath}`,
+      method: "GET",
+      headers: { accept: "text/markdown" },
+      clientKey: "203.0.113.9",
+    },
+    { startedAtMs: Date.now() }
+  );
+  return render402(doc).body;
 }
 
 async function main(): Promise<void> {
@@ -136,28 +146,25 @@ async function main(): Promise<void> {
     const html = htmlBytes(loaded, urlPath);
     const markdown = markdownBytes(loaded, urlPath);
 
-    const res = await build402Response(urlPath, noProof(), loaded);
-    assertEquals(res.status, 402, "status should be 402");
+    const body = JSON.parse(await offerBody(loaded, urlPath));
+    const info = body.extensions?.mdf?.info;
+    assert(!!info, "402 carries extensions.mdf.info");
 
-    const body = JSON.parse(res.body);
     assert(
-      typeof body.source_bytes === "number",
-      "402 body should carry a numeric source_bytes for a resolved content file"
+      typeof info.source_bytes === "number",
+      "402 extensions.mdf.info should carry a numeric source_bytes for a resolved content file"
     );
 
     assertEquals(
-      body.source_bytes,
+      info.source_bytes,
       html,
       "402 source_bytes must equal the rendered-HTML representation's byte length"
     );
-    assert(
-      body.source_bytes !== markdown,
-      "402 source_bytes must not be the served markdown size"
-    );
+    assert(info.source_bytes !== markdown, "402 source_bytes must not be the served markdown size");
 
     const htmlRes = serveContent(urlPath, "text/html", null, loaded);
     assertEquals(
-      body.source_bytes,
+      info.source_bytes,
       Number(htmlRes.headers["X-MDF-Source-Bytes"]),
       "402 body and 200 header must report the same HTML baseline for the same resource"
     );

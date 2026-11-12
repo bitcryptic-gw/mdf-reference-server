@@ -1,4 +1,4 @@
-# Reference Unraid templates (redacted)
+# Reference Unraid templates (redacted) — and the 0.3.0 deliverables
 
 Working fleet templates, committed so later sessions diff against reality instead of
 reconstructing the format (`unraid-docker-template-authoring-convention`, rule 1).
@@ -50,3 +50,82 @@ free of `tskey-`, `TailscaleParams` content, bearer tokens and masked values
   and IP, which breaks any Caddy upstream pinned to an IP. Keep the running shape unless the
   state is confirmed present at the explicit path.
 - `Name` / `TailscaleHostname` / `ORG_ENTRYPOINT` / `ORG_CMD` / the four mount targets.
+
+---
+
+# 0.3.0 deliverables (Stage B, #64)
+
+Not applied to any host. Each file passes a strict parse and the dockerMan harness
+(`php xmlconfig.php` from `bitcryptic-gw/mdf-facilitator/tests/unraid/`), which prints the
+`-v`/`-e` arguments Unraid would actually generate.
+
+| file | what it is | sha256 |
+|---|---|---|
+| `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.1`, failover secondary | `137d9741f4ba70cf88ba4c38d277e95f25ca60f64a81a14fdd6b8641cf89baa1` |
+| `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.1` | `fc9670282baf636e27a43c0343fd97178ef432cfffcdb607e1f5e20392d5880d` |
+| `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `142e0f7068d6f0a436e07932ba055167e288c77b1dfbf080aecb25bf70788f52` |
+| `valkey.conf` | Valkey server config, mounted read-only (AOF, noeviction, ACL file) | `43d248e68647422d8f05bc82e51719b6accef769a44903feba5ffcae0dc1d6cf` |
+
+Image pins:
+
+- server: `bitcryptic/mdf-reference-server@sha256:cc142e370b9704812002c3facd7af13d6f27e4fef21b852ece29d46252d216db`
+  (multi-arch index, `0.3.0-rc.1`; trivy secret scan 0 findings, and a direct grep of an
+  exported layer for the wallet address, `tskey-`, private-key headers and NWC URI fragments
+  found nothing — the only `nostr+walletconnect` strings are the URI parser's own source)
+- Valkey: `valkey/valkey@sha256:2602ace2be6569bc2bbb06f873776516ab9089821525be34f4305c67eb9db02a`
+  (`8.1-alpine` multi-arch index)
+
+## What changed in the two server templates
+
+Exactly four things, verified by `diff` against the redacted 0.2.9 copies:
+
+1. `<Repository>` → the 0.3.0-rc.1 digest.
+2. `<Overview>` gains three lines naming the release, the rails and the Valkey store.
+3. **Removed** the `alby_api_token` and `lightning_token_secret` mounts. 0.3.0 reads
+   neither: invoicing moved to NWC (`make_invoice`) and the macaroon/HMAC token is gone.
+   Leaving a spending-capable Alby token mounted for nothing is worse than a template diff.
+   `oracle_pubkey` is kept (harmless, and removing it is not this release's business).
+4. **Added** two file mounts next to the wallet mount:
+   - `/run/secrets/nwc_uri` — the NWC URI, one dedicated connection per instance.
+   - `/run/secrets/valkey_password` — the store password, identical to the Valkey ACL entry.
+
+Every Tailscale element, every port/variable/path, `Name`, `ORG_*` and the state-dir shape are
+byte-identical to the 0.2.9 copies. `TailscaleParams` stays empty: the nodes already exist and
+rejoin from the persisted state.
+
+## The Valkey template
+
+- `valkey/valkey:8.1-alpine`, pinned by index digest, `--restart unless-stopped`.
+- Tailnet node `mdf-valkey`, `TailscaleServe no`, **no host port**, state at
+  `/data/.tailscale_state` (explicit, on the persistent mount — the facilitator template's
+  proven shape, not the demo's blank/fallback one).
+- `aclfile /run/secrets/valkey_acl`: the password lives only in that mounted file. Stock
+  Valkey cannot read a password from a file any other way, so an ACL file is the mechanism.
+- AOF `everysec` on `/data`; `maxmemory-policy noeviction` so a replay record can never be
+  evicted into a replayable state.
+
+### Before first start (Gary, on unraid-private)
+
+```bash
+mkdir -p /mnt/cache/appdata/mdf-valkey/{data,secrets}
+cp valkey.conf /mnt/cache/appdata/mdf-valkey/valkey.conf
+openssl rand -hex 32 > /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl.tmp
+printf 'user default on >%s ~* &* +@all\n' "$(cat /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl.tmp)" \
+  > /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl
+rm /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl.tmp
+chmod 600 /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl
+```
+
+Put that same 64-hex value in **both** demo nodes'
+`/mnt/cache/appdata/<appdata-dir>/secrets/valkey_password` (mode 600). They must match; rotate
+both together.
+
+## ACL grants (cutover)
+
+```
+"hosts": { "mdf-valkey": "<tailnet ip>/32" }
+grants:
+  mdf-syd, mdf-prod            → mdf-valkey                tcp:6379
+  mdf-syd, mdf-prod            → mdf-fac-syd, mdf-fac-pub  tcp:8080
+  tag:caddy                    → mdf-syd, mdf-prod         tcp:3000
+```

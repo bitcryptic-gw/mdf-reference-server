@@ -35,7 +35,8 @@ import {
   tokenScopeForPath,
   validateRail,
 } from "../payment/rails.ts";
-import type { PricingConfig, RailConfig } from "../payment/rails.ts";
+import type { RailConfig } from "../payment/rails.ts";
+import { buildMdfJson } from "./mdf-json.ts";
 import type { FacilitatorPool } from "../payment/facilitator.ts";
 import type { ReplayStore } from "../payment/lnbtc/replay-store.ts";
 import { ValkeyReplayStore, MemoryReplayStore } from "../payment/lnbtc/replay-store.ts";
@@ -45,6 +46,8 @@ import { NwcClient } from "../payment/lnbtc/nwc.ts";
 import { LnbtcGate } from "../payment/lnbtc/availability.ts";
 import { MintLimiter } from "../payment/rate-limit.ts";
 import { FacilitatorPool as Pool } from "../payment/facilitator.ts";
+import type { LightningBreaker } from "../payment/breaker.ts";
+import type { DecodedInvoice } from "../payment/lnbtc/bolt11.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,6 +64,18 @@ export interface LnbtcRuntime {
   replay: ReplayStore;
   invoiceExpirySeconds: number;
   breaker: { initialBackoffMs: number; maxBackoffMs: number };
+  /**
+   * Invoice decoder. Production always uses `decodeBolt11`; the seam exists so
+   * the payment facade's preimage/replay/expiry handling can be tested without a
+   * BOLT11 signer (minting an invoice for an arbitrary binding is the one thing
+   * the test suite cannot do offline).
+   */
+  decodeInvoiceFrom?: (invoice: string) => DecodedInvoice;
+  /**
+   * The invoice-creation breaker, set by `index.ts` once the startup check has
+   * run (its probe needs a live gate). `/health` reads its snapshot.
+   */
+  breakerRuntime?: LightningBreaker;
 }
 
 export interface LoadedConfig {
@@ -83,12 +98,18 @@ export interface LoadedConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Read a secret from `/run/secrets/<name>`. Deliberately no env fallback: the
- * baseline says file-mounted only, and an env var is visible in
- * `docker inspect`.
+ * Read a secret from `<secrets dir>/<name>`, `/run/secrets` by default.
+ * Deliberately no env fallback for the *value*: the baseline says file-mounted
+ * only, and a secret in an env var is visible in `docker inspect`. The directory
+ * itself may be overridden (a path, never a secret) so a local acceptance run
+ * can use a private directory instead of the container's mount point.
  */
+export function secretsDir(): string {
+  return process.env.MDF_SECRETS_DIR ?? "/run/secrets";
+}
+
 export function readSecretFile(name: string): string | null {
-  const path = `/run/secrets/${name}`;
+  const path = `${secretsDir()}/${name}`;
   if (!existsSync(path)) return null;
   try {
     const stat = statSync(path);
@@ -104,7 +125,7 @@ function requireSecret(name: string, why: string): string {
   const value = readSecretFile(name);
   if (!value) {
     throw new Error(
-      `mdf-server: ${why} requires the '${name}' secret — mount it at /run/secrets/${name}`
+      `mdf-server: ${why} requires the '${name}' secret — mount it at ${secretsDir()}/${name}`
     );
   }
   return value;
@@ -130,78 +151,28 @@ function mdfVersion(): string {
 /**
  * Render `/mdf.json` from configuration alone.
  *
- * Rails are emitted verbatim as configured — including a rail whose runtime
- * dependency happens to be down. `access` is emitted only when it is `token`,
- * matching the spec's default.
+ * Delegates to `config/mdf-json.ts`, which is structurally typed so it cannot
+ * reach a breaker, a gate, a limiter or a clock — the guarantee that a rail is
+ * declared whenever it is configured, even while it is degraded.
  */
-export function buildMdfJson(
-  config: MdfConfig,
-  walletAddress: string | null
-): Record<string, unknown> {
-  const siteUrl = config.site.url.replace(/\/$/, "");
-
-  const renderEntry = (entry: PriceEntry): Record<string, unknown> => ({
-    rails: entry.rails.map((rail) => ({
-      scheme: rail.scheme,
-      network: rail.network,
-      asset: rail.asset,
-      amount: rail.amount,
-    })),
-    ...(entry.access === "token" ? { access: "token" } : {}),
+export function buildMdfJsonFor(config: MdfConfig): Record<string, unknown> {
+  const pricing: { default: (typeof config.pricing)["default"]; sections?: typeof config.pricing.sections } = {
+    default: config.pricing.default,
+    ...(config.pricing.sections ? { sections: config.pricing.sections } : {}),
+  };
+  return buildMdfJson({
+    site: config.site,
+    pricing,
+    ...(config.auth ? { auth: config.auth } : {}),
+    signals: config.signals,
+    formats: {
+      dialect: config.content.dialect,
+      frontmatter: config.content.frontmatter,
+      math: config.content.math,
+    },
+    ...(config.feed ? { feed: config.feed } : {}),
+    mdfVersion: mdfVersion(),
   });
-
-  const pricing: Record<string, unknown> = { default: renderEntry(config.pricing.default) };
-  if (config.pricing.sections && Object.keys(config.pricing.sections).length > 0) {
-    pricing.sections = Object.fromEntries(
-      Object.entries(config.pricing.sections).map(([pattern, entry]) => [pattern, renderEntry(entry)])
-    );
-  }
-
-  const doc: Record<string, unknown> = {
-    mdf_version: mdfVersion(),
-    site: siteUrl,
-  };
-  if (config.site.name) doc.name = config.site.name;
-  doc.pricing = pricing;
-
-  if (config.auth) {
-    doc.auth = {
-      endpoint: resolveEndpoint(config.auth.endpoint, siteUrl),
-      token_ttl_seconds: config.auth.token_ttl_seconds,
-    };
-  }
-
-  doc.content_signals = {
-    ai_train: config.signals.ai_train,
-    ai_input: config.signals.ai_input,
-    search: config.signals.search,
-    human_only: config.signals.human_only,
-  };
-  doc.formats = {
-    dialect: config.content.dialect,
-    frontmatter: config.content.frontmatter,
-    math: config.content.math,
-  };
-
-  if (config.feed) {
-    doc.feed = {
-      url: resolveEndpoint(config.feed.url, siteUrl),
-      format: config.feed.format,
-      ...(config.feed.websub_hub ? { websub_hub: config.feed.websub_hub } : {}),
-      ...(config.feed.change_types?.length ? { change_types: config.feed.change_types } : {}),
-    };
-  }
-  if (config.site.contact) doc.contact = config.site.contact;
-
-  // walletAddress is not emitted: the authoritative recipient is accepts[].payTo
-  // in the live offer (decision 19), never a static document.
-  void walletAddress;
-  return doc;
-}
-
-function resolveEndpoint(endpoint: string, siteUrl: string): string {
-  if (endpoint.startsWith("https://")) return endpoint;
-  return `${siteUrl.replace(/\/$/, "")}${endpoint}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,24 +189,11 @@ function pricingEntries(config: MdfConfig): Array<{ label: string; entry: PriceE
   return entries;
 }
 
-/** The pricing view the payment layer consumes (structurally identical). */
-export function pricingView(config: MdfConfig): PricingConfig {
-  return {
-    default: { rails: config.pricing.default.rails as RailConfig[], access: config.pricing.default.access },
-    ...(config.pricing.sections
-      ? {
-          sections: Object.fromEntries(
-            Object.entries(config.pricing.sections).map(([k, v]) => [
-              k,
-              { rails: v.rails as RailConfig[], access: v.access },
-            ])
-          ),
-        }
-      : {}),
-  };
-}
-
-function validate(config: MdfConfig, walletAddress: string | null): void {
+function validate(
+  config: MdfConfig,
+  walletAddress: string | null,
+  log: (message: string) => void
+): void {
   const errors: string[] = [];
   const entries = pricingEntries(config);
 
@@ -264,7 +222,7 @@ function validate(config: MdfConfig, walletAddress: string | null): void {
   }
   if (config.auth && !hasTokenEntry) {
     // Not an error: an auth endpoint with no token section is inert. Warn only.
-    console.warn(
+    log(
       "[mdf:config] [auth] is configured but no price entry uses `access: token` — the endpoint is inert"
     );
   }
@@ -290,7 +248,7 @@ function validate(config: MdfConfig, walletAddress: string | null): void {
     for (const rail of everyRail) {
       if (!rail.rail.network.startsWith("eip155:")) continue;
       if (!config.facilitator.rpc[rail.rail.network]) {
-        console.warn(
+        log(
           `[mdf:config] no facilitator.rpc entry for ${rail.rail.network} — on-chain confirmation is disabled for it`
         );
       }
@@ -298,7 +256,7 @@ function validate(config: MdfConfig, walletAddress: string | null): void {
   }
 
   // lnbtc: rails require the lightning block, and the block requires Valkey.
-  const lnbtcRails = everyRail.filter(({ rail }) => isLnbtcNetwork(rail.rail.network));
+  const lnbtcRails = everyRail.filter(({ rail }) => isLnbtcNetwork(rail.network));
   const lightning = config.lightning;
   if (lnbtcRails.length > 0) {
     if (!lightning?.enabled) {
@@ -314,7 +272,7 @@ function validate(config: MdfConfig, walletAddress: string | null): void {
     }
   }
   if (lightning?.enabled && lnbtcRails.length === 0) {
-    console.warn(
+    log(
       "[mdf:config] lightning is enabled but no lnbtc rail is priced — no invoice will be minted"
     );
   }
@@ -392,8 +350,10 @@ export function loadConfig(options: LoadOptions | string = "./mdf.yaml"): Loaded
   }
   const config = parsed.data;
 
-  const walletAddress = readSecret("wallet_address");
-  validate(config, walletAddress);
+  // Trimmed here as well as in the file reader: a reader injected by a test (or
+  // a future secret backend) must not be able to break EIP-55 on a trailing \n.
+  const walletAddress = readSecret("wallet_address")?.trim() || null;
+  validate(config, walletAddress, log);
 
   const valkeyPassword = config.valkey ? readSecret("valkey_password") ?? undefined : undefined;
 
@@ -460,7 +420,7 @@ export function loadConfig(options: LoadOptions | string = "./mdf.yaml"): Loaded
         },
         perClient: {
           capacity: lightning.mint.per_client_burst,
-          perMinute: lightning.mint.per_client_minute ?? lightning.mint.per_client_per_minute,
+          perMinute: lightning.mint.per_client_per_minute,
         },
       }),
       replay: replayStore ?? new MemoryReplayStore(),
@@ -481,7 +441,7 @@ export function loadConfig(options: LoadOptions | string = "./mdf.yaml"): Loaded
 
   return {
     config,
-    mdfJson: JSON.stringify(buildMdfJson(config, walletAddress), null, 2),
+    mdfJson: JSON.stringify(buildMdfJsonFor(config), null, 2),
     contentDir,
     walletAddress,
     facilitator: config.facilitator

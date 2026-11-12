@@ -75,7 +75,7 @@ test("IP literals normalise, and non-literals do not", () => {
 test("trusted proxy + valid header → the header's IP", () => {
   const r = resolveClientKey({
     peer: CADDY,
-    forwardedForHeader: USER,
+    realIpHeader: USER,
     trustedProxies: [CADDY],
   });
   eq(r.key, USER, "keys on the real client");
@@ -85,7 +85,7 @@ test("trusted proxy + valid header → the header's IP", () => {
 test("untrusted peer + header → the peer's IP", () => {
   const r = resolveClientKey({
     peer: "198.51.100.7",
-    forwardedForHeader: USER,
+    realIpHeader: USER,
     trustedProxies: [CADDY],
   });
   eq(r.key, "198.51.100.7", "a direct caller cannot claim another IP");
@@ -96,7 +96,7 @@ test("trusted proxy + junk header → the peer's IP", () => {
   for (const junk of ["not-an-ip", "203.0.113.9, 198.51.100.1", "203.0.113.9:443", ""]) {
     const r = resolveClientKey({
       peer: CADDY,
-      forwardedForHeader: junk,
+      realIpHeader: junk,
       trustedProxies: [CADDY],
     });
     eq(r.key, CADDY, `junk '${junk}' must not be used`);
@@ -107,7 +107,7 @@ test("trusted proxy + junk header → the peer's IP", () => {
 test("empty trusted-proxy list → the peer's IP, even from Caddy", () => {
   const r = resolveClientKey({
     peer: CADDY,
-    forwardedForHeader: USER,
+    realIpHeader: USER,
     trustedProxies: [],
   });
   eq(r.key, CADDY, "trusts nothing by default");
@@ -115,7 +115,7 @@ test("empty trusted-proxy list → the peer's IP, even from Caddy", () => {
 });
 
 test("a missing peer keys as 'unknown' rather than throwing", () => {
-  const r = resolveClientKey({ peer: null, forwardedForHeader: USER, trustedProxies: [CADDY] });
+  const r = resolveClientKey({ peer: null, realIpHeader: USER, trustedProxies: [CADDY] });
   eq(r.key, "unknown", "no peer, no trust");
   eq(r.source, "unknown", "source");
 });

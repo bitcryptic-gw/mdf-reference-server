@@ -24,12 +24,12 @@ import { NwcError } from "./nwc.ts";
 import { judgeNwcPermissions } from "./nwc-uri.ts";
 
 export type NwcCheck =
-  | { status: "pass"; methods: string[]; unverified: boolean }
+  | { status: "pass"; methods: string[]; unverified: boolean; pubkey?: string }
   | { status: "bad_credential"; reason: string }
   | { status: "unreachable"; reason: string };
 
 export interface NwcInfoSource {
-  getInfo(): Promise<{ methods: string[] | null }>;
+  getInfo(): Promise<{ methods: string[] | null; pubkey?: string }>;
 }
 
 /**
@@ -41,7 +41,7 @@ export interface NwcInfoSource {
  * on its stage (startup vs background retry).
  */
 export async function checkNwcConnection(client: NwcInfoSource): Promise<NwcCheck> {
-  let info: { methods: string[] | null };
+  let info: { methods: string[] | null; pubkey?: string };
   try {
     info = await client.getInfo();
   } catch (err) {
@@ -53,12 +53,13 @@ export async function checkNwcConnection(client: NwcInfoSource): Promise<NwcChec
 
   const verdict = judgeNwcPermissions(info.methods);
   if (!verdict.ok) return { status: "bad_credential", reason: verdict.reason };
+  const pubkey = info.pubkey && /^(02|03)[0-9a-f]{64}$/.test(info.pubkey) ? info.pubkey : undefined;
   if (!verdict.verified) {
     // Answered, but did not report a method list. The connection may well be
     // fine; it simply cannot be proven automatically.
-    return { status: "pass", methods: [], unverified: true };
+    return { status: "pass", methods: [], unverified: true, ...(pubkey ? { pubkey } : {}) };
   }
-  return { status: "pass", methods: verdict.methods, unverified: false };
+  return { status: "pass", methods: verdict.methods, unverified: false, ...(pubkey ? { pubkey } : {}) };
 }
 
 export type LnbtcStatus = "disabled" | "available" | "degraded";
@@ -188,6 +189,7 @@ export async function startLnbtc(options: StartLnbtcOptions): Promise<LnbtcGate>
   }
 
   const result = await checkNwcConnection(options.client);
+  options.onCheck?.(result);
   if (result.status === "bad_credential") throw new CredentialRefusedError(result.reason);
 
   gate.applyCheck(result);
