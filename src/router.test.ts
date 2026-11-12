@@ -824,6 +824,21 @@ await test("a client-asserted txHash/from in the body is ignored", async () => {
   }
 });
 
+await test("a store that fails its probe is refused before any payment is settled", async () => {
+  resetMock();
+  const config = makeLoaded();
+  (config as { tokenStore: unknown }).tokenStore = {
+    put: async () => true,
+    get: async () => null,
+    delete: async () => {},
+    health: async () => "unavailable",
+    close: () => {},
+  };
+  const res = await postToken("/mdf/auth", { config });
+  assertEquals(res.status, 503, "unavailable store is a 503");
+  assertEquals(calls.length, 0, "no verify, no settle — the payer keeps their money");
+});
+
 await test("an unreachable token store denies with 503, never a token", async () => {
   resetMock();
   const config = makeLoaded();
@@ -831,6 +846,7 @@ await test("an unreachable token store denies with 503, never a token", async ()
     put: async () => false,
     get: async () => null,
     delete: async () => {},
+    health: async () => "ok",
     close: () => {},
   };
   const offer = (await (await postToken("/mdf/auth", { config })).json()) as Record<string, unknown>;

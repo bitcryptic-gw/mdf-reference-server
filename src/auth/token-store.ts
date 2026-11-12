@@ -42,6 +42,14 @@ export interface TokenStore {
   put(id: string, token: StoredToken, ttlSeconds: number): Promise<boolean>;
   get(id: string): Promise<StoredToken | null>;
   delete(id: string): Promise<void>;
+  /**
+   * Cheap reachability probe, used *before* a token payment is settled.
+   *
+   * Mints settle first and issue second, so a store that is down at issue time
+   * costs the payer money and returns nothing. The probe cannot remove the race,
+   * but it removes the common case (store down for the whole request).
+   */
+  health(): Promise<"ok" | "unavailable">;
   close(): void;
 }
 
@@ -85,6 +93,10 @@ export class MemoryTokenStore implements TokenStore {
 
   async delete(id: string): Promise<void> {
     this.records.delete(id);
+  }
+
+  async health(): Promise<"ok" | "unavailable"> {
+    return "ok";
   }
 
   close(): void {
@@ -138,6 +150,12 @@ export class ValkeyTokenStore implements TokenStore {
 
   async delete(id: string): Promise<void> {
     await this.run([["DEL", KEY_PREFIX + id]]);
+  }
+
+  /** AUTH + PING on a fresh connection; the same path a write would take. */
+  async health(): Promise<"ok" | "unavailable"> {
+    const reply = await this.run([["PING"]]);
+    return reply.kind === "simple" && reply.value === "PONG" ? "ok" : "unavailable";
   }
 
   close(): void {

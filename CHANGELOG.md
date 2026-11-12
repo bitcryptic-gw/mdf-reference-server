@@ -24,7 +24,11 @@ v1 mode, `X-PAYMENT` is not read, and the L402 JSON/HMAC token is gone.
   scheme's requirement for one receiver served by more than one instance.
 - **Valkey-backed token store** (hash-only: `SHA-256("mdf-token-v1:"‖id‖secret)`,
   256-bit secret, constant-time compare). `token_store: valkey | memory` is
-  required with no default; `memory` logs a startup warning.
+  required with no default; `memory` logs a startup warning. The store is
+  probed (`AUTH` + `PING`) **before** a token payment is settled: mints settle
+  first and issue second, so a store that is down at issue time would take the
+  payer's money and return nothing (observed in Stage B acceptance — one 0.1
+  test-USDC payment settled against an unauthenticated store before this fix).
 - **Trusted-proxy client keying** for the invoice-mint budget: `X-Real-IP` is
   trusted only from `server.trusted_proxies`, must be a single IP literal, and
   `X-Forwarded-For` is never read.

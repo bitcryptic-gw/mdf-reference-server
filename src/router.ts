@@ -381,6 +381,25 @@ async function handleTokenEndpoint(
     };
   }
 
+  // Probe the store before any money moves: a token payment settles on-chain
+  // first, so discovering the store is down at issue time would take the payer's
+  // payment and hand back nothing.
+  const storeHealth = await loaded.tokenStore.health();
+  if (storeHealth !== "ok") {
+    return {
+      response: jsonError(503, "token store unavailable", true),
+      attempt: {
+        path: urlPath,
+        headers: {},
+        outcome: "error",
+        reason: "token_store_unavailable",
+        status: 503,
+        startedAtMs: start,
+        client: clientKey,
+      },
+    };
+  }
+
   const paymentSignature = req.headers.get(HEADER.signature.toLowerCase());
   const sawLegacy = req.headers.get("x-payment");
   const resourceUrl = absoluteUrl(loaded, payPath);
