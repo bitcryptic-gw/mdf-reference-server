@@ -14,6 +14,7 @@ import {
   CredentialRefusedError,
   LnbtcGate,
   checkNwcConnection,
+  normaliseNodePubkey,
   startLnbtc,
 } from "./lnbtc/availability.ts";
 import { NwcError } from "./lnbtc/nwc.ts";
@@ -154,6 +155,22 @@ await test("malformed wallet data degrades rather than refusing", async () => {
     },
   });
   eq(check.status, "unreachable", "unavailability, not a credential verdict");
+});
+
+await test("an x-only get_info pubkey is lifted to the compressed form payTo needs", async () => {
+  const xOnly = "ab".repeat(32);
+  eq(normaliseNodePubkey(xOnly), "02" + xOnly, "x-only is lifted with the canonical even-y prefix");
+  eq(normaliseNodePubkey("03" + "cd".repeat(32)), "03" + "cd".repeat(32), "compressed kept as-is");
+  eq(normaliseNodePubkey("not-a-key"), undefined, "junk is rejected");
+  eq(normaliseNodePubkey(null), undefined, "absent is absent");
+
+  const check = await checkNwcConnection({
+    async getInfo() {
+      return { methods: ["make_invoice"], pubkey: xOnly };
+    },
+  });
+  eq(check.status, "pass", "passes");
+  if (check.status === "pass") eq(check.pubkey, "02" + xOnly, "the check reports the lifted key");
 });
 
 await test("a disabled gate ignores later check results", async () => {

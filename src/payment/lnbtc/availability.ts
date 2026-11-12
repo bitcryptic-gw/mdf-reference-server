@@ -53,13 +53,35 @@ export async function checkNwcConnection(client: NwcInfoSource): Promise<NwcChec
 
   const verdict = judgeNwcPermissions(info.methods);
   if (!verdict.ok) return { status: "bad_credential", reason: verdict.reason };
-  const pubkey = info.pubkey && /^(02|03)[0-9a-f]{64}$/.test(info.pubkey) ? info.pubkey : undefined;
+  const pubkey = normaliseNodePubkey(info.pubkey);
   if (!verdict.verified) {
     // Answered, but did not report a method list. The connection may well be
     // fine; it simply cannot be proven automatically.
     return { status: "pass", methods: [], unverified: true, ...(pubkey ? { pubkey } : {}) };
   }
   return { status: "pass", methods: verdict.methods, unverified: false, ...(pubkey ? { pubkey } : {}) };
+}
+
+/**
+ * Normalise a wallet-reported node pubkey to the compressed 66-hex form the
+ * lnbtc rail's `payTo` requires.
+ *
+ * NIP-47 `get_info` returns the node's pubkey **x-only** (64 hex), while a
+ * BOLT11 signature recovers a compressed key (02/03 prefix + 64 hex). The two
+ * are compared for equality, so the x-only form is lifted with the canonical
+ * even-y prefix.
+ *
+ * The lift is a guess about y, and a wrong guess would make every invoice fail
+ * its payee check rather than accept a wrong payment. `offers.ts` therefore
+ * corrects the cached pubkey from the signing key of the first invoice the
+ * wallet actually mints, which is authoritative by construction.
+ */
+export function normaliseNodePubkey(raw: string | undefined | null): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const value = raw.trim().toLowerCase();
+  if (/^(02|03)[0-9a-f]{64}$/.test(value)) return value;
+  if (/^[0-9a-f]{64}$/.test(value)) return `02${value}`;
+  return undefined;
 }
 
 export type LnbtcStatus = "disabled" | "available" | "degraded";

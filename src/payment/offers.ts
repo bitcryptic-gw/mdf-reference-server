@@ -19,6 +19,7 @@
 import type { PaymentRequirement, PriceEntryConfig, RequirementContext } from "./rails.ts";
 import { buildEip155Requirement, buildLnbtcRequirement, isLnbtcNetwork } from "./rails.ts";
 import { computeRequestHash, type BindingInput } from "./lnbtc/binding.ts";
+import { decodeBolt11 } from "./lnbtc/bolt11.ts";
 import type { MintLimiter } from "./rate-limit.ts";
 import type { LnbtcGate } from "./lnbtc/availability.ts";
 
@@ -55,6 +56,12 @@ export interface BuildOffersOptions {
     gate: LnbtcGate;
     limiter: MintLimiter;
     clientKey: string;
+    /**
+     * Called with the signing key of an invoice the wallet just minted, which is
+     * the authoritative receiver pubkey (see `normaliseNodePubkey` — the
+     * `get_info` form is x-only and its y-parity is a guess).
+     */
+    observePayee?: (pubkey: string) => void;
     mint: (params: {
       amountMsat: number;
       descriptionHash: string;
@@ -121,7 +128,22 @@ export async function buildOffers(options: BuildOffersOptions): Promise<Offer> {
       continue;
     }
 
-    const built = buildLnbtcRequirement(rail, options.ctx, {
+    // The minted invoice's recovered signing key is the one fact about the
+    // receiver that cannot be stale or mis-lifted, so it wins for this offer and
+    // is fed back to the runtime for the verify path.
+    let payee = options.ctx.lnbtcPayTo;
+    try {
+      const decoded = decodeBolt11(minted.invoice);
+      if (decoded.signingKey) {
+        payee = decoded.signingKey;
+        if (payee !== options.ctx.lnbtcPayTo) lnbtc.observePayee?.(payee);
+      }
+    } catch {
+      // An invoice we cannot decode is still a valid invoice to hand out; the
+      // configured payee stands and verification will decide.
+    }
+
+    const built = buildLnbtcRequirement(rail, { ...options.ctx, lnbtcPayTo: payee }, {
       invoice: minted.invoice,
       requestHash: hash.requestHash,
       requestBindingParams: hash.requestBindingParams,

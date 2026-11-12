@@ -211,6 +211,27 @@ await test("an invalid rail is omitted without taking the offer down", async () 
   eq(offer.omitted[0].reason, "invalid_rail", "reason");
 });
 
+await test("the minted invoice's signing key wins as payTo, and is fed back", async () => {
+  const SPEC_INVOICE =
+    "lnbc250n1pj48ugqpp54y3u9s8ylemsv8l3ewyzzu0klhujvuvmkl6llchq23vy8rzjsf0qsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygshp5p4nz8am4uqj4q8a87z3sk4x6yk4dv2mvel34epw68qqkwy0xcqvqxqzfvcqpjr4rx6ls6j5rpwknuea64evlk7yfx56wmqcer5eerekdsn9tlv6v4ex9mlz5dtm9qapl3svwlqcf7837dmjkru9z9w4h2rvm0md52w2sqxrwu5f";
+  let observed: string | null = null;
+  const offer = await buildOffers({
+    entry: { rails: [{ scheme: "exact", network: LNBTC, asset: "BTC", amount: "25000" }] },
+    ctx: { ...CTX, lnbtcPayTo: "02" + "ff".repeat(32) },
+    binding: BINDING,
+    lnbtc: lnbtcConfig({
+      mint: async () => ({ invoice: SPEC_INVOICE, paymentHash: "aa".repeat(32) }),
+      observePayee: (pubkey: string) => {
+        observed = pubkey;
+      },
+    }),
+  });
+  eq(offer.accepts.length, 1, "the rail is offered");
+  const realKey = offer.accepts[0].payTo;
+  assert(realKey !== "02" + "ff".repeat(32), "the configured key is corrected from the invoice");
+  eq(observed, realKey, "the runtime is told, so verify agrees");
+});
+
 await test("a different representation or URL is a different binding", async () => {
   const markdown = await buildOffers({
     entry: DUAL,

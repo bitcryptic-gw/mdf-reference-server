@@ -106,6 +106,11 @@ export async function buildOfferFor(
             gate: loaded.lnbtc.gate,
             limiter: loaded.lnbtc.limiter,
             clientKey: request.clientKey,
+            observePayee: (pubkey) => {
+              // First invoice wins: it came from our own wallet, so it is the
+              // receiver's real compressed key whatever get_info reported.
+              if (loaded.lnbtc) loaded.lnbtc.payeePubkey = pubkey;
+            },
             mint: (params) =>
               loaded.lnbtc!.client.makeInvoice({
                 amountMsat: params.amountMsat,
