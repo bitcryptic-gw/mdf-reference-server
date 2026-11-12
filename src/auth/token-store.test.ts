@@ -9,8 +9,10 @@
  * Run with: bun run src/auth/token-store.test.ts
  */
 
+import { createServer, type Server } from "node:net";
 import {
   MemoryTokenStore,
+  ValkeyTokenStore,
   digestsEqual,
   hashTokenSecret,
   issueToken,
@@ -206,6 +208,153 @@ await test("digest comparison rejects unequal or empty inputs", () => {
   assert(!digestsEqual(a, hashTokenSecret("id2", "secret")), "different digests differ");
   assert(!digestsEqual(a, a.slice(0, 32)), "truncated digest differs");
   assert(!digestsEqual("", ""), "empty never compares equal");
+});
+
+// ---------------------------------------------------------------------------
+// The Valkey-backed store, against a fake password-protected server
+//
+// This exists because a live acceptance run found the store sending SET with no
+// AUTH: a password-protected Valkey answers NOAUTH, `put` returns false, and
+// every token mint is denied while /health still reports the store "ok". The
+// fake server enforces the password, so that regression cannot come back.
+// ---------------------------------------------------------------------------
+
+interface FakeValkey {
+  server: Server;
+  port: number;
+  commands: string[][];
+  close(): Promise<void>;
+}
+
+function startFakeValkey(password: string): Promise<FakeValkey> {
+  const store = new Map<string, string>();
+  const commands: string[][] = [];
+
+  const parse = (buffer: Buffer): { args: string[]; rest: Buffer } | null => {
+    if (buffer.length === 0 || buffer[0] !== 0x2a) return null; // '*'
+    const lineEnd = buffer.indexOf("\r\n");
+    if (lineEnd === -1) return null;
+    const count = Number(buffer.subarray(1, lineEnd).toString());
+    let offset = lineEnd + 2;
+    const args: string[] = [];
+    for (let i = 0; i < count; i++) {
+      if (buffer[offset] !== 0x24) return null; // '$'
+      const lenEnd = buffer.indexOf("\r\n", offset);
+      if (lenEnd === -1) return null;
+      const len = Number(buffer.subarray(offset + 1, lenEnd).toString());
+      const start = lenEnd + 2;
+      if (buffer.length < start + len + 2) return null;
+      args.push(buffer.subarray(start, start + len).toString("utf8"));
+      offset = start + len + 2;
+    }
+    return { args, rest: buffer.subarray(offset) };
+  };
+
+  const server = createServer((socket) => {
+    let buffer = Buffer.alloc(0);
+    let authed = false;
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      for (;;) {
+        const parsed = parse(buffer);
+        if (!parsed) return;
+        buffer = parsed.rest;
+        const [cmd, ...args] = parsed.args;
+        commands.push([cmd.toUpperCase(), ...args.map((a) => (cmd.toUpperCase() === "AUTH" ? "<redacted>" : a))]);
+        const upper = cmd.toUpperCase();
+        if (upper === "AUTH") {
+          if (args[0] === password) {
+            authed = true;
+            socket.write("+OK\r\n");
+          } else {
+            socket.write("-WRONGPASS invalid username-password pair\r\n");
+          }
+          continue;
+        }
+        if (!authed) {
+          socket.write("-NOAUTH Authentication required.\r\n");
+          continue;
+        }
+        if (upper === "SET") {
+          store.set(args[0], args[1]);
+          socket.write("+OK\r\n");
+        } else if (upper === "GET") {
+          const value = store.get(args[0]);
+          if (value === undefined) {
+            socket.write("$-1\r\n");
+          } else {
+            socket.write(`$${Buffer.byteLength(value)}\r\n${value}\r\n`);
+          }
+        } else if (upper === "DEL") {
+          store.delete(args[0]);
+          socket.write(":1\r\n");
+        } else {
+          socket.write("-ERR unknown command\r\n");
+        }
+      }
+    });
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const port = (server.address() as { port: number }).port;
+      resolve({
+        server,
+        port,
+        commands,
+        close: () => new Promise<void>((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
+await test("the Valkey store authenticates before it writes (AUTH first, then SET)", async () => {
+  const fake = await startFakeValkey("correct-horse");
+  try {
+    const store = new ValkeyTokenStore({ host: "127.0.0.1", port: fake.port, password: "correct-horse" });
+    const record = {
+      secretHash: hashTokenSecret("a".repeat(32), "b".repeat(64)),
+      pathScope: "/private/",
+      expiresAt: Date.now() + 60000,
+      issuedTo: "0xabc",
+      txHash: "0xdef",
+    };
+    eq(await store.put("a".repeat(32), record, 60), true, "put succeeds against a protected store");
+
+    const verbs = fake.commands.map((c) => c[0]);
+    eq(verbs[0], "AUTH", "the first command on the connection is AUTH");
+    assert(verbs.includes("SET"), "the write happened");
+
+    const got = await store.get("a".repeat(32));
+    assert(got !== null && got.pathScope === "/private/", "the record round-trips");
+
+    await store.delete("a".repeat(32));
+    eq(await store.get("a".repeat(32)), null, "delete removes it");
+  } finally {
+    await fake.close();
+  }
+});
+
+await test("a wrong password fails closed: put returns false and nothing is stored", async () => {
+  const fake = await startFakeValkey("correct-horse");
+  try {
+    const store = new ValkeyTokenStore({ host: "127.0.0.1", port: fake.port, password: "wrong" });
+    const record = {
+      secretHash: hashTokenSecret("c".repeat(32), "d".repeat(64)),
+      pathScope: "/private/",
+      expiresAt: Date.now() + 60000,
+      issuedTo: "0xabc",
+      txHash: "0xdef",
+    };
+    eq(await store.put("c".repeat(32), record, 60), false, "a denied write is a refusal");
+    eq(await store.get("c".repeat(32)), null, "nothing readable");
+    assert(
+      !fake.commands.some((c) => c[0] === "SET"),
+      "no unauthenticated write is even attempted"
+    );
+  } finally {
+    await fake.close();
+  }
 });
 
 console.log("--------------------------------------------------");

@@ -144,7 +144,7 @@ export class ValkeyTokenStore implements TokenStore {
     // Nothing pooled.
   }
 
-  /** Run one command over a fresh short-lived connection; null on any failure. */
+  /** Run one command over a fresh short-lived connection; an error on any step. */
   private async run(commands: string[][]): Promise<{ kind: string; value?: string }> {
     let socket: ReturnType<typeof connect> | null = null;
     try {
@@ -167,6 +167,14 @@ export class ValkeyTokenStore implements TokenStore {
       });
 
       const client = socket;
+      // AUTH first: a password-protected store answers NOAUTH to everything
+      // else, and a silent failure here would read as "store unavailable" on
+      // every token mint.
+      if (this.options.password) {
+        const auth = await this.command(client, ["AUTH", this.options.password]);
+        if (auth.kind === "error") return { kind: "error", value: auth.value };
+      }
+
       for (const command of commands) {
         const reply = await this.command(client, command);
         if (reply.kind === "error") return { kind: "error", value: reply.value };
