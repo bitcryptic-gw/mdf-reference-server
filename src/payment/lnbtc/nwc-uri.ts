@@ -92,8 +92,36 @@ export function redactNwcUri(uri: string): string {
   return `nostr+walletconnect://${parsed.value.walletPubkey}?${relays}&secret=<redacted>`;
 }
 
-/** Methods this server may hold. Anything else is a wider credential than needed. */
-export const ALLOWED_NWC_METHODS = new Set(["make_invoice", "get_info"]);
+/**
+ * The exact methods this server tolerates on its credential. **No wildcard and
+ * no prefix matching**: a method that is not named here refuses startup, so a
+ * future wallet method cannot silently widen the credential.
+ *
+ * `make_invoice` and `get_info` are the only two the client ever *calls*
+ * (`nwc.ts` has no other method path, asserted by test). The rest are tolerated
+ * because Alby Hub's narrowest UI scope — "Read your node info" + "Create
+ * invoices" — maps onto them:
+ *
+ *   - `make_hold_invoice`, `settle_hold_invoice`, `cancel_hold_invoice` are the
+ *     hold-invoice family. They create and manage **incoming** invoice state:
+ *     they cannot move a satoshi out of the wallet, and settling one releases
+ *     funds *to* the receiver. The hub grants them together with `make_invoice`,
+ *     and its UI offers no narrower invoice scope.
+ *   - `get_budget` is read-only (it reports the connection's remaining budget).
+ *
+ * Anything that can spend (`pay_*`, `multi_pay_*`) or that this rail
+ * deliberately does not need (`lookup_invoice` — the preimage is verified
+ * locally — `list_transactions`, `get_balance`, `sign_message`, …) refuses
+ * startup.
+ */
+export const ALLOWED_NWC_METHODS = new Set([
+  "make_invoice",
+  "get_info",
+  "make_hold_invoice",
+  "settle_hold_invoice",
+  "cancel_hold_invoice",
+  "get_budget",
+]);
 
 /** Methods that would let the credential move money. Never acceptable. */
 export const SPEND_NWC_METHODS = new Set([
@@ -132,7 +160,7 @@ export function judgeNwcPermissions(methods: readonly string[] | null): Permissi
       ok: false,
       reason:
         `the NWC connection holds spending permission(s): ${spend.join(", ")} — ` +
-        `refusing to start. Create a dedicated connection with make_invoice only.`,
+        `refusing to start. Create a dedicated connection with the invoice-minting scope only.`,
     };
   }
 
@@ -141,8 +169,8 @@ export function judgeNwcPermissions(methods: readonly string[] | null): Permissi
     return {
       ok: false,
       reason:
-        `the NWC connection permits method(s) this server never calls: ${unexpected.join(", ")} — ` +
-        `refusing to start; the credential should be make_invoice only`,
+        `the NWC connection permits method(s) outside the fixed allowlist: ${unexpected.join(", ")} — ` +
+        `refusing to start. Allowed: ${[...ALLOWED_NWC_METHODS].join(", ")}`,
     };
   }
 

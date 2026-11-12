@@ -10,6 +10,7 @@
  * Run with: bun run src/payment/lnbtc-nwc.test.ts
  */
 
+import { readFileSync } from "node:fs";
 import { getPublicKey } from "@noble/secp256k1";
 import { randomBytes } from "node:crypto";
 import {
@@ -249,8 +250,91 @@ await test("no reported permissions is unverified, not a refusal", () => {
   }
 });
 
-await test("the allowlist is exactly make_invoice + get_info", () => {
-  eq([...ALLOWED_NWC_METHODS].sort().join(","), "get_info,make_invoice", "allowlist");
+await test("the allowlist is the fixed six, named — no wildcard, no prefix matching", () => {
+  eq(
+    [...ALLOWED_NWC_METHODS].sort().join(","),
+    "cancel_hold_invoice,get_budget,get_info,make_hold_invoice,make_invoice,settle_hold_invoice",
+    "allowlist"
+  );
+});
+
+await test("each allowed method passes, and the tolerated ones are never required", () => {
+  // make_invoice is required; the others are tolerated when the hub bundles them.
+  const accepted = [
+    ["make_invoice", "get_info"],
+    ["make_invoice", "get_info", "get_budget"],
+    ["make_invoice", "get_info", "make_hold_invoice"],
+    ["make_invoice", "get_info", "settle_hold_invoice"],
+    ["make_invoice", "get_info", "cancel_hold_invoice"],
+    [
+      "make_invoice",
+      "get_info",
+      "make_hold_invoice",
+      "settle_hold_invoice",
+      "cancel_hold_invoice",
+      "get_budget",
+    ],
+  ];
+  for (const methods of accepted) {
+    const verdict = judgeNwcPermissions(methods);
+    eq(verdict.ok, true, `${methods.join(",")} is accepted`);
+    if (verdict.ok && verdict.verified) {
+      eq(verdict.methods.join(","), methods.join(","), "reports exactly what the wallet said");
+    }
+  }
+
+  // Each tolerated method alone is not enough: make_invoice must be present.
+  for (const extra of ["get_info", "get_budget", "make_hold_invoice"]) {
+    const verdict = judgeNwcPermissions([extra]);
+    eq(verdict.ok, false, `${extra} without make_invoice is useless`);
+  }
+});
+
+await test("each refused method fails startup and is named", () => {
+  const refused = [
+    "pay_invoice",
+    "pay_keysend",
+    "multi_pay_invoice",
+    "multi_pay_keysend",
+    "lookup_invoice",
+    "list_transactions",
+    "get_balance",
+    "sign_message",
+    "a_future_method_nobody_has_invented_yet",
+  ];
+  for (const method of refused) {
+    const verdict = judgeNwcPermissions(["make_invoice", "get_info", method]);
+    eq(verdict.ok, false, `${method} must refuse startup`);
+    if (!verdict.ok) {
+      assert(verdict.reason.includes(method), `the reason names ${method}: ${verdict.reason}`);
+    }
+  }
+});
+
+await test("the client only ever calls make_invoice and get_info", () => {
+  // The tolerated methods exist in the credential, never in the client: this is
+  // a structural assertion over the source, because "we don't call it today" is
+  // exactly the kind of promise that rots.
+  const source = readFileSync(new URL("./lnbtc/nwc.ts", import.meta.url), "utf8");
+  const called = [...source.matchAll(/this\.call\("([a-z_]+)"/g)].map((m) => m[1]);
+  eq(
+    [...new Set(called)].sort().join(","),
+    "get_info,make_invoice",
+    "the only method paths in the client"
+  );
+  for (const tolerated of [
+    "make_hold_invoice",
+    "settle_hold_invoice",
+    "cancel_hold_invoice",
+    "get_budget",
+    "pay_invoice",
+    "lookup_invoice",
+  ]) {
+    assert(
+      !source.includes(`"${tolerated}"`),
+      `${tolerated} must not appear anywhere in the client`
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------

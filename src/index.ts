@@ -56,17 +56,45 @@ const log = (message: string) => console.warn(message);
 if (loaded.lnbtc) {
   const rt = loaded.lnbtc;
 
-  /** Capture the receiver node pubkey from an answered wallet check. */
-  function applyPubkey(check: { status: string; pubkey?: string }): void {
+  /** The last scope the wallet reported, so a change is logged once. */
+  let reportedMethods: string | null = null;
+
+  /**
+   * Capture the receiver node pubkey and log the credential's exact scope.
+   *
+   * The scope is the wallet's answer, not our allowlist: an operator needs to
+   * see what Alby Hub actually granted, because that is what governs the risk if
+   * the connection leaks.
+   */
+  function applyCheckResult(check: {
+    status: string;
+    pubkey?: string;
+    methods?: string[];
+    unverified?: boolean;
+  }): void {
     if (check.status === "pass" && check.pubkey && !rt.payeePubkey) {
       rt.payeePubkey = check.pubkey;
+    }
+    if (check.status === "pass") {
+      const methods = [...(check.methods ?? [])].sort().join(",");
+      if (methods !== reportedMethods) {
+        reportedMethods = methods;
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            event: "lnbtc_credential",
+            permitted_methods: methods === "" ? [] : methods.split(","),
+            unverified: check.unverified === true,
+          })
+        );
+      }
     }
   }
 
   /** One wallet permission check, applied to the gate; null means healthy. */
   async function runNwcCheck(): Promise<LightningFailure | null> {
     const check = await checkNwcConnection(rt.client);
-    applyPubkey(check);
+    applyCheckResult(check);
     rt.gate.applyCheck(check);
     if (check.status === "pass") return null;
     return {
@@ -81,7 +109,7 @@ if (loaded.lnbtc) {
       enabled: true,
       client: rt.client,
       log,
-      onCheck: applyPubkey,
+      onCheck: applyCheckResult,
     });
     rt.gate = gate;
   } catch (err) {
