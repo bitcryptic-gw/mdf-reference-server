@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>mdf-server-syd</Name>
-  <Repository>bitcryptic/mdf-reference-server@sha256:cc142e370b9704812002c3facd7af13d6f27e4fef21b852ece29d46252d216db</Repository>
+  <Repository>bitcryptic/mdf-reference-server@sha256:90385776b7f069a645d098288d1b0814211ee563a8928aefb5cba9ffbcfab2cc</Repository>
   <Registry>https://hub.docker.com/r/bitcryptic/mdf-server</Registry>
   <Network>bridge</Network>
   <MyIP/>

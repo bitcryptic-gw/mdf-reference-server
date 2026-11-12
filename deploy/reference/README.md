@@ -61,14 +61,14 @@ Not applied to any host. Each file passes a strict parse and the dockerMan harne
 
 | file | what it is | sha256 |
 |---|---|---|
-| `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.1`, failover secondary | `137d9741f4ba70cf88ba4c38d277e95f25ca60f64a81a14fdd6b8641cf89baa1` |
-| `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.1` | `fc9670282baf636e27a43c0343fd97178ef432cfffcdb607e1f5e20392d5880d` |
+| `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.1`, failover secondary | `c7aea06556a8341e1f142bcb1f22c599494eb57cb0cf5d70618b9741b06a1ba3` |
+| `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.1` | `7f937cba68898ac328c723cc670d02022c1ffb6f215a9b1dad2a31c202a56ccd` |
 | `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `142e0f7068d6f0a436e07932ba055167e288c77b1dfbf080aecb25bf70788f52` |
 | `valkey.conf` | Valkey server config, mounted read-only (AOF, noeviction, ACL file) | `43d248e68647422d8f05bc82e51719b6accef769a44903feba5ffcae0dc1d6cf` |
 
 Image pins:
 
-- server: `bitcryptic/mdf-reference-server@sha256:cc142e370b9704812002c3facd7af13d6f27e4fef21b852ece29d46252d216db`
+- server: `bitcryptic/mdf-reference-server@sha256:90385776b7f069a645d098288d1b0814211ee563a8928aefb5cba9ffbcfab2cc`
   (multi-arch index, `0.3.0-rc.1`; trivy secret scan 0 findings, and a direct grep of an
   exported layer for the wallet address, `tskey-`, private-key headers and NWC URI fragments
   found nothing — the only `nostr+walletconnect` strings are the URI parser's own source)
