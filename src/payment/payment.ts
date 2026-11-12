@@ -1,1974 +1,386 @@
-import { createHash, createHmac, timingSafeEqual, randomBytes } from "crypto";
+/**
+ * The payment facade: offers, verification and settlement, in one place.
+ *
+ * Rail resolution lives in `rails.ts`, offer construction (degradation, rate
+ * limits, invoice minting) in `offers.ts`, the facilitator in `facilitator.ts`
+ * and lnbtc verification in `lnbtc/verify.ts`. This file is the seam the router
+ * talks to, and the only place that knows the order of operations for a paid
+ * request:
+ *
+ *     offer → PAYMENT-SIGNATURE → match a rail → verify → settle → serve
+ *
+ * with two rails whose settlement stories differ completely: eip155 delegates to
+ * a facilitator (verify then settle, with the #52 contract), lnbtc settles
+ * locally (validate the invoice and preimage, then claim the replay key).
+ */
+
 import type { LoadedConfig } from "../config/loader.ts";
-import type { FacilitatorConfig, FacilitatorChainConfig } from "../config/schema.ts";
 import { htmlSourceBytesForPath } from "../content/handler.ts";
 import {
-  LightningBreaker,
-  type BreakerProbeState,
-  type BreakerSnapshot,
-  type LightningFailure,
-  type LightningFailureCategory,
-} from "./breaker.ts";
+  isFreeEntry,
+  isTokenEntry,
+  resolvePriceEntry,
+  tokenScopeForPath,
+  pricingView,
+  type PaymentRequirement,
+  type RailConfig,
+  type RequirementContext,
+} from "./rails.ts";
+import { buildOffers, type Offer } from "./offers.ts";
+import { computeRequestHash } from "./lnbtc/binding.ts";
+import { buildPaymentRequired, coarseErrorClass, type CoarseError, type PaymentRequiredDoc } from "./402.ts";
+import { decodeHeaderObject, HEADER, MAX_PAYMENT_HEADER_CHARS } from "./headers.ts";
+import type { VerifiedAuthorization } from "./facilitator.ts";
+import { confirmSuccessfulTransfer } from "./facilitator.ts";
+import {
+  checkInvoice,
+  decodeBolt11,
+  preimageMatches,
+} from "./lnbtc/bolt11.ts";
+import { replayTtlSeconds } from "./lnbtc/replay-store.ts";
 
-export type {
-  BreakerSnapshot,
-  LightningFailure,
-  LightningFailureCategory,
-} from "./breaker.ts";
+export type VerifyStatus = "approved" | "no_payment" | "rejected" | "error";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/**
- * Parsed standard x402 (V1) payment payload, extracted from the X-PAYMENT
- * header. This is the decoded envelope plus the EIP-3009 authorization the
- * facilitator will act on.
- */
-export interface PaymentProof {
-  /** Raw X-PAYMENT header value (base64) */
-  raw: string;
-  /** x402 protocol version (1) */
-  x402Version: number;
-  /** Payment scheme, e.g. "exact" */
-  scheme: string;
-  /** x402 network name, e.g. "base" or "base-sepolia" */
-  network: string;
-  /** Signer / payer address */
-  from: string;
-  /** Recipient address */
-  to: string;
-  /** Amount in atomic token units (decimal string) */
-  value: string;
-  /** Authorization validity start (unix seconds) */
-  validAfter: number;
-  /** Authorization validity end (unix seconds) */
-  validBefore: number;
-  /** 32-byte authorization nonce (0x hex) */
-  nonce: string;
-  /** EOA / EIP-1271 signature bytes (0x hex) */
-  signature: string;
-  /** Full decoded PaymentPayload envelope, forwarded verbatim to the facilitator. */
-  envelope: Record<string, unknown>;
+export interface VerifyResult {
+  status: VerifyStatus;
+  /** Coarse class for the 402 body and the attempt log. */
+  reason?: CoarseError;
+  rail?: string;
+  settlement?: { transaction: string; network: string; payer?: string };
+  /** Set when the request was approved but a token should be issued. */
+  issueToken?: boolean;
 }
 
-/**
- * Parsed L402 credential extracted from Authorization header.
- * Format: "L402 <macaroon>:<preimage>"
- *
- * The macaroon here is an HMAC-bound token (not a full libmacaroon implementation).
- * It encodes {payment_hash, path_scope, expiry} and is signed with the server's
- * lightning.token_secret. The preimage is the Lightning payment preimage that,
- * when SHA-256 hashed, must equal the payment_hash encoded in the macaroon.
- */
-export interface L402Credential {
-  /** Raw Authorization header value */
-  raw: string;
-  /** Base64url-encoded macaroon token */
-  macaroon: string;
-  /** Hex-encoded Lightning payment preimage */
-  preimage: string;
+export interface RequestContext {
+  urlPath: string;
+  resourceUrl: string;
+  method: string;
+  /** Header values by lower-case name (only `accept` is bound). */
+  headers: Record<string, string | null | undefined>;
+  /** Client key already resolved through the trusted-proxy rule. */
+  clientKey: string;
 }
 
-/**
- * Decoded macaroon payload. This is the internal structure — never exposed
- * to callers directly. Verified by HMAC before use.
- */
-interface MacaroonPayload {
-  /** SHA-256 hash of the payment preimage (hex) */
-  payment_hash: string;
-  /** Path prefix this token is scoped to e.g. "/premium" */
-  path_scope: string;
-  /** Unix timestamp (seconds) after which the token is invalid */
-  expiry: number;
-  /** Random nonce to prevent payload collision */
-  nonce: string;
-}
-
-export type VerificationStatus =
-  | "approved"      // proof accepted — serve content
-  | "rejected"      // proof invalid — return 402
-  | "no_proof"      // no payment header present
-  | "error";        // upstream dependency failure — not a payment denial
-
-export interface VerificationResult {
-  status: VerificationStatus;
-  proof: PaymentProof | null;
-  l402Credential: L402Credential | null;
-  reason: string;
-  /** If true, this path should trigger auth token issuance rather than direct content */
-  requiresToken: boolean;
-  /** Rail that processed this result */
-  rail: "x402" | "l402" | "none";
-  /** Settlement metadata, present when an x402 payment settled successfully */
-  settlement?: { payer: string; transaction: string };
-}
-
-// ---------------------------------------------------------------------------
-// Lightning invoice failure surface
-// ---------------------------------------------------------------------------
-//
-// When invoice creation fails, the client must not be told a lie (a 402
-// advertising a rail that cannot be fulfilled) and the operator must get a
-// machine-readable reason. Failures are categorised backend-agnostically so a
-// future pluggable invoice backend (Vikunja #46) reuses this unchanged.
-
-/** Maximum length of a sanitised upstream message retained for logs. */
-const MAX_UPSTREAM_MESSAGE = 300;
-
-/**
- * Strip anything that could be a secret from an upstream error message and cap
- * its length. Defence in depth: the Alby error body should never carry our
- * token, but no secret may reach a log line, /health or a response body even if
- * it does. Long hex (preimages, payment hashes, signatures), Bearer/Authorization
- * values, long opaque token runs and any known secret value are replaced.
- */
-export function sanitizeUpstreamMessage(
-  input: string,
-  knownSecrets: string[] = []
-): string {
-  let out = typeof input === "string" ? input : String(input ?? "");
-
-  // Keep it a single line so the structured log stays one JSON record.
-  out = out.replace(/[\u0000-\u001f\u007f]+/g, " ");
-
-  // Exact known secrets first (longest first so an overlap cannot leave residue).
-  for (const secret of [...knownSecrets].sort((a, b) => b.length - a.length)) {
-    if (secret && secret.length >= 4) out = out.split(secret).join("[redacted]");
-  }
-
-  out = out
-    .replace(/\b(Bearer|Basic|Token)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [redacted]")
-    .replace(/\bAuthorization\b\s*[:=]\s*["']?[^"',}\s]+/gi, "Authorization: [redacted]")
-    // 64-hex preimages, 32-byte payment hashes, signatures (>= 32 hex chars)
-    .replace(/\b[0-9a-fA-F]{32,}\b/g, "[redacted-hex]")
-    // Long base64/base64url macaroon-ish runs
-    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, "[redacted]")
-    .trim();
-
-  if (out.length > MAX_UPSTREAM_MESSAGE) {
-    out = `${out.slice(0, MAX_UPSTREAM_MESSAGE)}…`;
-  }
-  return out;
-}
-
-/**
- * A categorised invoice-backend failure. `message` is only for local debugging;
- * `failure.upstreamMessage` is the sanitised value safe to log.
- */
-export class LightningBackendError extends Error {
-  readonly failure: LightningFailure;
-  constructor(failure: LightningFailure) {
-    super(`lightning invoice backend error (${failure.category})`);
-    this.name = "LightningBackendError";
-    this.failure = failure;
-  }
-}
-
-function classifyNetworkError(err: unknown, knownSecrets: string[] = []): LightningFailure {
-  // Connection refused, DNS failure and AbortSignal.timeout() all land here.
-  // A timeout is a form of unreachability, so both map to `unreachable`.
-  const message = (err as Error)?.message ?? String(err);
+function ctx(loaded: LoadedConfig): RequirementContext {
   return {
-    category: "unreachable",
-    upstreamStatus: null,
-    upstreamMessage: sanitizeUpstreamMessage(message, knownSecrets),
+    eip155PayTo: loaded.walletAddress,
+    lnbtcPayTo: loaded.lnbtc?.payeePubkey ?? null,
+    maxTimeoutSeconds: loaded.config.payment.max_timeout_seconds,
   };
 }
 
-function classifyHttpFailure(
-  status: number,
-  body: string,
-  knownSecrets: string[] = []
-): LightningFailure {
-  const category: LightningFailureCategory =
-    status === 401 || status === 403 ? "auth" : "rejected";
+/** Entry for a path, plus whether it is free / token-gated. */
+export function entryFor(loaded: LoadedConfig, urlPath: string) {
+  const { entry } = resolvePriceEntry(urlPath, pricingView(loaded.config));
   return {
-    category,
-    upstreamStatus: status,
-    upstreamMessage: sanitizeUpstreamMessage(body, knownSecrets),
-  };
-}
-
-/** Convert any thrown value into a typed failure without leaking raw text. */
-function failureFromError(err: unknown, knownSecrets: string[] = []): LightningFailure {
-  if (err instanceof LightningBackendError) {
-    // Re-sanitise defensively in case known secrets changed since it was thrown.
-    return {
-      ...err.failure,
-      upstreamMessage: sanitizeUpstreamMessage(err.failure.upstreamMessage, knownSecrets),
-    };
-  }
-  return classifyNetworkError(err, knownSecrets);
-}
-
-// ---------------------------------------------------------------------------
-// Alby Hub API client
-// ---------------------------------------------------------------------------
-
-/**
- * Alby Hub invoice creation response (subset of fields we use).
- *
- * NOTE: The Alby Hub internal REST API is marked "Experimental" in the UI
- * and may change or be removed. This client is isolated here so that if
- * the API changes, or if we migrate to NWC (Nostr Wallet Connect), only
- * this module needs updating.
- *
- * API base: http://<host>:8021/api
- * Auth: Authorization: Bearer <token>
- */
-interface AlbyInvoice {
-  paymentHash: string;     // Alby Hub uses camelCase
-  invoice: string;         // BOLT11 invoice string (not payment_request)
-  settledAt: string | null;
-}
-
-interface AlbyInvoiceStatus {
-  paymentHash: string;     // Alby Hub uses camelCase
-  state: string;           // "pending" | "settled" | "expired"
-  preimage: string | null; // hex preimage, present when settled
-}
-
-/**
- * Create a Lightning invoice via Alby Hub.
- *
- * `amountMsat` is in **millisatoshis**. Alby Hub's `POST /api/invoices` takes
- * `amount` in msat and rejects any value that is not a whole number of
- * satoshis (a multiple of 1000 msat) with HTTP 500 "the amount must be a whole
- * number of satoshis". Verified live 2026-09-20: sending 1000 yields a 1-sat
- * invoice (`lnbc10n`) and sending 100000 yields a 100-sat invoice (`lnbc1u`).
- * Description is shown in the payer's wallet.
- */
-async function albyCreateInvoice(
-  amountMsat: number,
-  description: string,
-  expirySeconds: number,
-  apiUrl: string,
-  apiToken: string,
-  knownSecrets: string[] = [apiToken]
-): Promise<AlbyInvoice> {
-  let res: Response;
-  try {
-    res = await fetch(`${apiUrl}/invoices`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiToken}`,
-      },
-      body: JSON.stringify({
-        amount: amountMsat,
-        description,
-        expiry: expirySeconds,
-      }),
-      // Hard timeout — don't let a slow Alby Hub stall request handling.
-      // This bounds both the request path and the background probe.
-      signal: AbortSignal.timeout(8000),
-    });
-  } catch (err) {
-    // Network error, DNS failure or timeout — categorised as unreachable.
-    throw new LightningBackendError(classifyNetworkError(err, knownSecrets));
-  }
-
-  if (!res.ok) {
-    // Keep the upstream status AND body: the body is the human-readable reason
-    // (e.g. Alby's "the amount must be a whole number of satoshis"). Both are
-    // sanitised before they reach a log line.
-    const text = await res.text().catch(() => "");
-    throw new LightningBackendError(classifyHttpFailure(res.status, text, knownSecrets));
-  }
-
-  try {
-    return (await res.json()) as AlbyInvoice;
-  } catch (err) {
-    throw new LightningBackendError({
-      category: "unknown",
-      upstreamStatus: res.status,
-      upstreamMessage: sanitizeUpstreamMessage(
-        `unparseable invoice response body: ${(err as Error).message}`,
-        knownSecrets
-      ),
-    });
-  }
-}
-
-/**
- * Lightweight, non-polluting reachability/auth probe for the breaker timer.
- *
- * An authenticated read exercises connectivity AND the token (a bare TCP/HTTP
- * GET would not), and distinguishes `unreachable` (network error/timeout) from
- * `auth` (401/403). It creates no invoice, so it does not pollute the Alby Hub
- * invoice/transaction list. It cannot exercise invoice *creation*, so for a
- * `rejected` category the caller confirms with a real minimal attempt.
- */
-async function albyReachabilityProbe(
-  apiUrl: string,
-  apiToken: string,
-  knownSecrets: string[]
-): Promise<LightningFailure | null> {
-  let res: Response;
-  try {
-    res = await fetch(`${apiUrl}/transactions?limit=1`, {
-      method: "GET",
-      headers: { "Authorization": `Bearer ${apiToken}` },
-      signal: AbortSignal.timeout(8000),
-    });
-  } catch (err) {
-    return classifyNetworkError(err, knownSecrets);
-  }
-
-  if (res.status === 401 || res.status === 403) {
-    return {
-      category: "auth",
-      upstreamStatus: res.status,
-      upstreamMessage: "reachability probe rejected (auth)",
-    };
-  }
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    return classifyHttpFailure(res.status, body, knownSecrets);
-  }
-  return null;
-}
-
-/**
- * Look up a Lightning invoice by payment hash via Alby Hub.
- * Returns settlement status and preimage if settled.
- *
- * NOTE: Alby Hub's /api/invoices/<hash> endpoint returns HTML (not JSON).
- * We use /api/transactions instead and filter by paymentHash client-side.
- * Fetches up to 50 recent transactions — sufficient for demo/reference use.
- * A production implementation should use a more targeted lookup if Alby Hub
- * exposes one in a future API version, or migrate to NWC for stability.
- */
-async function albyGetInvoice(
-  paymentHash: string,
-  apiUrl: string,
-  apiToken: string
-): Promise<AlbyInvoiceStatus> {
-  const res = await fetch(`${apiUrl}/transactions?limit=50&offset=0`, {
-    headers: {
-      "Authorization": `Bearer ${apiToken}`,
-    },
-    signal: AbortSignal.timeout(8000),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "(no body)");
-    throw new Error(`Alby Hub transaction lookup failed: ${res.status} ${text}`);
-  }
-
-  const data = await res.json() as { transactions: AlbyInvoiceStatus[] };
-  const match = data.transactions.find(
-    (t) => t.paymentHash.toLowerCase() === paymentHash.toLowerCase()
-  );
-
-  if (!match) {
-    // Invoice not found in recent transactions — treat as unsettled
-    return { paymentHash, state: "pending", preimage: null };
-  }
-
-  return match;
-}
-
-// ---------------------------------------------------------------------------
-// Macaroon (HMAC-bound token) implementation
-// ---------------------------------------------------------------------------
-
-/**
- * Create a signed macaroon token encoding the payment hash, path scope, and expiry.
- *
- * Format: base64url(<json_payload>).<base64url(<hmac_signature>)>
- *
- * The HMAC uses SHA-256 with the server's configured token_secret.
- * This is not a libmacaroon-compatible format — it is a simpler construction
- * appropriate for a reference implementation. A production deployment may wish
- * to adopt the full macaroon specification for delegation and attenuation support.
- */
-export function createMacaroon(
-  paymentHash: string,
-  pathScope: string,
-  ttlSeconds: number,
-  tokenSecret: string
-): string {
-  const payload: MacaroonPayload = {
-    payment_hash: paymentHash,
-    path_scope: pathScope,
-    expiry: Math.floor(Date.now() / 1000) + ttlSeconds,
-    nonce: randomBytes(8).toString("hex"),
-  };
-
-  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  const sig = createHmac("sha256", tokenSecret).update(payloadB64).digest("base64url");
-
-  return `${payloadB64}.${sig}`;
-}
-
-/**
- * Verify and decode a macaroon token.
- * Returns the payload if valid, throws if tampered or expired.
- */
-function verifyMacaroon(
-  macaroon: string,
-  tokenSecret: string
-): MacaroonPayload {
-  const dotIdx = macaroon.lastIndexOf(".");
-  if (dotIdx === -1) throw new Error("malformed macaroon: missing signature separator");
-
-  const payloadB64 = macaroon.slice(0, dotIdx);
-  const sigB64 = macaroon.slice(dotIdx + 1);
-
-  // Recompute expected signature
-  const expectedSig = createHmac("sha256", tokenSecret).update(payloadB64).digest("base64url");
-
-  // Timing-safe comparison
-  const sigBuf = Buffer.from(sigB64);
-  const expectedBuf = Buffer.from(expectedSig);
-  if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
-    throw new Error("macaroon signature invalid");
-  }
-
-  let payload: MacaroonPayload;
-  try {
-    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
-  } catch {
-    throw new Error("macaroon payload not valid JSON");
-  }
-
-  if (Math.floor(Date.now() / 1000) > payload.expiry) {
-    throw new Error("macaroon expired");
-  }
-
-  return payload;
-}
-
-// ---------------------------------------------------------------------------
-// L402 credential parsing
-// ---------------------------------------------------------------------------
-
-/**
- * Parse the Authorization header for an L402 credential.
- * Expected format: "L402 <macaroon>:<preimage>"
- */
-function parseL402Header(raw: string): L402Credential | null {
-  const stripped = raw.trim();
-  if (!stripped.toLowerCase().startsWith("l402 ")) return null;
-
-  const rest = stripped.slice(5).trim();
-  const colonIdx = rest.lastIndexOf(":");
-  if (colonIdx === -1) return null;
-
-  const macaroon = rest.slice(0, colonIdx).trim();
-  const preimage = rest.slice(colonIdx + 1).trim();
-
-  if (!macaroon || !preimage) return null;
-
-  // Basic hex validation on preimage (must be 64 hex chars — 32 bytes)
-  if (!/^[0-9a-fA-F]{64}$/.test(preimage)) return null;
-
-  return { raw, macaroon, preimage };
-}
-
-// ---------------------------------------------------------------------------
-// x402 header parsing
-// ---------------------------------------------------------------------------
-
-/**
- * Parse the standard x402 `X-PAYMENT` header: base64-encoded JSON of a V1
- * `PaymentPayload`. Returns null if malformed or missing required fields.
- *
- * Shape (x402 v1, exact scheme):
- *   {
- *     "x402Version": 1,
- *     "scheme": "exact",
- *     "network": "base-sepolia",
- *     "payload": {
- *       "signature": "0x…",
- *       "authorization": {
- *         "from": "0x…", "to": "0x…", "value": "100000",
- *         "validAfter": "0", "validBefore": "9999999999",
- *         "nonce": "0x…"
- *       }
- *     }
- *   }
- */
-function parseX402PaymentHeader(raw: string): PaymentProof | null {
-  let decoded: string;
-  try {
-    const normalized = raw.trim().replace(/-/g, "+").replace(/_/g, "/");
-    decoded = Buffer.from(normalized, "base64").toString("utf8");
-  } catch {
-    return null;
-  }
-
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(decoded) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-
-  if (parsed.x402Version !== 1) return null;
-  if (typeof parsed.scheme !== "string" || typeof parsed.network !== "string") return null;
-
-  const payload = parsed.payload as Record<string, unknown> | undefined;
-  const auth = payload?.authorization as Record<string, unknown> | undefined;
-  if (!payload || !auth) return null;
-
-  const signature = typeof payload.signature === "string" ? payload.signature : null;
-  const from      = typeof auth.from    === "string" ? auth.from    : null;
-  const to        = typeof auth.to      === "string" ? auth.to      : null;
-  const value     = typeof auth.value   === "string" ? auth.value   : null;
-  const nonce     = typeof auth.nonce   === "string" ? auth.nonce   : null;
-
-  if (!signature || !from || !to || !value || !nonce) return null;
-  if (auth.validAfter === undefined || auth.validBefore === undefined) return null;
-
-  const validAfter  = Number(auth.validAfter);
-  const validBefore = Number(auth.validBefore);
-  if (!Number.isFinite(validAfter) || !Number.isFinite(validBefore)) return null;
-
-  return {
-    raw,
-    x402Version: 1,
-    scheme: parsed.scheme,
-    network: parsed.network,
-    from,
-    to,
-    value,
-    validAfter,
-    validBefore,
-    nonce,
-    signature,
-    envelope: parsed,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Amount helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Convert a human-readable decimal amount (e.g. "1.0000") to atomic token
- * units for a token with `decimals` decimals (e.g. "1000000" for 6 decimals).
- *
- * Rounds up when the amount carries more precision than the token supports, so
- * a price is never under-charged. String/BigInt arithmetic only — no floats.
- */
-function toAtomicUnits(amount: string, decimals: number): string {
-  const [intPart = "0", fracPartRaw = ""] = amount.split(".");
-  const frac = fracPartRaw.replace(/[^0-9]/g, "");
-  const intDigits = intPart.replace(/[^0-9]/g, "") || "0";
-
-  if (frac.length <= decimals) {
-    return BigInt(intDigits + frac.padEnd(decimals, "0")).toString();
-  }
-
-  const keep = frac.slice(0, decimals);
-  const rest = frac.slice(decimals);
-  let units = BigInt(intDigits + keep);
-  if (/[1-9]/.test(rest)) units += 1n; // ceil — never under-charge
-  return units.toString();
-}
-
-// ---------------------------------------------------------------------------
-// Price / token helpers
-// ---------------------------------------------------------------------------
-
-function requiredPriceEntry(
-  urlPath: string,
-  config: LoadedConfig["config"]
-): { amount: string; currency: string | null | undefined; chain: string | null | undefined } {
-  const sections = config.pricing.sections ?? {};
-
-  function globToRegex(pattern: string): RegExp {
-    const escaped = pattern
-      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-      .replace(/\*\*/g, "§DOUBLE§")
-      .replace(/\*/g, "[^/]+")
-      .replace(/§DOUBLE§/g, ".*");
-    return new RegExp(`^${escaped}$`);
-  }
-
-  let bestPattern: string | null = null;
-  let bestLength = -1;
-  for (const pattern of Object.keys(sections)) {
-    if (globToRegex(pattern).test(urlPath) && pattern.length > bestLength) {
-      bestPattern = pattern;
-      bestLength  = pattern.length;
-    }
-  }
-
-  return bestPattern ? sections[bestPattern] : config.pricing.default;
-}
-
-function requiredPrice(urlPath: string, config: LoadedConfig["config"]): string {
-  return requiredPriceEntry(urlPath, config).amount;
-}
-
-function pathRequiresToken(urlPath: string, config: LoadedConfig["config"]): boolean {
-  if (!config.auth) return false;
-  const threshold = parseFloat(config.auth.price_threshold);
-  const price     = parseFloat(requiredPrice(urlPath, config));
-  return price >= threshold;
-}
-
-/**
- * True when `urlPath` falls in a token-access section (its price is at or above
- * `auth.price_threshold`). Exported for the token-issuance endpoint, which must
- * refuse to settle a payment for a per-fetch section only to discard it.
- */
-export function isTokenSection(
-  urlPath: string,
-  config: LoadedConfig["config"]
-): boolean {
-  return pathRequiresToken(urlPath, config);
-}
-
-/**
- * Derive the path scope prefix from a full path.
- * "/premium/deep-dive" → "/premium"
- * "/private/internals" → "/private"
- */
-function pathScope(urlPath: string): string {
-  const parts = urlPath.split("/").filter(Boolean);
-  return parts.length > 0 ? `/${parts[0]}` : "/";
-}
-
-/**
- * True when `urlPath` lies within `scope` on a path-segment boundary.
- *
- * A bare `urlPath.startsWith(scope)` would authorise sibling paths whose first
- * segment merely begins with the scope string — a macaroon scoped `/premium`
- * would be accepted for `/premiumx/…` or `/premium-other/…`. Require either an
- * exact match or a following `/`.
- */
-function pathInScope(urlPath: string, scope: string): boolean {
-  if (scope === "/") return true;
-  return urlPath === scope || urlPath.startsWith(scope + "/");
-}
-
-/**
- * Constant-time comparison of two hex-encoded values (length-checked, since
- * crypto.timingSafeEqual throws on a length mismatch). Used for preimage
- * comparisons so a byte-by-byte early exit cannot leak the value's prefix.
- */
-function hexEqual(a: string, b: string): boolean {
-  const ba = Buffer.from(a, "hex");
-  const bb = Buffer.from(b, "hex");
-  return ba.length === bb.length && timingSafeEqual(ba, bb);
-}
-
-/** Fixed reference rate: 1 BTC ≈ 100,000 USD → 1 USD ≈ 1,000 sats. */
-const SATS_PER_USD = 1000;
-
-/** 1 BTC = 100,000,000 satoshis. */
-export const SATS_PER_BTC = 100_000_000;
-
-/** Currencies the lightning rail knows how to price into satoshis. */
-const LIGHTNING_RAIL_CURRENCIES = new Set(["BTC", "USD", "USDC"]);
-
-/** 1 satoshi = 1,000 millisatoshis. */
-const MSAT_PER_SAT = 1000;
-
-/**
- * Convert a USD amount string to an exact, possibly fractional, satoshi value
- * using a rough fixed rate.
- *
- * TODO: Replace with a live rate feed (e.g. Coingecko or a self-hosted price
- * oracle) once the implementation is production-ready. The fixed rate is
- * acceptable for the reference implementation and demo purposes.
- *
- * Deliberately does NOT round: rounding belongs at the invoice boundary
- * (`satsToMsat`), where it must round *up* so the publisher is never
- * underpaid. Keeping this exact makes that rounding testable and keeps the
- * advertised price and the invoiced amount derived from the same number.
- */
-export function usdToSats(usdAmount: string): number {
-  const usd = parseFloat(usdAmount);
-  if (!Number.isFinite(usd) || usd < 0) return 0;
-  return usd * SATS_PER_USD;
-}
-
-/**
- * Convert a priced amount to satoshis, branching on currency.
- *
- * A BTC-denominated price converts at 1 BTC = 100,000,000 sats; USD/USDC prices
- * use the fixed reference rate. The previous code applied the USD rate to every
- * price, so a BTC price only landed on the right sat value by coincidence
- * (0.00000001 BTC happened to come out as 1 sat; 0.000001 BTC would have been
- * invoiced as 1 sat instead of 100 — a 100x undercharge).
- *
- * Any other currency is a hard error. The loader rejects it at startup, so this
- * is unreachable in a running server; it refuses rather than silently misreading
- * a price.
- */
-export function priceToSats(
-  amount: string,
-  currency: string | null | undefined
-): number {
-  const value = parseFloat(amount);
-  if (!Number.isFinite(value) || value < 0) return 0;
-  const code = (currency ?? "").toUpperCase();
-  if (code === "BTC") return value * SATS_PER_BTC;
-  if (code === "USD" || code === "USDC") return value * SATS_PER_USD;
-  throw new Error(
-    `unsupported lightning-rail currency: ${currency ?? "(none)"} — expected BTC, USD or USDC`
-  );
-}
-
-/** True when a currency is one the lightning rail can price. */
-export function isLightningRailCurrency(currency: string | null | undefined): boolean {
-  return LIGHTNING_RAIL_CURRENCIES.has((currency ?? "").toUpperCase());
-}
-
-/**
- * Convert a satoshi value to the millisatoshi amount Alby Hub's invoice API
- * expects, rounding **up** to a whole satoshi (Alby requires a multiple of
- * 1000 msat) with a 1-satoshi floor so an invoice is never zero.
- *
- * Rounding up means a fractional price (e.g. a sub-satoshi micropayment) still
- * produces a payable whole-satoshi invoice and the publisher is never
- * underpaid. The value returned is what `albyCreateInvoice` sends.
- */
-export function satsToMsat(sats: number): number {
-  if (!Number.isFinite(sats) || sats <= 0) return MSAT_PER_SAT;
-  return Math.ceil(sats) * MSAT_PER_SAT;
-}
-
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
-
-function logX402(urlPath: string, proof: PaymentProof, result: VerificationStatus) {
-  console.log(`[mdf:payment:x402] ${JSON.stringify({
-    ts: new Date().toISOString(),
-    path: urlPath,
-    status: result,
-    network: proof.network,
-    value: proof.value,
-    nonce: proof.nonce ? `${proof.nonce.slice(0, 10)}…` : undefined,
-    from: proof.from ? `${proof.from.slice(0, 6)}…${proof.from.slice(-4)}` : undefined,
-  })}`);
-}
-
-function logL402(urlPath: string, paymentHash: string, result: VerificationStatus, detail?: string) {
-  console.log(`[mdf:payment:l402] ${JSON.stringify({
-    ts: new Date().toISOString(),
-    path: urlPath,
-    status: result,
-    payment_hash: paymentHash,
-    detail,
-  })}`);
-}
-
-// ---------------------------------------------------------------------------
-// x402 facilitator client
-// ---------------------------------------------------------------------------
-//
-// All x402 verification and settlement is delegated to a standard facilitator's
-// /verify and /settle endpoints. One base URL, one HTTP client — no client-side
-// failover logic (Caddy fronts the facilitator pool).
-
-export interface FacilitatorChainInfo {
-  /** x402 network name for this MDF chain, e.g. "base-sepolia". */
-  network: string;
-  /** Numeric EVM chain id, e.g. "84532". */
-  chainId: string;
-  /** ERC-20 asset (token contract) address. */
-  asset: string;
-  /** Token decimals. */
-  decimals: number;
-  /** Scheme-specific extra data, passed through opaquely. */
-  extra?: Record<string, unknown>;
-  /** Optional JSON-RPC URL for independent settlement confirmation. */
-  rpcUrl?: string;
-}
-
-function facilitatorUrl(base: string, path: string): string {
-  return `${base.replace(/\/+$/, "")}${path}`;
-}
-
-async function facilitatorPost(
-  config: FacilitatorConfig,
-  path: "/verify" | "/settle",
-  body: unknown
-): Promise<{ status: number; json: Record<string, unknown> | null; text: string }> {
-  const res = await fetch(facilitatorUrl(config.url, path), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(config.timeout_ms),
-  });
-  const text = await res.text();
-  let json: Record<string, unknown> | null = null;
-  try {
-    json = JSON.parse(text) as Record<string, unknown>;
-  } catch {
-    json = null;
-  }
-  return { status: res.status, json, text };
-}
-
-interface X402VerifyRequest {
-  x402Version: 1;
-  paymentPayload: unknown;
-  paymentRequirements: Record<string, unknown>;
-}
-
-/**
- * The `(from, nonce)` pair the facilitator's /verify accepted on this request.
- *
- * Carried from the successful verify into settlement so the on-chain
- * confirmation on the /settle-error path can only ever check the authorization
- * that passed /verify in the same request — never a value re-read from the
- * client, and never reachable when /verify did not return `valid`.
- */
-interface VerifiedAuthorization {
-  from: string;
-  nonce: string;
-}
-
-/**
- * Outcome of a facilitator /verify call, as three mutually exclusive cases:
- *
- *   - valid   — the facilitator accepted the payment payload. Carries the
- *               verified `(from, nonce)` so settlement is bound to it.
- *   - invalid — the facilitator returned a structured x402 verdict of
- *               `isValid:false` (used/cancelled nonce, expired, under-paid,
- *               wrong recipient/asset, bad signature). This is a payment
- *               denial and must surface as 402, NEVER as a 5xx.
- *   - error   — no structured verdict was available: the facilitator was
- *               unreachable or timed out, returned a non-200 without an
- *               `isValid:false` body, or returned something unparseable.
- *               This is a facilitator-side failure (existing outage
- *               behaviour, 503), not a statement about the payment.
- */
-type VerifyOutcome =
-  | { ok: true; payer?: string; authorization: VerifiedAuthorization }
-  | { ok: false; kind: "invalid"; reason: string }
-  | { ok: false; kind: "error"; reason: string };
-
-/** Extract the authorization `(from, nonce)` from an x402 payment envelope. */
-function authorizationFromPayload(payload: unknown): VerifiedAuthorization | null {
-  const auth = (payload as { payload?: { authorization?: { from?: unknown; nonce?: unknown } } })
-    ?.payload?.authorization;
-  if (auth && typeof auth.from === "string" && typeof auth.nonce === "string") {
-    return { from: auth.from, nonce: auth.nonce };
-  }
-  return null;
-}
-
-/**
- * Call the facilitator's /verify and classify the result.
- *
- * x402-rs does not use the HTTP status consistently for payment-validity
- * outcomes: a used nonce and an invalid signature arrive as HTTP 500, while an
- * expired or under-paid authorization arrives as HTTP 400 — but all four carry
- * a structured `{"isValid":false,"invalidReason":…}` body. Keying on that
- * protocol verdict (rather than the status code or the revert-string text) is
- * what lets a payment denial (→ 402) be told apart from a facilitator outage
- * (→ 503) when both can present as a 500.
- */
-async function facilitatorVerify(
-  request: X402VerifyRequest,
-  config: FacilitatorConfig
-): Promise<VerifyOutcome> {
-  const { status, json, text } = await facilitatorPost(config, "/verify", request);
-
-  // Structured payment-invalid verdict — authoritative regardless of HTTP
-  // status. This is what makes a used or expired nonce always 402, never 5xx.
-  if (json && json.isValid === false) {
-    const invalidReason = typeof json.invalidReason === "string" ? json.invalidReason : undefined;
-    const details =
-      typeof json.invalidReasonDetails === "string" ? json.invalidReasonDetails : undefined;
-    return {
-      ok: false,
-      kind: "invalid",
-      reason: `facilitator rejected payment: ${invalidReason ?? "unknown"}${details ? ` (${details})` : ""}`,
-    };
-  }
-
-  // No structured verdict → facilitator-side failure. Never treat this as a
-  // payment denial: an unreachable/broken facilitator must not tell a payer
-  // their (possibly valid) payment was rejected.
-  if (status !== 200) {
-    return {
-      ok: false,
-      kind: "error",
-      reason: `facilitator /verify HTTP ${status}: ${text.slice(0, 200)}`,
-    };
-  }
-  if (!json || json.isValid !== true) {
-    return {
-      ok: false,
-      kind: "error",
-      reason: `facilitator /verify returned an unrecognised response: ${text.slice(0, 200)}`,
-    };
-  }
-  // /verify accepted the payment. Capture the exact authorization it saw so
-  // settlement (and any on-chain confirmation on a /settle error) is bound to
-  // it by construction.
-  const authorization = authorizationFromPayload(request.paymentPayload);
-  if (!authorization) {
-    return {
-      ok: false,
-      kind: "error",
-      reason: "facilitator /verify accepted a payload carrying no authorization",
-    };
-  }
-  return {
-    ok: true,
-    payer: typeof json.payer === "string" ? json.payer : undefined,
-    authorization,
-  };
-}
-
-interface SettleOutcome {
-  settled: boolean;
-  payer?: string;
-  transaction?: string;
-  reason?: string;
-}
-
-/**
- * Call the facilitator's /settle, and on any non-success result confirm on-chain
- * before concluding the payment failed.
- *
- * The facilitator can return HTTP 500 for a settlement that actually executed
- * (confirmed Phase 1 behaviour). Treating that as "payment not received" would
- * either double-charge on client retry or deny access after a real payment.
- *
- * `verified` is the authorization /verify accepted **in this same request**. It
- * is passed in rather than re-derived from the client so the on-chain
- * confirmation can only ever check that exact `(from, nonce)`, and this
- * function is only reachable from the `verify.ok` branch of `verifyPayment`.
- */
-async function facilitatorSettle(
-  request: X402VerifyRequest,
-  config: FacilitatorConfig,
-  chain: FacilitatorChainInfo,
-  verified: VerifiedAuthorization
-): Promise<SettleOutcome> {
-  let json: Record<string, unknown> | null = null;
-  let status = 0;
-  let text = "";
-  try {
-    const res = await facilitatorPost(config, "/settle", request);
-    status = res.status;
-    json = res.json;
-    text = res.text;
-  } catch (err) {
-    text = (err as Error).message;
-  }
-
-  if (status === 200 && json?.success === true) {
-    return {
-      settled: true,
-      payer: typeof json.payer === "string" ? json.payer : undefined,
-      transaction: typeof json.transaction === "string" ? json.transaction : undefined,
-    };
-  }
-
-  const facilitReason =
-    typeof json?.errorMessage === "string"
-      ? json.errorMessage
-      : typeof json?.errorReason === "string"
-        ? json.errorReason
-        : text || "unknown";
-
-  console.warn(
-    `[mdf:payment:x402] /settle did not return success (HTTP ${status}): ${facilitReason} — checking on-chain state`
-  );
-
-  const txHash =
-    typeof json?.transaction === "string" && json.transaction.length > 0
-      ? json.transaction
-      : undefined;
-
-  const onchain = await confirmSettlementOnChain(chain, {
-    txHash,
-    from: verified.from,
-    nonce: verified.nonce,
-  });
-
-  // On-chain confirmation of this exact authorization is the only way a
-  // /settle error can be recovered. Anything else is a facilitator-side
-  // failure, surfaced as 503 by the caller — never as a payment rejection,
-  // because /verify already accepted this payment in this request.
-  if (onchain === "settled") {
-    return { settled: true, payer: verified.from, transaction: txHash };
-  }
-  return {
-    settled: false,
-    reason: `facilitator /settle failed: ${facilitReason}`,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// On-chain settlement confirmation
-// ---------------------------------------------------------------------------
-
-// authorizationState(address,bytes32) — EIP-3009, returns whether a nonce was used.
-const AUTHORIZATION_STATE_SELECTOR = "0xe94a0102";
-
-function leftPad32(hexNo0x: string): string {
-  return hexNo0x.padStart(64, "0").slice(-64);
-}
-
-async function rpcCall(
-  rpcUrl: string,
-  method: string,
-  params: unknown[],
-  timeoutMs: number
-): Promise<unknown> {
-  const res = await fetch(rpcUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const body = (await res.json()) as { result?: unknown; error?: { message?: string } };
-  if (body.error) throw new Error(body.error.message ?? "RPC error");
-  return body.result;
-}
-
-/**
- * Confirm whether a specific EIP-3009 authorization was consumed on-chain.
- *
- * Order of evidence:
- *   1. If a tx hash was returned, fetch its receipt: status 0x1 → settled,
- *      status 0x0 → reverted (not settled).
- *   2. Otherwise call the token's `authorizationState(from, nonce)`. Once a
- *      transferWithAuthorization executes this flips — and stays — true, giving
- *      a definitive per-payment signal independent of the facilitator.
- *
- * Returns "unknown" when no RPC is configured or unreachable, so the caller
- * never mistakes an infrastructure failure for a payment denial.
- */
-async function confirmSettlementOnChain(
-  chain: FacilitatorChainInfo,
-  params: { txHash?: string; from: string; nonce: string }
-): Promise<"settled" | "not_settled" | "unknown"> {
-  if (!chain.rpcUrl) return "unknown";
-  const timeoutMs = 8000;
-
-  try {
-    if (params.txHash) {
-      const receipt = (await rpcCall(
-        chain.rpcUrl,
-        "eth_getTransactionReceipt",
-        [params.txHash],
-        timeoutMs
-      )) as { status?: string } | null;
-      if (receipt) {
-        return receipt.status === "0x1" ? "settled" : "not_settled";
-      }
-      // Receipt not found — tx may still be pending; fall through to nonce check.
-    }
-
-    const data =
-      AUTHORIZATION_STATE_SELECTOR +
-      leftPad32(params.from.replace(/^0x/, "")) +
-      leftPad32(params.nonce.replace(/^0x/, ""));
-
-    const result = (await rpcCall(
-      chain.rpcUrl,
-      "eth_call",
-      [{ to: chain.asset, data }, "latest"],
-      timeoutMs
-    )) as string | undefined;
-
-    if (typeof result === "string" && result.length >= 3) {
-      return result.slice(-1) === "1" ? "settled" : "not_settled";
-    }
-    return "not_settled";
-  } catch (err) {
-    console.warn(
-      `[mdf:payment:x402] on-chain settlement check failed: ${(err as Error).message}`
-    );
-    return "unknown";
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Lightning circuit breaker registry
-// ---------------------------------------------------------------------------
-//
-// One breaker per loaded config (i.e. per process). State is in-memory: after a
-// restart the breaker starts closed and rediscovers a persisting fault on the
-// first attempt. `__resetLightningBreakersForTests` exists so a test process
-// can isolate cases that share the module-level registry.
-
-let lightningBreakers = new WeakMap<LoadedConfig, LightningBreaker>();
-const activeLightningBreakers = new Set<LightningBreaker>();
-
-function lightningLogSink(entry: Record<string, unknown>): void {
-  // Structured, one JSON record, no secrets (the message is pre-sanitised).
-  console.error(`[mdf:payment:l402] ${JSON.stringify({ ts: new Date().toISOString(), ...entry })}`);
-}
-
-function buildLightningProbe(loaded: LoadedConfig) {
-  return async (state: BreakerProbeState): Promise<LightningFailure | null> => {
-    const lightning = loaded.config.lightning;
-    if (!lightning) return null;
-    const { api_url } = lightning;
-    const apiToken = lightning.api_token ?? "";
-    const secrets = [apiToken, lightning.token_secret ?? ""];
-
-    // Cheap, non-polluting: an authenticated read. Recovers the classic
-    // transient case (unreachable) and the token case (auth) without creating
-    // an invoice.
-    const reachability = await albyReachabilityProbe(api_url, apiToken, secrets);
-    if (reachability) return reachability;
-    if (state.category === "unreachable" || state.category === "auth") return null;
-
-    // `rejected` / `unknown`: reachability cannot prove invoice *creation*
-    // works again, so confirm with one real minimal attempt. This runs only
-    // while the breaker is open (bounded by the backoff cap), so it adds at
-    // most one 1-sat throwaway invoice per probe interval — never on the
-    // request path.
-    try {
-      await albyCreateInvoice(1000, "MDF invoice probe", 60, api_url, apiToken, secrets);
-      return null;
-    } catch (err) {
-      return failureFromError(err, secrets);
-    }
-  };
-}
-
-function getLightningBreaker(loaded: LoadedConfig): LightningBreaker {
-  const existing = lightningBreakers.get(loaded);
-  if (existing) return existing;
-
-  const lightning = loaded.config.lightning;
-  const breaker = new LightningBreaker({
-    initialBackoffMs: (lightning?.breaker_initial_backoff_seconds ?? 5) * 1000,
-    maxBackoffMs: (lightning?.breaker_max_backoff_seconds ?? 300) * 1000,
-    probe: buildLightningProbe(loaded),
-    log: lightningLogSink,
-  });
-  lightningBreakers.set(loaded, breaker);
-  activeLightningBreakers.add(breaker);
-  return breaker;
-}
-
-/** Coarse lightning health for /health, or null when lightning is not configured. */
-export function lightningHealth(loaded: LoadedConfig): BreakerSnapshot | null {
-  if (!loaded.config.lightning) return null;
-  return getLightningBreaker(loaded).snapshot();
-}
-
-/** Seconds until the breaker's next probe, or null when healthy. */
-export function lightningRetryAfterSeconds(loaded: LoadedConfig): number | null {
-  if (!loaded.config.lightning) return null;
-  return getLightningBreaker(loaded).retryAfterSeconds();
-}
-
-/** Clear all breaker timers (graceful shutdown). */
-export function shutdownLightningBreakers(): void {
-  for (const breaker of activeLightningBreakers) breaker.stop();
-  activeLightningBreakers.clear();
-}
-
-/** Test-only: drop all breaker state so cases do not leak into each other. */
-export function __resetLightningBreakersForTests(): void {
-  shutdownLightningBreakers();
-  lightningBreakers = new WeakMap();
-}
-
-// ---------------------------------------------------------------------------
-// L402 invoice creation (called when building the 402 response)
-// ---------------------------------------------------------------------------
-
-/**
- * Outcome of an L402 challenge attempt. On failure the typed `failure` carries
- * a category, the upstream status (if any) and a sanitised message — never a
- * bare `null`, so the caller can stop advertising an unfulfillable rail and
- * surface a machine-readable reason.
- */
-export type L402ChallengeOutcome =
-  | { ok: true; wwwAuthenticate: string; paymentHash: string }
-  | { ok: false; failure: LightningFailure; suppressed: boolean };
-
-/**
- * Create a Lightning invoice and a macaroon bound to its payment hash.
- * Returns the WWW-Authenticate header value for the 402 response.
- *
- * Called from build402Response when the request path's offer is on the
- * lightning rail and lightning credentials are configured.
- */
-export async function createL402Challenge(
-  urlPath: string,
-  loaded: LoadedConfig
-): Promise<L402ChallengeOutcome> {
-  const { config } = loaded;
-
-  if (!config.lightning) {
-    return {
-      ok: false,
-      suppressed: false,
-      failure: {
-        category: "unknown",
-        upstreamStatus: null,
-        upstreamMessage: "lightning not configured",
-      },
-    };
-  }
-
-  const breaker = getLightningBreaker(loaded);
-
-  // While the breaker is open, do not call the backend on every request and do
-  // not log every suppressed attempt — the open/reminder/recovery lines come
-  // from the breaker itself.
-  if (breaker.isOpen()) {
-    return { ok: false, suppressed: true, failure: breaker.lastFailure() };
-  }
-
-  const { api_url, invoice_expiry_seconds } = config.lightning;
-  // loader.ts resolves (and requires) both whenever [lightning] is configured;
-  // the schema fields are optional so the resolution lives in exactly one place.
-  const api_token = config.lightning.api_token!;
-  const token_secret = config.lightning.token_secret!;
-  const priceEntry = requiredPriceEntry(urlPath, config);
-  const secrets = [api_token, token_secret];
-
-  // Alby Hub invoices in millisatoshis and requires a whole number of
-  // satoshis. `priceToSats` yields the (possibly fractional) satoshi value for
-  // the advertised price by currency; `satsToMsat` rounds it up to a whole
-  // satoshi and converts to msat, so the invoice matches the advertised amount
-  // and is never under-charged.
-  let amountMsat: number;
-  try {
-    amountMsat = satsToMsat(priceToSats(priceEntry.amount, priceEntry.currency));
-  } catch (err) {
-    // The loader rejects unsupported lightning currencies at startup, so this
-    // is defence in depth: fail closed without opening the breaker.
-    return {
-      ok: false,
-      suppressed: false,
-      failure: {
-        category: "rejected",
-        upstreamStatus: null,
-        upstreamMessage: sanitizeUpstreamMessage((err as Error).message),
-      },
-    };
-  }
-  const expiry = invoice_expiry_seconds ?? 300;
-
-  let invoice: AlbyInvoice;
-  try {
-    invoice = await albyCreateInvoice(
-      amountMsat,
-      `MDF access: ${urlPath}`,
-      expiry,
-      api_url,
-      api_token,
-      secrets
-    );
-  } catch (err) {
-    const failure = failureFromError(err, secrets);
-    breaker.recordFailure(failure, { path: urlPath });
-    return { ok: false, suppressed: false, failure };
-  }
-
-  const macaroon = createMacaroon(
-    invoice.paymentHash,
-    pathScope(urlPath),
-    expiry,
-    token_secret
-  );
-
-  const wwwAuthenticate =
-    `L402 macaroon="${macaroon}", invoice="${invoice.invoice}"`;
-
-  logL402(urlPath, invoice.paymentHash, "no_proof", "invoice issued");
-
-  return { ok: true, wwwAuthenticate, paymentHash: invoice.paymentHash };
-}
-
-// ---------------------------------------------------------------------------
-// L402 proof verification
-// ---------------------------------------------------------------------------
-
-/**
- * Verify an L402 credential (macaroon + preimage) for a given path.
- *
- * Verification steps:
- *   1. Parse the Authorization header — must be "L402 <macaroon>:<preimage>"
- *   2. Verify HMAC signature on the macaroon (timing-safe)
- *   3. Check macaroon expiry
- *   4. Check path scope — the macaroon must be scoped to a prefix of urlPath
- *   5. Hash the preimage with SHA-256 — must equal the payment_hash in the macaroon
- *   6. Confirm invoice settlement with Alby Hub (the authoritative check)
- *
- * Steps 2–5 are local and cheap. Step 6 is the network call to Alby Hub.
- * We do local checks first to avoid unnecessary API calls on malformed tokens.
- */
-export async function verifyL402(
-  urlPath: string,
-  authHeader: string,
-  loaded: LoadedConfig
-): Promise<VerificationResult> {
-  const { config } = loaded;
-  const requiresToken = pathRequiresToken(urlPath, config);
-
-  const credential = parseL402Header(authHeader);
-  if (!credential) {
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: null,
-      reason: "malformed L402 Authorization header",
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  if (!config.lightning) {
-    // Lightning is not configured, so an L402 credential cannot be verified.
-    // Fail closed: the former stub approved the request on a structural check
-    // alone, which served a lightning-priced route to any well-formed-looking
-    // L402 header. The loader now refuses to start a config with a
-    // lightning-priced route but no [lightning] block, so this path is only
-    // reachable for a free/x402 route carrying an L402 header.
-    logL402(urlPath, "(unknown)", "rejected", "lightning not configured");
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: credential,
-      reason: "lightning rail is not configured — L402 cannot be verified",
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  const { api_url } = config.lightning;
-  const api_token = config.lightning.api_token!;
-  const token_secret = config.lightning.token_secret!;
-
-  // Step 2+3: Verify and decode macaroon
-  let payload: MacaroonPayload;
-  try {
-    payload = verifyMacaroon(credential.macaroon, token_secret);
-  } catch (err) {
-    logL402(urlPath, "(invalid)", "rejected", (err as Error).message);
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: credential,
-      reason: `macaroon invalid: ${(err as Error).message}`,
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  // Step 4: Path scope check (segment boundary, not a bare string prefix)
-  if (!pathInScope(urlPath, payload.path_scope)) {
-    logL402(urlPath, payload.payment_hash, "rejected", `scope mismatch: ${payload.path_scope}`);
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: credential,
-      reason: `macaroon scoped to '${payload.path_scope}', not valid for '${urlPath}'`,
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  // Step 5: Preimage hash check
-  const preimageHash = createHash("sha256")
-    .update(Buffer.from(credential.preimage, "hex"))
-    .digest("hex");
-
-  const expectedHash = Buffer.from(payload.payment_hash, "hex");
-  const actualHash   = Buffer.from(preimageHash, "hex");
-
-  if (
-    expectedHash.length !== actualHash.length ||
-    !timingSafeEqual(expectedHash, actualHash)
-  ) {
-    logL402(urlPath, payload.payment_hash, "rejected", "preimage hash mismatch");
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: credential,
-      reason: "preimage does not hash to declared payment_hash",
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  // Step 6: Confirm settlement with Alby Hub
-  let invoiceStatus: AlbyInvoiceStatus;
-  try {
-    invoiceStatus = await albyGetInvoice(payload.payment_hash, api_url, api_token);
-  } catch (err) {
-    // Alby Hub unreachable — log and reject rather than fail open
-    console.error(`[mdf:payment:l402] Alby Hub lookup failed: ${(err as Error).message}`);
-    logL402(urlPath, payload.payment_hash, "rejected", "alby hub unreachable");
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: credential,
-      reason: "could not verify invoice settlement: Alby Hub unreachable",
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  if (invoiceStatus.state !== "settled") {
-    logL402(urlPath, payload.payment_hash, "rejected", "invoice not settled");
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: credential,
-      reason: "Lightning invoice not yet settled",
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  // Verify the preimage Alby Hub recorded matches what the agent submitted
-  // (belt-and-braces: the hash check above already confirms this, but an
-  // explicit match against the settled record is worth having in the log).
-  // Constant-time: this is a preimage comparison.
-  if (invoiceStatus.preimage && !hexEqual(invoiceStatus.preimage, credential.preimage)) {
-    logL402(urlPath, payload.payment_hash, "rejected", "preimage mismatch vs alby record");
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: credential,
-      reason: "submitted preimage does not match settled invoice record",
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  logL402(urlPath, payload.payment_hash, "approved");
-  return {
-    status: "approved",
-    proof: null,
-    l402Credential: credential,
-    reason: "L402: Lightning invoice settled and preimage verified",
-    requiresToken,
-    rail: "l402",
-  };
-}
-
-// ---------------------------------------------------------------------------
-// x402 chain registry and verifier
-// ---------------------------------------------------------------------------
-
-const CHAIN_ID_MAP: Record<string, string> = {
-  base: "8453",
-  base_sepolia: "84532",
-  ethereum: "1",
-};
-
-/**
- * x402 V1 network names. x402-rs resolves these to CAIP-2 chain ids; only
- * networks listed here can be offered on the x402 rail.
- */
-const X402_NETWORK_MAP: Record<string, string> = {
-  base: "base",
-  base_sepolia: "base-sepolia",
-};
-
-function isLightningChain(chain: string | null | undefined): boolean {
-  return chain?.toLowerCase() === "lightning";
-}
-
-/**
- * Resolve the facilitator-side metadata for an MDF chain, or null when the
- * chain is not an x402 chain / has no configured asset.
- */
-export function x402ChainInfo(
-  chain: string | null | undefined,
-  facilitatorConfig: FacilitatorConfig | null
-): FacilitatorChainInfo | null {
-  if (!chain || !facilitatorConfig) return null;
-  const key = chain.toLowerCase();
-  const network = X402_NETWORK_MAP[key];
-  const chainId = CHAIN_ID_MAP[key];
-  const chainCfg = facilitatorConfig.chains[key];
-  if (!network || !chainId || !chainCfg) return null;
-  return {
-    network,
-    chainId,
-    asset: chainCfg.asset,
-    decimals: chainCfg.decimals,
-    extra: chainCfg.extra,
-    rpcUrl: chainCfg.rpc_url,
+    entry,
+    free: isFreeEntry(entry),
+    tokenAccess: isTokenEntry(entry),
+    tokenScope: tokenScopeForPath(urlPath),
   };
 }
 
 /**
- * Build the standard x402 V1 `PaymentRequirements` for an offer. Field names
- * are camelCase per the x402 wire format (MDF's own 402 body uses snake_case).
+ * Build the offer for a 402. Returns the offers plus the `PaymentRequired`
+ * document, so the caller renders body and header from one object.
  */
-function buildPaymentRequirements(
-  offer: { amount: string },
-  resource: string,
+export async function buildOfferFor(
   loaded: LoadedConfig,
-  chainInfo: FacilitatorChainInfo,
-  config: FacilitatorConfig
-): Record<string, unknown> {
-  const requirements: Record<string, unknown> = {
-    scheme: config.scheme,
-    network: chainInfo.network,
-    maxAmountRequired: toAtomicUnits(offer.amount, chainInfo.decimals),
-    resource,
-    description: `MDF access: ${resource}`,
-    mimeType: "text/markdown",
-    payTo: loaded.walletAddress ?? "",
-    maxTimeoutSeconds: config.max_timeout_seconds,
-    asset: chainInfo.asset,
-  };
-  if (chainInfo.extra) requirements.extra = chainInfo.extra;
-  return requirements;
-}
+  request: RequestContext,
+  options: { error?: CoarseError; startedAtMs: number; mimeType?: string } = { startedAtMs: Date.now() }
+): Promise<{ offer: Offer; doc: PaymentRequiredDoc }> {
+  const { entry, tokenAccess } = entryFor(loaded, request.urlPath);
 
-/**
- * Map a settlement network to the payment rail that would handle it.
- *
- * This mirrors the branch that selects the verifier: `lightning` is served by
- * the L402 flow (invoice + macaroon), while chains in CHAIN_ID_MAP (base,
- * base_sepolia, ethereum) are served by the x402 flow. Any chain with no known
- * rail returns null so the caller can omit the field rather than assert a
- * mapping that may not hold.
- */
-function railForChain(chain: string | null | undefined): "x402" | "l402" | null {
-  const c = chain?.toLowerCase();
-  if (c === "lightning") return "l402";
-  if (c && CHAIN_ID_MAP[c]) return "x402";
-  return null;
-}
-
-/**
- * Verify and settle an x402 payment for a request.
- *
- * The client submits a standard base64 `PaymentPayload` in the `X-PAYMENT`
- * header. The server builds `PaymentRequirements` from the offer it issued and
- * calls the facilitator's `/verify` then `/settle`.
- *
- * A `/verify` that rejects the payment (structured `isValid:false`) returns
- * 402 — the server never approves on the strength of a prior on-chain
- * settlement (#52). Approval requires a successful `/settle` in this request;
- * the one exception is a `/settle` error independently confirmed on-chain for
- * the same authorization (the Phase-1 lost-response recovery). A `/verify`
- * with no structured verdict (unreachable, timeout, malformed) is a
- * facilitator failure, surfaced as 503 by the router.
- */
-export async function verifyPayment(
-  urlPath: string,
-  paymentHeader: string | null | undefined,
-  loaded: LoadedConfig
-): Promise<VerificationResult> {
-  const { config, facilitatorConfig } = loaded;
-  const requiresToken = pathRequiresToken(urlPath, config);
-  const priceEntry = requiredPriceEntry(urlPath, config);
-  const required = priceEntry.amount;
-
-  // Free content
-  if (parseFloat(required) === 0) {
-    return {
-      status: "approved",
-      proof: null,
-      l402Credential: null,
-      reason: "free access",
-      requiresToken: false,
-      rail: "none",
-    };
-  }
-
-  // No proof supplied
-  if (!paymentHeader || paymentHeader.trim().length === 0) {
-    return {
-      status: "no_proof",
-      proof: null,
-      l402Credential: null,
-      reason: `payment required: ${required} ${priceEntry.currency ?? config.pricing.default.currency ?? ""}`.trim(),
-      requiresToken,
-      rail: "none",
-    };
-  }
-
-  // Lightning prices are served by the L402 flow, not x402. Reaching this
-  // function at all means the request did not carry an `Authorization: L402`
-  // credential (the router routes those to verifyL402), so a request that got
-  // here with an X-PAYMENT header is attempting x402 against a Lightning offer.
-  // That is not a verification the x402 rail can perform, so it must be
-  // rejected — never approved. Approving it (the former stub_approved) let any
-  // non-empty X-PAYMENT header win a paid 200 (and a conditional 304) without
-  // payment, and would also have let a shared cache store that paid body.
-  if (isLightningChain(priceEntry.chain)) {
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: null,
-      reason: "lightning offer — pay via the L402 flow (Authorization: L402), not X-PAYMENT",
-      requiresToken,
-      rail: "l402",
-    };
-  }
-
-  const proof = parseX402PaymentHeader(paymentHeader.trim());
-  if (!proof) {
-    return {
-      status: "rejected",
-      proof: null,
-      l402Credential: null,
-      reason: "malformed X-PAYMENT header (expected base64 x402 PaymentPayload)",
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  if (!facilitatorConfig) {
-    return {
-      status: "error",
-      proof,
-      l402Credential: null,
-      reason: "x402 pricing configured but no [facilitator] block is available",
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  const chainInfo = x402ChainInfo(priceEntry.chain, facilitatorConfig);
-  if (!chainInfo) {
-    return {
-      status: "error",
-      proof,
-      l402Credential: null,
-      reason: `no facilitator chain config for '${priceEntry.chain ?? "unspecified"}'`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  if (proof.scheme !== facilitatorConfig.scheme) {
-    logX402(urlPath, proof, "rejected");
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: `scheme '${proof.scheme}' not accepted (expected '${facilitatorConfig.scheme}')`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  if (proof.network.toLowerCase() !== chainInfo.network.toLowerCase()) {
-    logX402(urlPath, proof, "rejected");
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: `network '${proof.network}' does not match offer '${chainInfo.network}'`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  if (proof.to.toLowerCase() !== (loaded.walletAddress ?? "").toLowerCase()) {
-    logX402(urlPath, proof, "rejected");
-    return {
-      status: "rejected",
-      proof,
-      l402Credential: null,
-      reason: "payment recipient does not match offer pay_to",
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  const resource = `${config.site.url.replace(/\/$/, "")}${urlPath}`;
-  const requirements = buildPaymentRequirements(
-    priceEntry,
-    resource,
-    loaded,
-    chainInfo,
-    facilitatorConfig
-  );
-  const request: X402VerifyRequest = {
-    x402Version: 1,
-    paymentPayload: proof.envelope ?? {},
-    paymentRequirements: requirements,
-  };
-
-  let verify: VerifyOutcome;
-  try {
-    verify = await facilitatorVerify(request, facilitatorConfig);
-  } catch (err) {
-    logX402(urlPath, proof, "error");
-    return {
-      status: "error",
-      proof,
-      l402Credential: null,
-      reason: `facilitator /verify unreachable: ${(err as Error).message}`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  if (!verify.ok) {
-    if (verify.kind === "invalid") {
-      // The facilitator rejected the payment: a used or cancelled nonce, an
-      // expired authorization, an under-payment, the wrong recipient or asset,
-      // or a bad signature. Return 402 with a fresh offer — and never approve
-      // on the strength of a prior on-chain settlement. Doing the latter (#52)
-      // let anyone rebuild an X-PAYMENT from public transferWithAuthorization
-      // calldata and replay it forever. Approval now requires a successful
-      // /settle in this same request, or (on a /settle error only) on-chain
-      // confirmation of the exact authorization /verify accepted here.
-      logX402(urlPath, proof, "rejected");
-      return {
-        status: "rejected",
-        proof,
-        l402Credential: null,
-        reason: verify.reason,
-        requiresToken,
-        rail: "x402",
-      };
-    }
-    // Facilitator-side failure (unreachable, timeout, or an unrecognised
-    // response) — not a payment denial. Existing outage behaviour: 503.
-    logX402(urlPath, proof, "error");
-    return {
-      status: "error",
-      proof,
-      l402Credential: null,
-      reason: verify.reason,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  let settle: SettleOutcome;
-  try {
-    // Only reachable after /verify returned valid above, and bound to the
-    // exact authorization /verify accepted (verify.authorization).
-    settle = await facilitatorSettle(request, facilitatorConfig, chainInfo, verify.authorization);
-  } catch (err) {
-    logX402(urlPath, proof, "error");
-    return {
-      status: "error",
-      proof,
-      l402Credential: null,
-      reason: `facilitator /settle unreachable: ${(err as Error).message}`,
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  if (!settle.settled) {
-    // A /settle that errored and was not recovered on-chain is a
-    // facilitator-side failure, not a payment denial — /verify already
-    // accepted this payment. Surface 503 (existing outage behaviour).
-    logX402(urlPath, proof, "error");
-    return {
-      status: "error",
-      proof,
-      l402Credential: null,
-      reason: settle.reason ?? "settlement failed",
-      requiresToken,
-      rail: "x402",
-    };
-  }
-
-  logX402(urlPath, proof, "approved");
-  return {
-    status: "approved",
-    proof,
-    l402Credential: null,
-    reason: "x402: payment verified and settled via facilitator",
-    requiresToken,
-    rail: "x402",
-    settlement: {
-      payer: settle.payer ?? proof.from,
-      transaction: settle.transaction ?? "",
+  const offer = await buildOffers({
+    entry,
+    ctx: ctx(loaded),
+    binding: {
+      method: request.method,
+      url: request.resourceUrl,
+      headers: request.headers,
+      boundHeaders: ["accept"],
     },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// 402 response builder
-// ---------------------------------------------------------------------------
-
-export interface PaymentResponse {
-  status: 402 | 503;
-  headers: Record<string, string>;
-  body: string;
-}
-
-/**
- * Build the HTTP 402 response body and headers.
- *
- * An L402 challenge/invoice is attached **only when the route's own offer is on
- * the lightning rail** — an x402 offer must not advertise a rail it cannot
- * fulfil (and an unconditional attach burned an Alby invoice per 402). This is
- * a deliberate single-rail-per-route position for the demo; offering every
- * configured rail for every priced resource is a separate design item
- * (Vikunja #47) and is not built here.
- *
- * While the lightning rail is degraded (invoice creation failing), the rail is
- * not advertised: a lightning-only route returns 503 with `Retry-After` (there
- * is no other rail to pay), and `payment.lightning_unavailable` + the coarse
- * category is surfaced. The upstream message is never placed in a public body.
- *
- * For x402 paths: emits the MDF 0.2.0 superset fields (pay_to, asset, scheme,
- * max_timeout_seconds, extra) alongside the original MDF fields.
- */
-export async function build402Response(
-  urlPath: string,
-  result: VerificationResult,
-  loaded: LoadedConfig,
-  resourceUrl?: string
-): Promise<PaymentResponse> {
-  const { config } = loaded;
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json; charset=utf-8",
-    "X-MDF-Version": "1",
-    // A 402 is a per-request payment offer: an L402 invoice must be unique per
-    // request, and an x402 offer carries request-bound payment parameters.
-    // `no-store` is the explicit guard against any shared cache storing and
-    // replaying an offer to a second agent. A 402 is not heuristically
-    // cacheable, so `no-store` is hardening rather than a live fault fix — but
-    // it is set here, in the one builder every 402/503 payment response
-    // (content paths and /mdf/pay, x402 and L402) passes through, so a new
-    // route cannot forget it.
-    "Cache-Control": "no-store",
-  };
-
-  const priceEntry = requiredPriceEntry(urlPath, config);
-
-  // Absolute URL of the priced resource, reconstructed from the request. The
-  // caller passes the full URL (query string included) where available; the
-  // fallback covers path-only callers.
-  const resource =
-    resourceUrl ?? `${config.site.url.replace(/\/$/, "")}${urlPath}`;
-
-  // The rail for this offer, derived from the same chain->rail mapping that
-  // selects the verifier at payment time.
-  const offerRail = railForChain(priceEntry.chain);
-
-  // Only a lightning offer gets an L402 challenge. When creation fails, the
-  // breaker is (or has been) opened by createL402Challenge; remember the coarse
-  // category for the degraded body. No upstream message is retained for output.
-  let l402Challenge: { wwwAuthenticate: string; paymentHash: string } | null = null;
-  let lightningDegraded = false;
-  let degradedCategory: LightningFailureCategory | null = null;
-  if (offerRail === "l402" && config.lightning) {
-    const outcome = await createL402Challenge(urlPath, loaded);
-    if (outcome.ok) {
-      l402Challenge = { wwwAuthenticate: outcome.wwwAuthenticate, paymentHash: outcome.paymentHash };
-      headers["WWW-Authenticate"] = outcome.wwwAuthenticate;
-    } else {
-      lightningDegraded = true;
-      degradedCategory = outcome.failure.category;
-    }
-  }
-
-  // A lightning-only offer whose rail is degraded has nothing payable to
-  // advertise. Returning a 402 with no invoice would be the exact unpayable
-  // offer this change exists to remove, so return 503 + Retry-After instead:
-  // the correct semantic for a temporarily unavailable service, and it lets a
-  // client retry on the breaker's own schedule.
-  if (offerRail === "l402" && lightningDegraded) {
-    const retryAfter = lightningRetryAfterSeconds(loaded);
-    if (retryAfter !== null) headers["Retry-After"] = String(retryAfter);
-    const body = JSON.stringify({
-      error: "Lightning temporarily unavailable",
-      reason: "the lightning rail cannot currently issue an invoice; retry later",
-      resource,
-      payment: {
-        endpoint: config.payment?.endpoint
-          ? resolveEndpoint(config.payment.endpoint, config.site.url)
-          : null,
-        amount: priceEntry.amount,
-        currency: priceEntry.currency ?? config.pricing.default.currency,
-        chain: priceEntry.chain ?? null,
-        // Schema-legal (`payment` is additionalProperties: true) and reserved
-        // for the multi-rail case (#47); coarse category only, never the
-        // upstream message.
-        lightning_unavailable: true,
-        lightning_unavailable_category: degradedCategory,
-      },
-    }, null, 2);
-    return { status: 503, headers, body };
-  }
-
-  // x402 superset fields (MDF 0.2.0) — required when this offer is on the
-  // x402 rail, so the 402 body is directly usable as x402 PaymentRequirements
-  // without a translation layer. expires_at shares the offer's validity
-  // window with max_timeout_seconds rather than tracking a second lifetime.
-  const chainInfo =
-    offerRail === "x402" ? x402ChainInfo(priceEntry.chain, loaded.facilitatorConfig) : null;
-
-  let x402Fields: Record<string, unknown> = {};
-  let offerExpiresAt: string | undefined;
-  if (offerRail === "x402" && config.facilitator) {
-    x402Fields = {
-      ...(loaded.walletAddress ? { pay_to: loaded.walletAddress } : {}),
-      ...(chainInfo ? { asset: chainInfo.asset } : {}),
-      scheme: config.facilitator.scheme,
-      max_timeout_seconds: config.facilitator.max_timeout_seconds,
-      ...(chainInfo?.extra ? { extra: chainInfo.extra } : {}),
-    };
-    offerExpiresAt = new Date(
-      Date.now() + config.facilitator.max_timeout_seconds * 1000
-    ).toISOString();
-  }
-
-  // source_bytes — the byte length of this resource's rendered-HTML
-  // representation (the alternative an agent would otherwise fetch), computed
-  // the same way serveContent renders it. A 402 can be reached for a URL with
-  // no content file, so omit the field rather than erroring.
-  const sourceBytes = htmlSourceBytesForPath(urlPath, loaded);
-
-  const body = JSON.stringify({
-    error: "Payment Required",
-    reason: result.reason,
-    resource,
-    ...(sourceBytes !== undefined ? { source_bytes: sourceBytes } : {}),
-    payment: {
-      endpoint: config.payment?.endpoint
-        ? resolveEndpoint(config.payment.endpoint, config.site.url)
-        : null,
-      amount: priceEntry.amount,
-      currency: priceEntry.currency ?? config.pricing.default.currency,
-      chain: priceEntry.chain ?? null,
-      // The lightning rail is only advertised if its challenge was issued. A
-      // degraded lightning rail (multi-rail #47 case) omits it and flags why.
-      ...(offerRail && !lightningDegraded ? { rail: offerRail } : {}),
-      accepted_chains: config.payment?.accepted_chains ?? [],
-      accepted_currencies: config.payment?.accepted_currencies ?? [],
-      ...x402Fields,
-      ...(offerExpiresAt ? { expires_at: offerExpiresAt } : {}),
-      ...(l402Challenge ? { lightning_invoice: headers["WWW-Authenticate"] } : {}),
-      ...(lightningDegraded
+    lnbtc:
+      loaded.lnbtc && entry.rails.some((rail) => rail.network.startsWith("lnbtc:"))
         ? {
-            lightning_unavailable: true,
-            lightning_unavailable_category: degradedCategory,
+            gate: loaded.lnbtc.gate,
+            limiter: loaded.lnbtc.limiter,
+            clientKey: request.clientKey,
+            mint: (params) =>
+              loaded.lnbtc!.client.makeInvoice({
+                amountMsat: params.amountMsat,
+                descriptionHash: params.descriptionHash,
+                expirySeconds: params.expirySeconds,
+              }),
           }
-        : {}),
-    },
-    ...(result.requiresToken && config.auth
-      ? {
-          auth: {
-            endpoint: resolveEndpoint(config.auth.endpoint, config.site.url),
-            token_ttl_seconds: config.auth.token_ttl_seconds,
-          },
-        }
+        : undefined,
+  });
+
+  const doc = buildPaymentRequired({
+    resourceUrl: request.resourceUrl,
+    serviceName: loaded.config.site.name,
+    mimeType: options.mimeType ?? "text/markdown",
+    accepts: offer.accepts,
+    error: options.error ?? "payment_required",
+    expiresAt: new Date(
+      Date.now() + loaded.config.payment.max_timeout_seconds * 1000
+    ).toISOString(),
+    sourceBytes: sourceBytesFor(loaded, request.urlPath),
+    ...(tokenAccess && loaded.config.auth
+      ? { authEndpoint: absoluteEndpoint(loaded, loaded.config.auth.endpoint) }
       : {}),
-  }, null, 2);
+  });
 
-  return { status: 402, headers, body };
+  return { offer, doc };
 }
 
-function resolveEndpoint(endpoint: string, siteUrl: string): string {
+function absoluteEndpoint(loaded: LoadedConfig, endpoint: string): string {
   if (endpoint.startsWith("https://")) return endpoint;
-  return `${siteUrl.replace(/\/$/, "")}${endpoint}`;
+  return `${loaded.config.site.url.replace(/\/$/, "")}${endpoint}`;
 }
+
+/** source_bytes is informational; absence must never fail a 402. */
+function sourceBytesFor(loaded: LoadedConfig, urlPath: string): number | undefined {
+  try {
+    return htmlSourceBytesForPath(urlPath, loaded);
+  } catch {
+    return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+export interface VerifyInput {
+  loaded: LoadedConfig;
+  request: RequestContext;
+  /** The `PAYMENT-SIGNATURE` header value, if any. */
+  paymentSignature: string | null;
+  /** Whether an `X-PAYMENT` header was also present (logging only). */
+  sawLegacyHeader?: boolean;
+}
+
+/**
+ * Verify and settle a payment for this request.
+ *
+ * `X-PAYMENT` is intentionally not read: the v2 hard cut means the old header
+ * buys nothing. Its presence is reported by the caller for the attempt log.
+ */
+export async function verifyPayment(input: VerifyInput): Promise<VerifyResult> {
+  const { loaded, request, paymentSignature } = input;
+  const { entry, free, tokenAccess } = entryFor(loaded, request.urlPath);
+
+  if (free) return { status: "approved" };
+
+  if (!paymentSignature) {
+    return { status: "no_payment", reason: "payment_required", ...(tokenAccess ? { issueToken: true } : {}) };
+  }
+
+  const decoded = decodeHeaderObject<Record<string, unknown>>(
+    paymentSignature,
+    MAX_PAYMENT_HEADER_CHARS
+  );
+  if (!decoded.ok) {
+    // Oversized, not base64 or not JSON: all one class to the client.
+    return { status: "rejected", reason: "invalid_payment" };
+  }
+  const payload = decoded.value;
+  if (payload.x402Version !== 2) {
+    // A v1 payload is not silently upgraded; the client must speak v2.
+    return { status: "rejected", reason: "invalid_payment" };
+  }
+
+  const accepted = payload.accepted as PaymentRequirement | undefined;
+  if (!accepted || typeof accepted.network !== "string") {
+    return { status: "rejected", reason: "invalid_payment" };
+  }
+
+  const rail = entry.rails.find((candidate) => matchesRail(candidate, accepted));
+  if (!rail) {
+    // The client paid for something we are not offering. Coarse class only, but
+    // split far enough to be actionable: a different network or asset is
+    // "unsupported", a different amount is "wrong_amount", and anything else
+    // (payee, scheme) is "wrong_recipient".
+    return { status: "rejected", reason: classifyRailMismatch(entry.rails, accepted) };
+  }
+
+  const railLabel = `${rail.scheme}/${rail.network}`;
+
+  if (rail.network.startsWith("lnbtc:")) {
+    return verifyLnbtc({ loaded, request, payload, accepted, rail, tokenAccess });
+  }
+  return verifyEip155({ loaded, request, payload, accepted, rail, tokenAccess });
+}
+
+/** The four fields that identify a rail, compared case-insensitively for hex. */
+export function matchesRail(rail: RailConfig, accepted: PaymentRequirement): boolean {
+  if (rail.scheme !== accepted.scheme) return false;
+  if (rail.network !== accepted.network) return false;
+  if (rail.amount !== accepted.amount) return false;
+  return rail.asset.toLowerCase() === String(accepted.asset).toLowerCase();
+}
+
+/**
+ * Why an `accepted` requirement matches no configured rail, in the coarse
+ * vocabulary. Every branch names a class the client can act on, and none echoes
+ * a facilitator message.
+ */
+export function classifyRailMismatch(
+  rails: readonly RailConfig[],
+  accepted: PaymentRequirement
+): CoarseError {
+  const sameNetwork = rails.filter((rail) => rail.network === accepted.network);
+  if (sameNetwork.length === 0) return "unsupported_rail";
+  if (!sameNetwork.some((rail) => String(accepted.asset).toLowerCase() === rail.asset.toLowerCase())) {
+    return "unsupported_rail";
+  }
+  if (!sameNetwork.some((rail) => rail.amount === accepted.amount)) return "wrong_amount";
+  return "wrong_recipient";
+}
+
+async function verifyEip155(args: {
+  loaded: LoadedConfig;
+  request: RequestContext;
+  payload: Record<string, unknown>;
+  accepted: PaymentRequirement;
+  rail: RailConfig;
+  tokenAccess: boolean;
+}): Promise<VerifyResult> {
+  const { loaded, request, payload, accepted, rail, tokenAccess } = args;
+  const pool = loaded.pool;
+  if (!pool) return { status: "error", reason: "payment_unavailable" };
+
+  if (accepted.payTo !== loaded.walletAddress) {
+    return { status: "rejected", reason: "wrong_recipient" };
+  }
+  if (accepted.maxTimeoutSeconds !== loaded.config.payment.max_timeout_seconds) {
+    return { status: "rejected", reason: "invalid_payment" };
+  }
+
+  const verifyRequest = {
+    x402Version: 2 as const,
+    paymentPayload: payload,
+    paymentRequirements: accepted,
+  };
+
+  const { outcome, leg } = await pool.verify(verifyRequest);
+  if (!outcome.ok) {
+    return outcome.kind === "invalid"
+      ? { status: "rejected", reason: coarseErrorClass(outcome.reason) }
+      : { status: "error", reason: "payment_unavailable" };
+  }
+
+  const settled = await pool.settle(leg, verifyRequest, {
+    network: rail.network,
+    asset: accepted.asset,
+    rpcUrl: loaded.config.facilitator?.rpc[rail.network],
+  }, outcome.authorization);
+
+  if (!settled.settled) return { status: "error", reason: "payment_unavailable" };
+
+  return {
+    status: "approved",
+    rail: `${rail.scheme}/${rail.network}`,
+    settlement: {
+      transaction: settled.transaction,
+      network: settled.network,
+      ...(settled.payer ?? outcome.payer ? { payer: settled.payer ?? outcome.payer } : {}),
+    },
+    ...(tokenAccess ? { issueToken: true } : {}),
+  };
+}
+
+async function verifyLnbtc(args: {
+  loaded: LoadedConfig;
+  request: RequestContext;
+  payload: Record<string, unknown>;
+  accepted: PaymentRequirement;
+  rail: RailConfig;
+  tokenAccess: boolean;
+}): Promise<VerifyResult> {
+  const { loaded, request, payload, accepted, rail, tokenAccess } = args;
+  const rt = loaded.lnbtc;
+  if (!rt) return { status: "rejected", reason: "unsupported_rail" };
+  if (!rt.gate.canOffer()) return { status: "error", reason: "payment_unavailable" };
+  if (!rt.payeePubkey) return { status: "error", reason: "payment_unavailable" };
+
+  // 1. The accepted invoice must be the one we could have issued for this request.
+  const extra = (accepted.extra ?? {}) as Record<string, unknown>;
+  const invoice = typeof extra.invoice === "string" ? extra.invoice : "";
+  if (!invoice) return { status: "rejected", reason: "invalid_payment" };
+
+  const binding = computeRequestHash({
+    method: request.method,
+    url: request.resourceUrl,
+    headers: request.headers,
+    boundHeaders: ["accept"],
+  });
+
+  let decoded;
+  try {
+    decoded = (rt.decodeInvoiceFrom ?? decodeBolt11)(invoice);
+  } catch {
+    return { status: "rejected", reason: "invalid_payment" };
+  }
+
+  const invoiceCheck = checkInvoice(
+    decoded,
+    {
+      network: rt.network,
+      amountMsat: Number(rail.amount),
+      requestHash: binding.requestHash,
+      payeePubkey: rt.payeePubkey,
+      maxTimeoutSeconds: loaded.config.payment.max_timeout_seconds,
+    },
+    Math.floor(Date.now() / 1000)
+  );
+  if (!invoiceCheck.ok) {
+    // Replay and expiry are worth distinguishing for the client's benefit.
+    const reason: CoarseError = /expired/i.test(invoiceCheck.reason)
+      ? "payment_expired"
+      : "invalid_payment";
+    return { status: "rejected", reason };
+  }
+
+  // 2. The preimage proves payment of that invoice.
+  const preimage = (payload.payload as { preimage?: unknown } | undefined)?.preimage;
+  if (typeof preimage !== "string") return { status: "rejected", reason: "invalid_payment" };
+  const preimageCheck = preimageMatches(preimage, decoded.paymentHash);
+  if (!preimageCheck.ok) return { status: "rejected", reason: "invalid_payment" };
+
+  // 3. Single use, durably, across instances.
+  const claim = await rt.replay.claim(
+    rt.network,
+    decoded.paymentHash,
+    replayTtlSeconds(loaded.config.payment.max_timeout_seconds)
+  );
+  if (claim === "duplicate") return { status: "rejected", reason: "replay_rejected" };
+  if (claim === "unavailable") return { status: "error", reason: "payment_unavailable" };
+
+  return {
+    status: "approved",
+    rail: `${rail.scheme}/${rail.network}`,
+    settlement: { transaction: decoded.paymentHash, network: rt.network },
+    ...(tokenAccess ? { issueToken: true } : {}),
+  };
+}
+
+/**
+ * Header for a paid response. eip155 carries the payer; lnbtc must omit it
+ * (Lightning reveals no stable payer address).
+ */
+export function settlementHeader(result: VerifyResult): string | null {
+  if (!result.settlement) return null;
+  const body = {
+    success: true,
+    transaction: result.settlement.transaction,
+    network: result.settlement.network,
+    ...(result.settlement.payer ? { payer: result.settlement.payer } : {}),
+  };
+  return Buffer.from(JSON.stringify(body), "utf8").toString("base64");
+}
+
+export { HEADER };
+export { confirmSuccessfulTransfer };
+export type { VerifiedAuthorization };

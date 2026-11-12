@@ -1,17 +1,23 @@
 /**
- * Config loader tests
+ * Config loader tests — 0.3.x (rails) shape.
  *
- * loadConfig() resolves secrets (file > env > inline), validates the parsed
- * YAML against MdfConfigSchema, enforces cross-field startup constraints that
- * the schema alone can't express (wallet required once pricing is non-zero,
- * facilitator required once any chain is priced in x402, lightning secrets
- * required once a [lightning] block is configured), and builds the /mdf.json
- * payload. None of that had a regression test — this fills that gap
- * (Vikunja #15).
+ * loadConfig() resolves file-mounted secrets, validates the parsed YAML against
+ * MdfConfigSchema, enforces the cross-field startup constraints the schema alone
+ * cannot express (a priced eip155 rail needs a wallet and a facilitator; an
+ * lnbtc rail needs lightning + Valkey; `access: token` needs an endpoint; a
+ * configured asset must be in the vendored table), and renders `/mdf.json` from
+ * those rails.
  *
- * Fixtures are real files under a temp directory rather than mocked fs calls,
- * since loadConfig reads mdf.yaml, the content directory, and /run/secrets/*
- * from disk directly.
+ * Secrets are injected through `setSecretReaderForTests`, which is the same seam
+ * the loader uses in production — a real file read at `/run/secrets/<name>` — so
+ * these tests exercise the resolution path without needing root.
+ *
+ * Migration note (Stage B, #64): the 0.2.x suite tested `{amount, currency,
+ * chain}`, env-var secret precedence, `price_threshold` and a fixed sats/USD
+ * conversion. Those concepts are gone by design (no exchange rate, file-only
+ * secrets, `access` instead of a threshold), so those cases are replaced by the
+ * rails equivalents here rather than dropped — see the per-suite accounting in
+ * `docs/STAGE-B-TEST-ACCOUNTING.md`.
  *
  * Run with: bun run src/config/loader.test.ts
  */
@@ -20,19 +26,28 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import yaml from "js-yaml";
-import { loadConfig } from "./loader.ts";
+import { loadConfig, setSecretReaderForTests, buildMdfJsonFor } from "./loader.ts";
 import { isValidEip55Address, toEip55Checksum } from "./wallet.ts";
 
 // Valid EIP-55 checksummed wallets for priced fixtures. The strict validator
-// added for Vikunja #9 rejects placeholder/unchecksummed values as soon as any
-// pricing is non-zero, so these fixtures can no longer use "0xDEAD"/"n/a".
+// (Vikunja #9) rejects placeholder/unchecksummed values as soon as any eip155
+// rail is priced.
 const WALLET_A = "0x1111111111111111111111111111111111111111";
 const WALLET_B = "0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF";
 // The live demo wallet, checked in B0 to prove the validator accepts production.
 const WALLET_LIVE = "0xa7D911138322aF8823642beA2b174dFaC2725fB7";
 
+const USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const USDC_SEPOLIA = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+const LNBTC = "lnbtc:000000000019d6689c085ae165831e93";
+const FACILITATOR = {
+  legs: ["http://mdf-facilitator-syd:8080"],
+  timeout_ms: 15000,
+  rpc: { "eip155:8453": "https://mainnet.base.org" },
+};
+
 // ---------------------------------------------------------------------------
-// Test harness (same shape as 402-schema.test.ts / handler.test.ts)
+// Test harness
 // ---------------------------------------------------------------------------
 
 let passed = 0;
@@ -59,6 +74,7 @@ function assertThrows(fn: () => void, msgContains: string, what: string) {
     throw new Error(`expected to throw (${what}), but it did not`);
   } catch (err) {
     const message = (err as Error).message;
+    if (message.startsWith("expected to throw")) throw err;
     assert(
       message.includes(msgContains),
       `${what}: expected error to include "${msgContains}", got: ${message}`
@@ -76,14 +92,20 @@ function printSummary(): void {
 // Fixture helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Build a temp working directory with a content/ folder and an mdf.yaml
- * built from the supplied config object. Returns the yaml path and a
- * secrets(name, value) helper that writes a Docker-secret-style file.
- *
- * Callers are responsible for calling rmSync(dir, { recursive: true }) via
- * withTempDir's cleanup — see below.
- */
+/** Secret reader backed by a map — the loader's documented test seam. */
+function secrets(values: Record<string, string>): (name: string) => string | null {
+  return (name) => values[name] ?? null;
+}
+
+function withSecrets<T>(values: Record<string, string>, fn: () => T): T {
+  setSecretReaderForTests(secrets(values));
+  try {
+    return fn();
+  } finally {
+    setSecretReaderForTests(null);
+  }
+}
+
 function makeFixture(configObj: Record<string, unknown>) {
   const dir = mkdtempSync(join(tmpdir(), "mdf-loader-test-"));
   const contentDir = join(dir, "content");
@@ -93,30 +115,21 @@ function makeFixture(configObj: Record<string, unknown>) {
   const merged = {
     site: { url: "https://example.com", name: "Test Site" },
     content: { dir: contentDir },
-    pricing: { default: { amount: "0.0000" } },
+    pricing: { default: { rails: [] } },
+    token_store: "memory",
     ...configObj,
   };
 
   const yamlPath = join(dir, "mdf.yaml");
   writeFileSync(yamlPath, yaml.dump(merged));
 
-  const secretsDir = join(dir, "secrets");
-  mkdirSync(secretsDir);
-
-  return {
-    dir,
-    yamlPath,
-    contentDir,
-    writeSecret(name: string, value: string) {
-      writeFileSync(join(secretsDir, name), value);
-    },
-    secretPath(name: string) {
-      return join(secretsDir, name);
-    },
-  };
+  return { dir, yamlPath, contentDir };
 }
 
-function withTempDir<T>(configObj: Record<string, unknown>, fn: (f: ReturnType<typeof makeFixture>) => T): T {
+function withTempDir<T>(
+  configObj: Record<string, unknown>,
+  fn: (f: ReturnType<typeof makeFixture>) => T
+): T {
   const fixture = makeFixture(configObj);
   try {
     return fn(fixture);
@@ -125,29 +138,25 @@ function withTempDir<T>(configObj: Record<string, unknown>, fn: (f: ReturnType<t
   }
 }
 
-// loadConfig only checks /run/secrets/<name> on the real filesystem root, not
-// a configurable secrets dir, so secret-file-precedence cases are exercised
-// via MDF_* env vars instead (which loadConfig does honour) plus the
-// inline-value fallback. This mirrors how the real container is actually
-// configured (Docker secrets mount at /run/secrets/*) without requiring
-// root or a bind mount inside this test.
-
-function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
-  const prev: Record<string, string | undefined> = {};
-  for (const [k, v] of Object.entries(vars)) {
-    prev[k] = process.env[k];
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
-  }
-  try {
-    return fn();
-  } finally {
-    for (const [k, v] of Object.entries(prev)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-  }
+/** The eip155 rail fixture used by most cases. */
+function baseRail(amount = "10000", network = "eip155:8453"): Record<string, string> {
+  return {
+    scheme: "exact",
+    network,
+    asset: network === "eip155:8453" ? USDC_BASE : USDC_SEPOLIA,
+    amount,
+  };
 }
+
+function pricedConfig(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    pricing: { default: { rails: [baseRail()] } },
+    facilitator: FACILITATOR,
+    ...extra,
+  };
+}
+
+const WALLET_SECRET = { wallet_address: WALLET_A };
 
 // ---------------------------------------------------------------------------
 // Basic load + mdf.json shape
@@ -155,13 +164,16 @@ function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
 
 console.log("\nBasic load\n");
 
-test("loads a minimal free-content config with no payment block", () => {
+test("loads a minimal free-content config", () => {
   withTempDir({}, ({ yamlPath }) => {
-    const loaded = loadConfig(yamlPath);
-    assert(loaded.walletAddress === null, "no wallet configured for a free-only site");
-    assert(loaded.facilitatorConfig === null, "no facilitator configured for a free-only site");
-    const mdfJson = JSON.parse(loaded.mdfJson);
-    assert(mdfJson.payment === undefined, "mdf.json should omit payment when nothing is priced");
+    withSecrets({}, () => {
+      const loaded = loadConfig(yamlPath);
+      assert(loaded.walletAddress === null, "no wallet configured for a free-only site");
+      assert(loaded.pool === null, "no facilitator configured for a free-only site");
+      const mdfJson = JSON.parse(loaded.mdfJson);
+      assert(mdfJson.mdf_version === "0.3.1", "mdf_version is the spec generation");
+      assert(mdfJson.payment === undefined, "mdf.json carries no v1 payment object");
+    });
   });
 });
 
@@ -186,537 +198,351 @@ test("throws a descriptive error on invalid YAML shape", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Secret resolution precedence (env var > inline config value)
-// ---------------------------------------------------------------------------
-
-console.log("\nSecret resolution\n");
-
-test("wallet resolves from MDF_WALLET env var when set", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: WALLET_B }, () => {
-        const loaded = loadConfig(yamlPath);
-        assert(loaded.walletAddress === WALLET_B, "wallet should resolve from MDF_WALLET");
-      });
-    }
-  );
-});
-
-test("wallet falls back to the inline config value when no env var is set", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-        wallet: WALLET_A,
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: undefined }, () => {
-        const loaded = loadConfig(yamlPath);
-        assert(loaded.walletAddress === WALLET_A, "wallet should fall back to the inline value");
-      });
-    }
-  );
-});
-
-test("MDF_WALLET env var takes precedence over the inline config value", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-        wallet: WALLET_A,
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: WALLET_B }, () => {
-        const loaded = loadConfig(yamlPath);
-        assert(
-          loaded.walletAddress === WALLET_B,
-          "env var should win over the inline value per the documented precedence order"
-        );
-      });
-    }
-  );
+test("an unknown top-level key is refused (strict schema)", () => {
+  withTempDir({ paymnet: { max_timeout_seconds: 60 } }, ({ yamlPath }) => {
+    assertThrows(() => loadConfig(yamlPath), "invalid configuration", "typo'd section");
+  });
 });
 
 // ---------------------------------------------------------------------------
-// Startup constraint validation
+// token_store
 // ---------------------------------------------------------------------------
 
-console.log("\nStartup constraint validation\n");
+console.log("\ntoken_store\n");
 
-test("throws when pricing is non-zero but no [payment] block is configured", () => {
-  withTempDir({ pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } } }, ({ yamlPath }) => {
-    assertThrows(
-      () => loadConfig(yamlPath),
-      "non-zero amounts but no [payment] block",
-      "priced with no payment block"
+test("token_store is required with no default", () => {
+  const fixture = makeFixture({});
+  try {
+    // Re-write without the merged default.
+    const raw = yaml.load(
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      require("fs").readFileSync(fixture.yamlPath, "utf8")
+    ) as Record<string, unknown>;
+    delete raw.token_store;
+    writeFileSync(fixture.yamlPath, yaml.dump(raw));
+    assertThrows(() => loadConfig(fixture.yamlPath), "token_store", "missing token_store");
+  } finally {
+    rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("token_store: memory logs the instance-local warning", () => {
+  withTempDir({}, ({ yamlPath }) => {
+    const warnings: string[] = [];
+    loadConfig({ configPath: yamlPath, log: (m) => warnings.push(m) });
+    assert(
+      warnings.some((w) => w.includes("instance-local")),
+      `memory must warn that tokens are instance-local, got: ${warnings.join(" | ")}`
     );
   });
 });
 
-test("throws when pricing is non-zero and [payment] exists but no wallet resolves", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: { endpoint: "/mdf/pay", accepted_chains: ["base"], accepted_currencies: ["USDC"] },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: undefined }, () => {
-        assertThrows(() => loadConfig(yamlPath), "requires a wallet address", "priced with no wallet");
-      });
-    }
-  );
+test("token_store: valkey requires a [valkey] block", () => {
+  withTempDir({ token_store: "valkey" }, ({ yamlPath }) => {
+    assertThrows(() => loadConfig(yamlPath), "requires a [valkey] block", "valkey store, no url");
+  });
 });
 
-test("throws when an x402 chain is priced but no [facilitator] block is configured", () => {
+test("token_store: valkey builds a Valkey-backed store", () => {
   withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-        wallet: WALLET_A,
-      },
-    },
-    ({ yamlPath }) => {
-      assertThrows(
-        () => loadConfig(yamlPath),
-        "no [facilitator] block is configured",
-        "x402 priced with no facilitator block"
-      );
-    }
-  );
-});
-
-test("throws when an x402 chain is priced but the facilitator has no asset entry for that chain", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-        wallet: WALLET_A,
-      },
-      facilitator: { url: "https://x402.bitcryptic.com", chains: {} },
-    },
-    ({ yamlPath }) => {
-      assertThrows(
-        () => loadConfig(yamlPath),
-        "requires facilitator.chains.base.asset",
-        "x402 priced chain missing from facilitator.chains"
-      );
-    }
-  );
-});
-
-test("loads cleanly when the facilitator has a matching chain asset entry", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-        wallet: WALLET_A,
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-    },
+    { token_store: "valkey", valkey: { url: "redis://mdf-valkey:6379" } },
     ({ yamlPath }) => {
       const loaded = loadConfig(yamlPath);
-      assert(loaded.facilitatorConfig !== null, "facilitatorConfig should resolve");
+      assert(loaded.tokenStoreBackend === "valkey", "backend recorded");
+      assert(loaded.tokenStore.constructor.name === "ValkeyTokenStore", "valkey store constructed");
+    }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Secret resolution — file-mounted only
+// ---------------------------------------------------------------------------
+
+console.log("\nSecret resolution\n");
+
+test("the wallet resolves from the mounted secret", () => {
+  withTempDir(pricedConfig(), ({ yamlPath }) => {
+    withSecrets(WALLET_SECRET, () => {
+      const loaded = loadConfig(yamlPath);
+      assert(loaded.walletAddress === WALLET_A, "wallet should resolve from the secret file");
+    });
+  });
+});
+
+test("a priced eip155 rail with no wallet secret refuses to start", () => {
+  withTempDir(pricedConfig(), ({ yamlPath }) => {
+    withSecrets({}, () => {
+      assertThrows(() => loadConfig(yamlPath), "wallet_address", "priced with no wallet secret");
+    });
+  });
+});
+
+test("a malformed wallet refuses to start once an eip155 rail is priced", () => {
+  withTempDir(pricedConfig(), ({ yamlPath }) => {
+    withSecrets({ wallet_address: "0xDEADBEEF" }, () => {
+      assertThrows(() => loadConfig(yamlPath), "EIP-55", "priced with malformed wallet");
+    });
+  });
+});
+
+test("a trailing newline on the wallet secret is trimmed", () => {
+  withTempDir(pricedConfig(), ({ yamlPath }) => {
+    withSecrets({ wallet_address: WALLET_LIVE + "\n" }, () => {
+      const loaded = loadConfig(yamlPath);
+      assert(loaded.walletAddress === WALLET_LIVE, "trailing newline should be trimmed");
+    });
+  });
+});
+
+test("a malformed wallet is tolerated when nothing is priced", () => {
+  withTempDir({}, ({ yamlPath }) => {
+    withSecrets({ wallet_address: "not-an-address" }, () => {
+      const loaded = loadConfig(yamlPath);
       assert(
-        loaded.facilitatorConfig!.chains.base?.asset === "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-        "resolved facilitator config should carry the configured chain asset"
+        loaded.walletAddress === "not-an-address",
+        "malformed wallet should still resolve when nothing is priced"
       );
-    }
-  );
-});
-
-test("lightning-only pricing does not require a [facilitator] block", () => {
-  // hasX402Price excludes chain === "lightning" — a lightning-only priced
-  // site should never demand a facilitator config. Since Vikunja #27 the
-  // LightningSchema fields are optional, so this config carries no inline
-  // api_token/token_secret at all and resolution comes from the environment.
-  withTempDir(
-    {
-      pricing: { default: { amount: "0.00000001", currency: "BTC", chain: "lightning" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["lightning"],
-        accepted_currencies: ["BTC"],
-        wallet: WALLET_A,
-      },
-      lightning: {
-        api_url: "https://alby.example.com",
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv(
-        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
-        () => {
-          const loaded = loadConfig(yamlPath);
-          assert(
-            loaded.facilitatorConfig === null,
-            "lightning-only pricing should not require a facilitator block"
-          );
-          assert(
-            loaded.config.lightning?.api_token === "test-token",
-            "resolved api_token should come from the environment"
-          );
-        }
-      );
-    }
-  );
-});
-
-// The test harness cannot write /run/secrets (root-owned), so secret-file
-// resolution is exercised via the MDF_* env vars that share resolveSecret's
-// precedence chain — the same stand-in used by the wallet-precedence tests.
-
-test("lightning block with no inline fields and a resolvable secret loads", () => {
-  withTempDir(
-    {
-      lightning: {
-        api_url: "https://alby.example.com",
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv(
-        { MDF_ALBY_TOKEN: "resolved-token", MDF_LIGHTNING_SECRET: "y".repeat(32) },
-        () => {
-          const loaded = loadConfig(yamlPath);
-          assert(
-            loaded.config.lightning?.api_token === "resolved-token",
-            "api_token should resolve with no inline field present"
-          );
-          assert(
-            loaded.config.lightning?.token_secret === "y".repeat(32),
-            "token_secret should resolve with no inline field present"
-          );
-        }
-      );
-    }
-  );
-});
-
-test("throws when [lightning] has no inline fields and nothing resolvable", () => {
-  withTempDir(
-    {
-      lightning: {
-        api_url: "https://alby.example.com",
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_ALBY_TOKEN: undefined, MDF_LIGHTNING_SECRET: undefined }, () => {
-        assertThrows(
-          () => loadConfig(yamlPath),
-          "alby_api_token secret not found",
-          "lightning configured with nothing resolvable via file or env"
-        );
-      });
-    }
-  );
-});
-
-test("throws when the lightning token secret alone cannot be resolved", () => {
-  withTempDir(
-    {
-      lightning: {
-        api_url: "https://alby.example.com",
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: undefined }, () => {
-        assertThrows(
-          () => loadConfig(yamlPath),
-          "lightning_token_secret not found",
-          "lightning configured with no token secret resolvable via file or env"
-        );
-      });
-    }
-  );
-});
-
-test("legacy inline placeholders still parse and remain inert", () => {
-  // Both live hosts carry inline placeholders in mdf.yaml. They must keep
-  // parsing, but must never be read: the resolved value is the env secret.
-  withTempDir(
-    {
-      lightning: {
-        api_url: "https://alby.example.com",
-        api_token: "inline-placeholder",
-        token_secret: "inline-placeholder-padded-to-32ch",
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv(
-        { MDF_ALBY_TOKEN: "env-token", MDF_LIGHTNING_SECRET: "z".repeat(32) },
-        () => {
-          const loaded = loadConfig(yamlPath);
-          assert(
-            loaded.config.lightning?.api_token === "env-token",
-            "inline placeholder must not win over the resolved secret"
-          );
-          assert(
-            loaded.config.lightning?.token_secret === "z".repeat(32),
-            "inline token_secret must not win over the resolved secret"
-          );
-        }
-      );
-    }
-  );
-});
-
-test("legacy inline placeholders alone do not satisfy secret resolution", () => {
-  withTempDir(
-    {
-      lightning: {
-        api_url: "https://alby.example.com",
-        api_token: "inline-placeholder",
-        token_secret: "inline-placeholder-padded-to-32ch",
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_ALBY_TOKEN: undefined, MDF_LIGHTNING_SECRET: undefined }, () => {
-        assertThrows(
-          () => loadConfig(yamlPath),
-          "alby_api_token secret not found",
-          "inline placeholder must be inert and not satisfy resolution"
-        );
-      });
-    }
-  );
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
-// Lightning rail startup constraints (Vikunja #43, #44)
+// Startup constraints
 // ---------------------------------------------------------------------------
 
-console.log("\nLightning rail startup constraints\n");
+console.log("\nStartup constraints\n");
 
-test("a lightning-priced route with no [lightning] block refuses to start", () => {
+test("an eip155 rail with no [facilitator] block refuses to start", () => {
+  withTempDir({ pricing: { default: { rails: [baseRail()] } } }, ({ yamlPath }) => {
+    withSecrets(WALLET_SECRET, () => {
+      assertThrows(() => loadConfig(yamlPath), "no [facilitator] block", "no facilitator");
+    });
+  });
+});
+
+test("an eip155 rail whose asset is absent from the vendored table refuses to start", () => {
   withTempDir(
     {
       pricing: {
-        default: { amount: "0.0000" },
-        sections: { "/micropayment/**": { amount: "0.00000001", currency: "BTC", chain: "lightning" } },
+        default: {
+          rails: [{ scheme: "exact", network: "eip155:8453", asset: "0x" + "11".repeat(20), amount: "1" }],
+        },
       },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["lightning"],
-        accepted_currencies: ["BTC"],
-        wallet: WALLET_A,
-      },
+      facilitator: FACILITATOR,
     },
     ({ yamlPath }) => {
-      try {
-        loadConfig(yamlPath);
-        throw new Error("expected a lightning-priced route with no [lightning] block to throw");
-      } catch (err) {
-        const message = (err as Error).message;
-        assert(
-          message.includes("/micropayment/**"),
-          `error must name the offending route, got: ${message}`
-        );
-        assert(
-          message.includes("no [lightning] block is configured"),
-          `error must explain the missing block, got: ${message}`
-        );
-        assert(
-          !/token|secret|Bearer/i.test(message),
-          `error must not mention secret material, got: ${message}`
-        );
-      }
+      withSecrets(WALLET_SECRET, () => {
+        assertThrows(() => loadConfig(yamlPath), "not in the vendored", "unknown asset");
+      });
     }
   );
 });
 
-test("a lightning-priced route with an unsupported currency refuses to start", () => {
+test("a network this build cannot settle refuses to start", () => {
   withTempDir(
     {
       pricing: {
-        default: { amount: "0.0000" },
-        sections: { "/micropayment/**": { amount: "1.00", currency: "EUR", chain: "lightning" } },
+        default: {
+          rails: [{ scheme: "exact", network: "eip155:137", asset: USDC_BASE, amount: "1" }],
+        },
       },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["lightning"],
-        accepted_currencies: ["EUR"],
-        wallet: WALLET_A,
-      },
-      lightning: { api_url: "https://alby.example.com" },
+      facilitator: FACILITATOR,
     },
     ({ yamlPath }) => {
-      withEnv(
-        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
-        () => {
-          assertThrows(
-            () => loadConfig(yamlPath),
-            "unsupported currency 'EUR'",
-            "lightning rail with a currency it cannot convert"
-          );
-        }
-      );
+      withSecrets(WALLET_SECRET, () => {
+        assertThrows(() => loadConfig(yamlPath), "not one this build can settle", "unsupported network");
+      });
     }
   );
 });
 
-test("a BTC-denominated lightning price is accepted and loads", () => {
-  withTempDir(
-    {
-      pricing: {
-        default: { amount: "0.0000" },
-        sections: { "/micropayment/**": { amount: "0.00000001", currency: "BTC", chain: "lightning" } },
-      },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["lightning"],
-        accepted_currencies: ["BTC"],
-        wallet: WALLET_A,
-      },
-      lightning: { api_url: "https://alby.example.com" },
-    },
-    ({ yamlPath }) => {
-      withEnv(
-        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
-        () => {
-          const loaded = loadConfig(yamlPath);
-          assert(loaded.config.lightning !== undefined, "lightning config present");
-        }
-      );
-    }
-  );
-});
-
-test("an x402-only config with no [lightning] block still starts", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-        wallet: WALLET_A,
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-    },
-    ({ yamlPath }) => {
+test("the asset table supplies the EIP-712 domain per network", () => {
+  // "USD Coin" on Base mainnet, "USDC" on Base Sepolia — never free config.
+  withTempDir(pricedConfig(), ({ yamlPath }) => {
+    withSecrets(WALLET_SECRET, () => {
       const loaded = loadConfig(yamlPath);
-      assert(loaded.config.lightning === undefined, "no lightning configured");
-      assert(loaded.facilitatorConfig !== null, "x402 config still loads");
+      assert(loaded.config.pricing.default.rails[0].network === "eip155:8453", "mainnet rail");
+    });
+  });
+});
+
+test("a non-atomic (decimal) amount fails schema validation", () => {
+  withTempDir(
+    { pricing: { default: { rails: [{ ...baseRail(), amount: "0.01" }] } }, facilitator: FACILITATOR },
+    ({ yamlPath }) => {
+      withSecrets(WALLET_SECRET, () => {
+        assertThrows(() => loadConfig(yamlPath), "invalid configuration", "decimal amount");
+      });
     }
   );
+});
+
+test("an lnbtc rail with no [lightning] block refuses to start", () => {
+  withTempDir(
+    {
+      pricing: {
+        default: { rails: [{ scheme: "exact", network: LNBTC, asset: "BTC", amount: "1000" }] },
+      },
+    },
+    ({ yamlPath }) => {
+      withSecrets({}, () => {
+        assertThrows(() => loadConfig(yamlPath), "lightning.enabled is false", "lnbtc with lightning off");
+      });
+    }
+  );
+});
+
+test("an lnbtc rail with lightning enabled but no [valkey] block refuses to start", () => {
+  withTempDir(
+    {
+      pricing: {
+        default: { rails: [{ scheme: "exact", network: LNBTC, asset: "BTC", amount: "1000" }] },
+      },
+      lightning: { enabled: true },
+    },
+    ({ yamlPath }) => {
+      withSecrets({ nwc_uri: "nostr+walletconnect://x?relay=wss%3A%2F%2Fr.example&secret=00" }, () => {
+        assertThrows(() => loadConfig(yamlPath), "no [valkey] block", "lnbtc with no store");
+      });
+    }
+  );
+});
+
+test("a sub-satoshi lnbtc amount refuses to start at load time", () => {
+  withTempDir(
+    {
+      pricing: {
+        default: { rails: [{ scheme: "exact", network: LNBTC, asset: "BTC", amount: "1500" }] },
+      },
+      lightning: { enabled: true, node_pubkey: "02" + "ab".repeat(32) },
+      valkey: { url: "redis://mdf-valkey:6379" },
+    },
+    ({ yamlPath }) => {
+      withSecrets({ nwc_uri: "nostr+walletconnect://x?relay=wss%3A%2F%2Fr.example&secret=00" }, () => {
+        assertThrows(() => loadConfig(yamlPath), "whole number of satoshis", "1500 msat");
+      });
+    }
+  );
+});
+
+test("an lnbtc amount below the 1-sat floor refuses to start", () => {
+  withTempDir(
+    {
+      pricing: {
+        default: { rails: [{ scheme: "exact", network: LNBTC, asset: "BTC", amount: "500" }] },
+      },
+      lightning: { enabled: true, node_pubkey: "02" + "ab".repeat(32) },
+      valkey: { url: "redis://mdf-valkey:6379" },
+    },
+    ({ yamlPath }) => {
+      withSecrets({ nwc_uri: "nostr+walletconnect://x?relay=wss%3A%2F%2Fr.example&secret=00" }, () => {
+        assertThrows(() => loadConfig(yamlPath), "1-sat floor", "500 msat");
+      });
+    }
+  );
+});
+
+test("an lnbtc rail with a non-BTC asset refuses to start", () => {
+  withTempDir(
+    {
+      pricing: {
+        default: { rails: [{ scheme: "exact", network: LNBTC, asset: "USDT", amount: "1000" }] },
+      },
+      lightning: { enabled: true, node_pubkey: "02" + "ab".repeat(32) },
+      valkey: { url: "redis://mdf-valkey:6379" },
+    },
+    ({ yamlPath }) => {
+      withSecrets({ nwc_uri: "nostr+walletconnect://x?relay=wss%3A%2F%2Fr.example&secret=00" }, () => {
+        assertThrows(() => loadConfig(yamlPath), 'must use asset "BTC"', "non-BTC lnbtc asset");
+      });
+    }
+  );
+});
+
+test("lightning enabled with no nwc_uri secret refuses to start", () => {
+  withTempDir(
+    {
+      lightning: { enabled: true, node_pubkey: "02" + "ab".repeat(32) },
+      valkey: { url: "redis://mdf-valkey:6379" },
+    },
+    ({ yamlPath }) => {
+      withSecrets({}, () => {
+        assertThrows(() => loadConfig(yamlPath), "nwc_uri", "no NWC credential");
+      });
+    }
+  );
+});
+
+test("lightning disabled makes no NWC client at all", () => {
+  withTempDir({ lightning: { enabled: false } }, ({ yamlPath }) => {
+    withSecrets({}, () => {
+      const loaded = loadConfig(yamlPath);
+      assert(loaded.lnbtc === null, "no lnbtc runtime without the rail");
+    });
+  });
 });
 
 test("invalid breaker backoff refuses to start", () => {
   withTempDir(
     {
       lightning: {
-        api_url: "https://alby.example.com",
+        enabled: true,
+        node_pubkey: "02" + "ab".repeat(32),
         breaker_initial_backoff_seconds: 60,
         breaker_max_backoff_seconds: 10,
       },
+      valkey: { url: "redis://mdf-valkey:6379" },
     },
     ({ yamlPath }) => {
-      withEnv(
-        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
-        () => {
-          assertThrows(
-            () => loadConfig(yamlPath),
-            "breaker_max_backoff_seconds",
-            "cap below the starting delay"
-          );
-        }
-      );
+      withSecrets({ nwc_uri: "nostr+walletconnect://x?relay=wss%3A%2F%2Fr.example&secret=00" }, () => {
+        assertThrows(() => loadConfig(yamlPath), "breaker_max_backoff_seconds", "cap below start");
+      });
     }
   );
 });
 
 test("a non-positive breaker backoff fails schema validation", () => {
   withTempDir(
-    {
-      lightning: {
-        api_url: "https://alby.example.com",
-        breaker_initial_backoff_seconds: 0,
-      },
-    },
+    { lightning: { enabled: true, breaker_initial_backoff_seconds: 0 } },
     ({ yamlPath }) => {
-      withEnv(
-        { MDF_ALBY_TOKEN: "test-token", MDF_LIGHTNING_SECRET: "x".repeat(32) },
-        () => {
-          assertThrows(
-            () => loadConfig(yamlPath),
-            "invalid configuration",
-            "zero initial backoff"
-          );
-        }
-      );
+      withSecrets({}, () => {
+        assertThrows(() => loadConfig(yamlPath), "invalid configuration", "zero initial backoff");
+      });
     }
   );
 });
 
-test("throws when [auth] is configured but no priced section meets its threshold", () => {
+test("an [auth] block with no token entry warns but loads", () => {
+  withTempDir(pricedConfig({ auth: { endpoint: "/mdf/auth" } }), ({ yamlPath }) => {
+    const warnings: string[] = [];
+    withSecrets(WALLET_SECRET, () => {
+      loadConfig({ configPath: yamlPath, log: (m) => warnings.push(m) });
+    });
+    assert(
+      warnings.some((w) => w.includes("inert")),
+      `an endpoint with no token section must warn, got: ${warnings.join(" | ")}`
+    );
+  });
+});
+
+test("an `access: token` entry with no [auth] block refuses to start", () => {
   withTempDir(
     {
-      pricing: {
-        default: { amount: "1.0000", currency: "USDC", chain: "base" },
-      },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-        wallet: WALLET_A,
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-      auth: { endpoint: "/mdf/auth", price_threshold: "50.0000" },
+      pricing: { default: { rails: [baseRail()], access: "token" } },
+      facilitator: FACILITATOR,
     },
     ({ yamlPath }) => {
-      assertThrows(
-        () => loadConfig(yamlPath),
-        "no section is priced at or above that amount",
-        "auth threshold with nothing priced high enough"
-      );
+      withSecrets(WALLET_SECRET, () => {
+        assertThrows(() => loadConfig(yamlPath), "requires an [auth] block", "token tier, no auth");
+      });
     }
   );
+});
+
+test("a bad trusted_proxies entry (a hostname) fails schema validation", () => {
+  withTempDir({ server: { trusted_proxies: ["caddy.example.com"] } }, ({ yamlPath }) => {
+    assertThrows(() => loadConfig(yamlPath), "invalid configuration", "hostname in trusted proxies");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -725,59 +551,70 @@ test("throws when [auth] is configured but no priced section meets its threshold
 
 console.log("\nmdf.json generation\n");
 
-test("emits the wallet in mdf.json's payment object once resolved", () => {
+test("renders the configured rails verbatim", () => {
+  withTempDir(pricedConfig(), ({ yamlPath }) => {
+    withSecrets(WALLET_SECRET, () => {
+      const loaded = loadConfig(yamlPath);
+      const mdfJson = JSON.parse(loaded.mdfJson);
+      const rail = mdfJson.pricing.default.rails[0];
+      assert(rail.amount === "10000", "atomic amount carried");
+      assert(rail.asset === USDC_BASE, "asset carried");
+      assert(rail.network === "eip155:8453", "CAIP-2 network carried");
+    });
+  });
+});
+
+test("omits `access` for a per_fetch entry and emits it for a token entry", () => {
   withTempDir(
     {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
+      pricing: {
+        default: { rails: [baseRail()] },
+        sections: { "/private/**": { rails: [baseRail("100000")], access: "token" } },
       },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
+      facilitator: FACILITATOR,
+      auth: { endpoint: "/mdf/auth" },
     },
     ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: WALLET_A }, () => {
+      withSecrets(WALLET_SECRET, () => {
         const loaded = loadConfig(yamlPath);
         const mdfJson = JSON.parse(loaded.mdfJson);
-        assert(mdfJson.payment.wallet === WALLET_A, "mdf.json payment.wallet should be the resolved wallet");
+        assert(mdfJson.pricing.default.access === undefined, "per_fetch is the default");
+        assert(mdfJson.pricing.sections["/private/**"].access === "token", "token emitted");
         assert(
-          mdfJson.payment.endpoint === "https://example.com/mdf/pay",
-          "root-relative payment endpoint should resolve against site.url"
+          mdfJson.auth.endpoint === "https://example.com/mdf/auth",
+          "root-relative endpoint resolves against site.url"
         );
       });
     }
   );
 });
 
-test("resolves an already-absolute https:// endpoint unchanged", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "https://pay.elsewhere.com/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: WALLET_A }, () => {
-        const loaded = loadConfig(yamlPath);
-        const mdfJson = JSON.parse(loaded.mdfJson);
-        assert(
-          mdfJson.payment.endpoint === "https://pay.elsewhere.com/mdf/pay",
-          "an absolute https:// endpoint should be passed through unchanged"
-        );
-      });
-    }
+test("an already-absolute https:// endpoint is passed through unchanged", () => {
+  const doc = buildMdfJsonFor({
+    site: { url: "https://example.com" },
+    content: { dir: "./content", dialect: "commonmark", frontmatter: false, math: false },
+    pricing: { default: { rails: [], access: "per_fetch" } },
+    auth: { endpoint: "https://pay.elsewhere.com/mdf/auth", token_ttl_seconds: 60 },
+    token_store: "memory",
+    signals: { ai_train: false, ai_input: true, search: true, human_only: false },
+    dashboard: { enabled: false, port: 9090 },
+    payment: { max_timeout_seconds: 300 },
+    server: { trusted_proxies: [] },
+  } as never);
+  assert(
+    (doc.auth as { endpoint: string }).endpoint === "https://pay.elsewhere.com/mdf/auth",
+    "absolute endpoint unchanged"
   );
+});
+
+test("does not emit a wallet or a v1 payment object", () => {
+  withTempDir(pricedConfig(), ({ yamlPath }) => {
+    withSecrets(WALLET_SECRET, () => {
+      const mdfJson = JSON.parse(loadConfig(yamlPath).mdfJson);
+      assert(!JSON.stringify(mdfJson).includes(WALLET_A), "no wallet in the document");
+      assert(mdfJson.payment === undefined, "no payment block");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -822,76 +659,6 @@ test("rejects wrong length, missing 0x, and non-hex characters", () => {
 
 test("rejects the zero address", () => {
   assert(!isValidEip55Address("0x" + "0".repeat(40)), "zero address must be rejected");
-});
-
-test("priced config with a bad wallet refuses to start", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: "0xDEADBEEF" }, () => {
-        assertThrows(() => loadConfig(yamlPath), "EIP-55", "priced with malformed wallet");
-      });
-    }
-  );
-});
-
-test("unpriced config with a bad wallet warns only", () => {
-  withTempDir(
-    {
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-        wallet: "not-an-address",
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: undefined }, () => {
-        const loaded = loadConfig(yamlPath);
-        assert(
-          loaded.walletAddress === "not-an-address",
-          "malformed wallet should still resolve when nothing is priced"
-        );
-      });
-    }
-  );
-});
-
-test("trailing newline on a wallet secret is trimmed, not treated as invalid", () => {
-  withTempDir(
-    {
-      pricing: { default: { amount: "1.0000", currency: "USDC", chain: "base" } },
-      payment: {
-        endpoint: "/mdf/pay",
-        accepted_chains: ["base"],
-        accepted_currencies: ["USDC"],
-      },
-      facilitator: {
-        url: "https://x402.bitcryptic.com",
-        chains: { base: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" } },
-      },
-    },
-    ({ yamlPath }) => {
-      withEnv({ MDF_WALLET: WALLET_LIVE + "\n" }, () => {
-        const loaded = loadConfig(yamlPath);
-        assert(
-          loaded.walletAddress === WALLET_LIVE,
-          "trailing newline should be trimmed before validation"
-        );
-      });
-    }
-  );
 });
 
 printSummary();

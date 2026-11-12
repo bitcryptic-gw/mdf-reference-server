@@ -44,6 +44,16 @@ function assertEquals(actual: unknown, expected: unknown, msg: string) {
 // works from a clean checkout on any machine (src/content/ -> repo root).
 const CONTENT_DIR = join(import.meta.dir, "..", "..", "content");
 
+const USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const LNBTC = "lnbtc:000000000019d6689c085ae165831e93";
+
+const rail = (amount: string, network = "eip155:8453", asset = USDC) => ({
+  scheme: "exact",
+  network,
+  asset,
+  amount,
+});
+
 function makeLoaded(overrides: Partial<LoadedConfig["config"]["pricing"]> = {}): LoadedConfig {
   return {
     contentDir: CONTENT_DIR,
@@ -53,14 +63,16 @@ function makeLoaded(overrides: Partial<LoadedConfig["config"]["pricing"]> = {}):
       site: { url: "https://example.com", name: "Test" },
       content: { dir: CONTENT_DIR, dialect: "commonmark", frontmatter: true, math: false },
       pricing: {
-        default: { amount: "0.0001", currency: "USDC", chain: "base" },
+        default: { rails: [rail("100")] },
         sections: {
-          "/docs/**": { amount: "0.0000", currency: null, chain: null },
-          "/premium/**": { amount: "1.0000", currency: "USDC", chain: "base" },
-          "/private/**": { amount: "100.00", currency: "USDC", chain: "base" },
+          "/docs/**": { rails: [] },
+          "/premium/**": { rails: [rail("10000")] },
+          "/private/**": { rails: [rail("100000")], access: "token" },
+          "/showcase/**": { rails: [rail("20000"), rail("20000", LNBTC, "BTC")] },
         },
         ...overrides,
       },
+      token_store: "memory",
       signals: { ai_train: false, ai_input: true, search: true, human_only: false },
       dashboard: { enabled: true, port: 9090 },
     } as LoadedConfig["config"],
@@ -195,8 +207,8 @@ test("emits X-MDF-Version header", () => {
 
 test("emits X-MDF-Price and X-MDF-Currency for paid content", () => {
   const result = serveContent("/premium/deep-dive", "text/markdown", null, loaded);
-  assertEquals(result.headers["X-MDF-Price"], "1.0000", "price");
-  assertEquals(result.headers["X-MDF-Currency"], "USDC", "currency");
+  assertEquals(result.headers["X-MDF-Price"], "10000", "atomic amount of the first rail");
+  assertEquals(result.headers["X-MDF-Currency"], "USDC", "symbol from the vendored asset table");
 });
 
 test("omits X-MDF-Price for free content", () => {
@@ -204,9 +216,19 @@ test("omits X-MDF-Price for free content", () => {
   assert(!result.headers["X-MDF-Price"], "no price header for free content");
 });
 
-test("private section uses $100 price", () => {
+test("private section reports its own rail, not the default", () => {
   const result = serveContent("/private/internals", "text/markdown", null, loaded);
-  assertEquals(result.headers["X-MDF-Price"], "100.00", "private price");
+  assertEquals(result.headers["X-MDF-Price"], "100000", "private price, atomic");
+  assertEquals(result.headers["X-MDF-Currency"], "USDC", "private currency");
+});
+
+test("a dual-rail entry reports its first configured rail in the header", () => {
+  // A single header cannot carry two prices; the authoritative set is the 402's
+  // accepts[] and /mdf.json. This pins which rail the informational header
+  // reports so it cannot drift to "the cheapest" or "the last one".
+  const result = serveContent("/showcase/dual-rail", "text/markdown", null, loaded);
+  assertEquals(result.headers["X-MDF-Price"], "20000", "first rail (eip155) amount");
+  assertEquals(result.headers["X-MDF-Currency"], "USDC", "first rail symbol");
 });
 
 test("emits ETag header", () => {

@@ -81,6 +81,23 @@ export function isEip155Network(network: string): boolean {
   return network.startsWith("eip155:");
 }
 
+/**
+ * The payment layer's view of the config's pricing block.
+ *
+ * Structurally typed and located here rather than in the loader so that
+ * `content/handler.ts` can resolve a price entry without importing the loader,
+ * which imports the payment layer — a cycle through two value imports that
+ * ESM would tolerate but no one should have to reason about.
+ */
+export function pricingView(config: {
+  pricing: { default: PriceEntryConfig; sections?: Record<string, PriceEntryConfig> };
+}): PricingConfig {
+  return {
+    default: config.pricing.default,
+    ...(config.pricing.sections ? { sections: config.pricing.sections } : {}),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Path → price entry
 // ---------------------------------------------------------------------------
@@ -321,7 +338,7 @@ export function priceSummary(requirements: PaymentRequirement[]): string {
   const clauses = requirements.map((r) => {
     if (isLnbtcNetwork(r.network)) {
       const sats = humanAmount(r.amount, 3);
-      return `${r.amount} msat (${sats} sat) over Lightning`;
+      return `${r.amount} msat (${sats} sat) on ${r.network}`;
     }
     const entry = lookupAsset(r.network, r.asset);
     const decimals = entry?.decimals ?? 6;

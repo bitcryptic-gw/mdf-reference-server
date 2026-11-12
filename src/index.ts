@@ -1,7 +1,20 @@
 /**
  * mdf-server — Markdown First reference implementation
- * Entry point: loads config, starts the Bun HTTP server, and wires the
- * feed watcher and dashboard. Request routing lives in router.ts.
+ * Entry point: loads config, runs the startup gates, starts the Bun HTTP server,
+ * and wires the feed watcher and dashboard. Request routing lives in router.ts.
+ *
+ * Two startup gates decide what the demo can sell, and they are deliberately
+ * different in kind:
+ *
+ *   - an NWC credential that answers and permits more than invoice minting is an
+ *     operator misconfiguration with a security consequence, so the process
+ *     **exits 1** and says which method is over-permitted;
+ *   - an unreachable relay is a transient dependency failure, so the process
+ *     starts with the lnbtc rail degraded (omitted from `accepts[]`, reported on
+ *     `/health`) and re-checks the wallet on the invoice breaker's backoff.
+ *
+ * USDC payments, free content and `/health` never depend on the relay, so a
+ * Lightning outage can never take the site down.
  */
 
 import { loadConfig } from "./config/loader.ts";
@@ -9,8 +22,9 @@ import { ensureDataDir } from "./feed/events.ts";
 import { initWatcher, startWatcher } from "./feed/watcher.ts";
 import { emitEvent } from "./feed/events.ts";
 import { handleRequest } from "./router.ts";
-import { tokenStore } from "./auth/auth.ts";
-import { shutdownLightningBreakers } from "./payment/payment.ts";
+import { startLnbtc, checkNwcConnection } from "./payment/lnbtc/availability.ts";
+import { LightningBreaker, type LightningFailure } from "./payment/breaker.ts";
+import { SERVER_VERSION } from "./version.ts";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -22,7 +36,7 @@ const DASHBOARD_PORT_OVERRIDE = process.env.MDF_DASHBOARD_PORT
   ? parseInt(process.env.MDF_DASHBOARD_PORT, 10)
   : null;
 
-let loaded: Awaited<ReturnType<typeof loadConfig>>;
+let loaded: ReturnType<typeof loadConfig>;
 
 try {
   loaded = loadConfig(CONFIG_PATH);
@@ -31,8 +45,67 @@ try {
   process.exit(1);
 }
 
-const dashboardPort =
-  DASHBOARD_PORT_OVERRIDE ?? loaded.config.dashboard.port;
+const dashboardPort = DASHBOARD_PORT_OVERRIDE ?? loaded.config.dashboard.port;
+
+// ---------------------------------------------------------------------------
+// lnbtc startup gate
+// ---------------------------------------------------------------------------
+
+const log = (message: string) => console.warn(message);
+
+if (loaded.lnbtc) {
+  const rt = loaded.lnbtc;
+
+  /** Capture the receiver node pubkey from an answered wallet check. */
+  function applyPubkey(check: { status: string; pubkey?: string }): void {
+    if (check.status === "pass" && check.pubkey && !rt.payeePubkey) {
+      rt.payeePubkey = check.pubkey;
+    }
+  }
+
+  /** One wallet permission check, applied to the gate; null means healthy. */
+  async function runNwcCheck(): Promise<LightningFailure | null> {
+    const check = await checkNwcConnection(rt.client);
+    applyPubkey(check);
+    rt.gate.applyCheck(check);
+    if (check.status === "pass") return null;
+    return {
+      category: check.status === "bad_credential" ? "auth" : "unreachable",
+      upstreamStatus: null,
+      upstreamMessage: check.reason.slice(0, 120),
+    };
+  }
+
+  try {
+    const gate = await startLnbtc({
+      enabled: true,
+      client: rt.client,
+      log,
+      onCheck: applyPubkey,
+    });
+    rt.gate = gate;
+  } catch (err) {
+    // bad_credential: refuse to run with a credential that can spend.
+    console.error((err as Error).message);
+    process.exit(1);
+  }
+
+  rt.breakerRuntime = new LightningBreaker({
+    initialBackoffMs: rt.breaker.initialBackoffMs,
+    maxBackoffMs: rt.breaker.maxBackoffMs,
+    probe: () => runNwcCheck(),
+  });
+
+  if (!rt.gate.canOffer()) {
+    // Not a failure of the process: open the breaker so its timed probe owns
+    // recovery, and keep USDC and free content serving meanwhile.
+    rt.breakerRuntime.recordFailure({
+      category: "unreachable",
+      upstreamStatus: null,
+      upstreamMessage: "wallet unreachable at startup",
+    });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Feed setup — data dir, initial manifest, startup event
@@ -47,15 +120,9 @@ startWatcher(loaded);
 emitEvent(
   "mdf_capability",
   "/mdf.json",
-  `mdf-server started — MDF v1.0`,
+  `mdf-server started — MDF 0.3.1`,
   `site: ${loaded.config.site.url}`
 );
-
-// ---------------------------------------------------------------------------
-// Token store sweep
-// ---------------------------------------------------------------------------
-
-tokenStore.startSweep();
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown — clear timers so they cannot hold the process open
@@ -68,8 +135,9 @@ function shutdown(signal: string): void {
   console.log(
     JSON.stringify({ ts: new Date().toISOString(), event: "shutdown", signal })
   );
-  shutdownLightningBreakers();
-  tokenStore.stopSweep();
+  loaded.lnbtc?.breakerRuntime?.stop();
+  loaded.replayStore?.close();
+  loaded.tokenStore.close();
   mainServer.stop();
   process.exit(0);
 }
@@ -81,86 +149,86 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 // Dashboard server
 // ---------------------------------------------------------------------------
 
+function railLabel(network: string): string {
+  if (network.startsWith("lnbtc:")) return "⚡ Lightning";
+  if (network === "eip155:8453") return "Base";
+  if (network === "eip155:84532") return "Base Sepolia";
+  if (network === "eip155:1") return "Ethereum";
+  return network;
+}
+
+function formatAmount(rail: { amount: string; network: string; asset: string }): string {
+  const n = Number(rail.amount);
+  if (rail.network.startsWith("lnbtc:")) {
+    const sats = n / 1000;
+    return `${sats} sat`;
+  }
+  const human = n / 1_000_000;
+  return `${String(Number(human.toFixed(6)))} USDC`;
+}
+
 function buildDashboardHtml(): string {
-  const store = (tokenStore as any).store as Map<string, any>;
-  const activeTokens = [...store.values()].filter(
-    (r) => r.expiresAt > Date.now()
-  ).length;
-
   const cfg = loaded.config;
-  const chains: string[] = cfg.payment?.accepted_chains ?? [];
-  const currencies: string[] = cfg.payment?.accepted_currencies ?? [];
-  const signals = cfg.signals ?? {};
-  const sections = cfg.pricing?.sections ?? {};
+  const signals = cfg.signals;
+  const sections = cfg.pricing.sections ?? {};
 
-  // Build pricing tiers rows — sorted by amount ascending
-  type SectionEntry = { path: string; amount: string; currency: string | null; chain: string | null };
-  const tiers: SectionEntry[] = Object.entries(sections).map(([path, p]: [string, any]) => ({
-    path,
-    amount: p.amount,
-    currency: p.currency ?? null,
-    chain: p.chain ?? null,
-  }));
-  tiers.sort((a, b) => parseFloat(a.amount) - parseFloat(b.amount));
+  type Tier = {
+    path: string;
+    access: string;
+    rails: Array<{ amount: string; network: string; asset: string }>;
+  };
 
-  function tierLabel(t: SectionEntry): string {
-    if (!t.currency) return "Free";
-    const amt = parseFloat(t.amount);
-    if (t.chain === "lightning") {
-      // Convert BTC to sats for readability
-      const sats = Math.round(amt * 1e8);
-      return sats === 1 ? "1 sat" : `${sats} sats`;
-    }
-    return `${parseFloat(t.amount).toFixed(amt >= 1 ? 2 : 4)} ${t.currency}`;
-  }
+  const tiers: Tier[] = [
+    { path: "(default)", access: cfg.pricing.default.access, rails: cfg.pricing.default.rails },
+    ...Object.entries(sections).map(([path, entry]) => ({
+      path,
+      access: entry.access,
+      rails: entry.rails,
+    })),
+  ];
 
-  function railBadge(chain: string | null): string {
-    if (!chain) return `<span class="badge badge-free">open</span>`;
-    if (chain === "lightning") return `<span class="badge badge-lightning">⚡ Lightning</span>`;
-    return `<span class="badge badge-evm">${chain}</span>`;
-  }
-
-  const tierRows = tiers.map(t => `
+  const tierRows = tiers
+    .map((t) => {
+      const price =
+        t.rails.length === 0
+          ? "free"
+          : t.rails.map((r) => `${formatAmount(r)} <span class="subtle">${railLabel(r.network)}</span>`).join(" or ");
+      return `
     <tr>
       <td class="td-path"><code>${t.path}</code></td>
-      <td class="td-price">${tierLabel(t)}</td>
-      <td class="td-rail">${railBadge(t.chain)}</td>
-    </tr>`).join("");
+      <td class="td-price">${price}</td>
+      <td class="td-rail">${t.access === "token" ? `<span class="badge badge-evm">token</span>` : ""}</td>
+    </tr>`;
+    })
+    .join("");
 
-  const defaultPrice = cfg.pricing?.default;
-  const defaultLabel = defaultPrice?.currency
-    ? `${parseFloat(defaultPrice.amount).toFixed(4)} ${defaultPrice.currency}`
-    : "free";
+  const configuredRails = new Map<string, string>();
+  for (const entry of [cfg.pricing.default, ...Object.values(sections)]) {
+    for (const rail of entry.rails) configuredRails.set(rail.network, rail.asset);
+  }
+  const railTags = [...configuredRails.keys()]
+    .map((network) =>
+      network.startsWith("lnbtc:")
+        ? `<span class="tag tag-lightning">⚡ ${network}</span>`
+        : `<span class="tag tag-evm">${network}</span>`
+    )
+    .join("");
 
-  // Signal dots
-  function sig(val: boolean | undefined, name: string): string {
-    const on = val === true;
-    return `<span class="sig ${on ? "sig-on" : "sig-off"}">${name}</span>`;
+  function sig(val: boolean, name: string): string {
+    return `<span class="sig ${val ? "sig-on" : "sig-off"}">${name}</span>`;
   }
 
-  // Chain / currency tags
-  const chainTags = chains.map(c =>
-    c === "lightning"
-      ? `<span class="tag tag-lightning">⚡ ${c}</span>`
-      : `<span class="tag tag-evm">${c}</span>`
-  ).join("");
-
-  const currencyTags = currencies.map(c =>
-    `<span class="tag tag-currency">${c}</span>`
-  ).join("");
-
-  // Lightning node status — present if lightning: block configured
-  const lightningCfg = (cfg as any).lightning;
-  const lightningRow = lightningCfg
+  const lnbtc = loaded.lnbtc;
+  const lightningRow = lnbtc
     ? `<tr>
-        <td class="meta-label">Lightning node</td>
-        <td><span class="dot dot-green"></span> Alby Hub &nbsp;<code class="subtle">${lightningCfg.api_url}</code></td>
+        <td class="meta-label">lnbtc rail</td>
+        <td><span class="dot ${lnbtc.gate.canOffer() ? "dot-green" : "dot-off"}"></span> ${lnbtc.gate.canOffer() ? "offered" : "degraded"} &nbsp;<code class="subtle">NWC · make_invoice</code></td>
       </tr>
       <tr>
         <td class="meta-label">Invoice expiry</td>
-        <td>${lightningCfg.invoice_expiry_seconds}s</td>
+        <td>${lnbtc.invoiceExpirySeconds}s</td>
       </tr>`
-    : `<tr><td class="meta-label">Lightning node</td><td><span class="dot dot-off"></span> not configured</td></tr>`;
+    : `<tr><td class="meta-label">lnbtc rail</td><td><span class="dot dot-off"></span> not configured</td></tr>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -172,71 +240,44 @@ function buildDashboardHtml(): string {
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, monospace;
-    font-size: 13px;
-    line-height: 1.6;
-    background: #0d1117;
-    color: #c9d1d9;
-    max-width: 860px;
-    margin: 0 auto;
-    padding: 2rem 1.5rem 4rem;
+    font-size: 13px; line-height: 1.6;
+    background: #0d1117; color: #c9d1d9;
+    max-width: 860px; margin: 0 auto; padding: 2rem 1.5rem 4rem;
   }
-
-  /* Header */
   .header { display: flex; align-items: baseline; gap: 1rem; border-bottom: 1px solid #21262d; padding-bottom: 1rem; margin-bottom: 1.5rem; }
   .header h1 { font-size: 1.25rem; font-weight: 600; color: #58a6ff; letter-spacing: -.01em; }
   .header .site { color: #8b949e; font-size: .8rem; }
   .header .version { margin-left: auto; color: #3fb950; font-size: .75rem; }
-
-  /* Stat cards */
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .75rem; margin-bottom: 2rem; }
   .card { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: .9rem 1rem; }
   .card .label { font-size: .7rem; color: #8b949e; text-transform: uppercase; letter-spacing: .06em; margin-bottom: .3rem; }
   .card .value { font-size: 1.5rem; font-weight: 600; color: #58a6ff; }
   .card .sub { font-size: .75rem; color: #8b949e; margin-top: .15rem; word-break: break-all; }
-
-  /* Section heading */
   .section-title { font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; color: #8b949e; margin: 1.75rem 0 .6rem; border-bottom: 1px solid #21262d; padding-bottom: .4rem; }
-
-  /* Pricing table */
   table.tiers { width: 100%; border-collapse: collapse; }
   table.tiers th { text-align: left; font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: #8b949e; padding: .3rem .5rem; }
   table.tiers td { padding: .4rem .5rem; border-top: 1px solid #21262d; vertical-align: middle; }
   .td-path code { color: #c9d1d9; font-size: .8rem; }
   .td-price { color: #e6edf3; min-width: 100px; }
   .td-rail { text-align: right; }
-
-  /* Meta table */
   table.meta { width: 100%; border-collapse: collapse; }
   table.meta td { padding: .35rem .5rem; border-top: 1px solid #21262d; vertical-align: middle; }
   .meta-label { color: #8b949e; width: 140px; white-space: nowrap; }
   code { font-family: inherit; }
-  code.subtle { color: #6e7681; font-size: .78rem; }
-
-  /* Badges */
+  code.subtle, .subtle { color: #6e7681; font-size: .78rem; }
   .badge { display: inline-block; border-radius: 4px; padding: .1rem .45rem; font-size: .72rem; font-weight: 600; letter-spacing: .02em; }
-  .badge-lightning { background: #f7931a22; color: #f7931a; border: 1px solid #f7931a44; }
   .badge-evm { background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb55; }
-  .badge-free { background: #3fb95022; color: #3fb950; border: 1px solid #3fb95044; }
-
-  /* Tags (chains/currencies) */
   .tags { display: flex; flex-wrap: wrap; gap: .3rem; }
   .tag { display: inline-block; border-radius: 4px; padding: .1rem .45rem; font-size: .72rem; }
   .tag-lightning { background: #f7931a22; color: #f7931a; border: 1px solid #f7931a44; }
   .tag-evm { background: #1f6feb33; color: #58a6ff; border: 1px solid #1f6feb55; }
-  .tag-currency { background: #8957e522; color: #d2a8ff; border: 1px solid #8957e544; }
-
-  /* Signals */
   .signals { display: flex; flex-wrap: wrap; gap: .4rem; }
   .sig { display: inline-block; border-radius: 4px; padding: .1rem .45rem; font-size: .72rem; }
   .sig-on  { background: #3fb95018; color: #3fb950; border: 1px solid #3fb95033; }
   .sig-off { background: #21262d; color: #6e7681; border: 1px solid #30363d; }
-
-  /* Status dots */
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
   .dot-green { background: #3fb950; box-shadow: 0 0 4px #3fb95088; }
   .dot-off   { background: #6e7681; }
-
-  /* Footer */
   .footer { margin-top: 3rem; color: #21262d; font-size: .7rem; }
 </style>
 </head>
@@ -244,36 +285,36 @@ function buildDashboardHtml(): string {
 
 <div class="header">
   <h1>mdf-server</h1>
-  <span class="site">${cfg.site?.url ?? "—"}</span>
-  <span class="version">MDF v${cfg.mdf_version ?? "1.0"}</span>
+  <span class="site">${cfg.site.url ?? "—"}</span>
+  <span class="version">MDF 0.3.1 · server ${SERVER_VERSION}</span>
 </div>
 
 <div class="cards">
   <div class="card">
-    <div class="label">Active tokens</div>
-    <div class="value">${activeTokens}</div>
+    <div class="label">Configured rails</div>
+    <div class="value">${configuredRails.size}</div>
   </div>
   <div class="card">
-    <div class="label">Default price</div>
-    <div class="value" style="font-size:1.1rem">${defaultLabel}</div>
+    <div class="label">Token store</div>
+    <div class="value" style="font-size:1.1rem">${loaded.tokenStoreBackend}</div>
   </div>
   <div class="card">
     <div class="label">Content dir</div>
     <div class="sub" style="font-size:.8rem;margin-top:.4rem">${loaded.contentDir}</div>
   </div>
   <div class="card">
-    <div class="label">Price tiers</div>
+    <div class="label">Price entries</div>
     <div class="value">${tiers.length}</div>
   </div>
 </div>
 
-<div class="section-title">Pricing tiers</div>
+<div class="section-title">Pricing</div>
 <table class="tiers">
   <thead>
     <tr>
       <th>Path</th>
-      <th>Price</th>
-      <th style="text-align:right">Rail</th>
+      <th>Rails</th>
+      <th style="text-align:right">Access</th>
     </tr>
   </thead>
   <tbody>${tierRows}</tbody>
@@ -282,34 +323,18 @@ function buildDashboardHtml(): string {
 <div class="section-title">Payment</div>
 <table class="meta">
   <tr>
-    <td class="meta-label">Accepted chains</td>
-    <td><div class="tags">${chainTags || "—"}</div></td>
+    <td class="meta-label">Rails</td>
+    <td><div class="tags">${railTags || "—"}</div></td>
   </tr>
   <tr>
-    <td class="meta-label">Currencies</td>
-    <td><div class="tags">${currencyTags || "—"}</div></td>
-  </tr>
-  <tr>
-    <td class="meta-label">Payment endpoint</td>
-    <td><code class="subtle">${(cfg.site?.url ?? "") + (cfg.payment?.endpoint ?? "") || "—"}</code></td>
-  </tr>
-  ${lightningRow}
-</table>
-
-<div class="section-title">Auth</div>
-<table class="meta">
-  <tr>
-    <td class="meta-label">Threshold</td>
-    <td>${cfg.auth?.price_threshold ?? "—"}</td>
-  </tr>
-  <tr>
-    <td class="meta-label">Token TTL</td>
-    <td>${cfg.auth?.token_ttl_seconds ?? "—"}s</td>
+    <td class="meta-label">Facilitator legs</td>
+    <td><code class="subtle">${loaded.facilitator?.legs.join(" → ") || "—"}</code></td>
   </tr>
   <tr>
     <td class="meta-label">Auth endpoint</td>
-    <td><code class="subtle">${(cfg.site?.url ?? "") + (cfg.auth?.endpoint ?? "") || "—"}</code></td>
+    <td><code class="subtle">${(cfg.site.url ?? "") + (cfg.auth?.endpoint ?? "") || "—"}</code></td>
   </tr>
+  ${lightningRow}
 </table>
 
 <div class="section-title">Content signals</div>
@@ -331,7 +356,7 @@ function buildDashboardHtml(): string {
 <table class="meta">
   <tr>
     <td class="meta-label">Feed URL</td>
-    <td><code class="subtle">${(cfg.site?.url ?? "") + (cfg.feed?.url ?? "") || "—"}</code></td>
+    <td><code class="subtle">${(cfg.site.url ?? "") + (cfg.feed?.url ?? "") || "—"}</code></td>
   </tr>
   <tr>
     <td class="meta-label">WebSub hub</td>
@@ -363,7 +388,8 @@ async function handleDashboardRequest(req: Request): Promise<Response> {
 
 const mainServer = Bun.serve({
   port: PORT,
-  fetch: (req) => handleRequest(req, loaded),
+  fetch: (req, server) =>
+    handleRequest(req, loaded, { peer: server.requestIP(req)?.address ?? null }),
   error(err) {
     console.error(`[mdf-server] unhandled error: ${err.message}`);
     return new Response(JSON.stringify({ error: "Internal Server Error" }), {
@@ -381,12 +407,17 @@ console.log(
     port: PORT,
     dashboardPort,
     contentDir: loaded.contentDir,
-    defaultPrice: `${loaded.config.pricing.default.amount} ${loaded.config.pricing.default.currency ?? "free"}`,
+    tokenStore: loaded.tokenStoreBackend,
+    rails: [...new Set(
+      [loaded.config.pricing.default, ...Object.values(loaded.config.pricing.sections ?? {})]
+        .flatMap((entry) => entry.rails.map((rail) => rail.network))
+    )],
+    lnbtc: loaded.lnbtc ? (loaded.lnbtc.gate.canOffer() ? "available" : "degraded") : "disabled",
   })
 );
 
 if (loaded.config.dashboard.enabled) {
-  const dashServer = Bun.serve({
+  Bun.serve({
     port: dashboardPort,
     fetch: handleDashboardRequest,
     error(err) {

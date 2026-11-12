@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>MDF-Server-Prod</Name>
+  <Repository>bitcryptic/mdf-reference-server@sha256:cc142e370b9704812002c3facd7af13d6f27e4fef21b852ece29d46252d216db</Repository>
+  <Registry>https://hub.docker.com/r/bitcryptic/mdf-server</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <MyMAC/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/bitcryptic-gw/mdf-reference-server/issues</Support>
+  <Project>https://github.com/bitcryptic-gw/mdf</Project>
+  <ReadMe/>
+  <Overview>mdf-server Prod (fresh deploy on unraid-public, native Tailscale-in-container).&#13;
+Tailscale hostname mdf-server-prod, joined to pygmy-bramble.&#13;
+0.3.0: x402 v2, multi-rail pricing (Base USDC 8453 / Base Sepolia 84532 / lnbtc),&#13;
+Valkey-backed replay + token store, NWC invoice minting.&#13;
+Auth key is placeholder - Gary will set real key via Unraid UI.&#13;
+Runs as root for the Tailscale hook, drops to bun (uid 1000) via su-exec for the app.&#13;
+ACL: needs tag:misc-services grant for port 3000 (Gary to apply).&#13;
+</Overview>
+  <Category>Web:</Category>
+  <WebUI>http://100.126.109.83:9090/mdf.json</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/bitcryptic-gw/bitcryptic-blog/main/bc-icon.png</Icon>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled>1794397958</DateInstalled>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="MDF Port" Target="MDF_PORT" Default="3000" Mode="" Description="Internal server port" Type="Variable" Display="always" Required="true" Mask="false">3000</Config>
+  <Config Name="Dashboard Port" Target="MDF_DASHBOARD_PORT" Default="9090" Mode="" Description="Internal dashboard port - no host mapping" Type="Variable" Display="always" Required="false" Mask="false">9090</Config>
+  <Config Name="Data Dir" Target="MDF_DATA_DIR" Default="/app/data" Mode="" Description="Path inside container where feed event log is written" Type="Variable" Display="always" Required="true" Mask="false">/app/data</Config>
+  <Config Name="Config File" Target="/app/mdf.yaml" Default="/mnt/cache/appdata/MDF-Server-Prod/mdf.yaml" Mode="ro" Description="MDF server configuration file" Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/MDF-Server-Prod/mdf.yaml</Config>
+  <Config Name="Content Directory" Target="/app/content" Default="/mnt/cache/appdata/MDF-Server-Prod/content" Mode="ro" Description="Markdown content directory" Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/MDF-Server-Prod/content</Config>
+  <Config Name="Data Directory" Target="/app/data" Default="/mnt/cache/appdata/MDF-Server-Prod/data" Mode="rw" Description="Persistent feed event log directory" Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/MDF-Server-Prod/data</Config>
+  <Config Name="Wallet Secret" Target="/run/secrets/wallet_address" Default="/mnt/cache/appdata/MDF-Server-Prod/secrets/wallet_address" Mode="ro" Description="Wallet address secret file" Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/MDF-Server-Prod/secrets/wallet_address</Config>
+  <Config Name="nwc_uri" Target="/run/secrets/nwc_uri" Default="/mnt/cache/appdata/MDF-Server-Prod/secrets/nwc_uri" Mode="ro" Description="Nostr Wallet Connect URI (file-mounted, mode 600). A dedicated per-instance connection permitting make_invoice + get_info only. Required while lightning.enabled is true." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/MDF-Server-Prod/secrets/nwc_uri</Config>
+  <Config Name="valkey_password" Target="/run/secrets/valkey_password" Default="/mnt/cache/appdata/MDF-Server-Prod/secrets/valkey_password" Mode="ro" Description="Password for the shared Valkey replay/token store (file-mounted, mode 600). Same value as the mdf-valkey ACL entry; rotate both together." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/MDF-Server-Prod/secrets/valkey_password</Config>
+  <Config Name="Oracle Pubkey" Target="/run/secrets/oracle_pubkey" Default="" Mode="ro" Description="" Type="Path" Display="always" Required="false" Mask="false">/mnt/cache/appdata/MDF-Server-Prod/secrets/oracle_pubkey</Config>
+  <Config Name="Tailscale Fallback State Directory" Target="CA_TS_FALLBACK_DIR" Default="/app/data" Mode="" Description="Persistent container directory for tailscale state (falls back when Tailscale State Directory is blank)" Type="Variable" Display="advanced" Required="false" Mask="false">/app/data</Config>
+  <Config Name="ORG_ENTRYPOINT" Target="ORG_ENTRYPOINT" Default="/usr/local/bin/docker-entrypoint.sh" Mode="" Description="Original Docker entrypoint" Type="Variable" Display="advanced-hide" Required="false" Mask="false">/usr/local/bin/docker-entrypoint.sh</Config>
+  <Config Name="ORG_CMD" Target="ORG_CMD" Default="su-exec bun:bun /usr/local/bin/bun run src/index.ts" Mode="" Description="Original Docker command" Type="Variable" Display="advanced-hide" Required="false" Mask="false">su-exec bun:bun /usr/local/bin/bun run src/index.ts</Config>
+  <TailscaleEnabled>true</TailscaleEnabled>
+  <TailscaleIsExitNode>false</TailscaleIsExitNode>
+  <TailscaleHostname>mdf-server-prod</TailscaleHostname>
+  <TailscaleExitNodeIP/>
+  <TailscaleSSH>false</TailscaleSSH>
+  <TailscaleUserspaceNetworking>false</TailscaleUserspaceNetworking>
+  <TailscaleLANAccess>false</TailscaleLANAccess>
+  <TailscaleServe>no</TailscaleServe>
+  <TailscaleWebUI>http://[noserve]/mdf.json</TailscaleWebUI>
+  <TailscaleDParams/>
+  <TailscaleParams/>
+  <TailscaleRoutes/>
+  <TailscaleAcceptRoutes>false</TailscaleAcceptRoutes>
+  <TailscaleStateDir/>
+</Container>
