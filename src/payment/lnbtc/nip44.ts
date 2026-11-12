@@ -40,9 +40,32 @@ function utf8(text: string): Uint8Array {
 export function sharedX(privateKeyHex: string, publicKeyHex: string): Uint8Array {
   const priv = privateKeyHex.replace(/^0x/, "");
   if (!/^[0-9a-fA-F]{64}$/.test(priv)) throw new Error("NIP-44: invalid private key");
-  const point = Point.fromHex(publicKeyHex.replace(/^0x/, "")); // validates on-curve
+  const point = liftPublicKey(publicKeyHex); // validates on-curve
   const shared = point.multiply(BigInt("0x" + priv)).toRawBytes(true);
   return shared.slice(1, 33);
+}
+
+/**
+ * Accept an x-only key (32 bytes, as Nostr and NIP-44 use) as well as a
+ * compressed one. The x-only form has two candidate points; the even-y lift is
+ * tried first and the odd-y one second, which is exactly what BIP-340's
+ * `lift_x` does.
+ */
+function liftPublicKey(publicKeyHex: string): Point {
+  const clean = publicKeyHex.replace(/^0x/, "");
+  if (!/^[0-9a-fA-F]+$/.test(clean)) throw new Error("NIP-44: invalid public key");
+  if (clean.length === 64) {
+    let lastError: unknown = null;
+    for (const prefix of ["02", "03"]) {
+      try {
+        return Point.fromHex(prefix + clean);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw new Error(`NIP-44: public key is not on the curve (${(lastError as Error)?.message ?? ""})`);
+  }
+  return Point.fromHex(clean);
 }
 
 /** `get_conversation_key`: HKDF-Extract(shared_x, salt = "nip44-v2"). */
