@@ -49,7 +49,8 @@ free of `tskey-`, `TailscaleParams` content, bearer tokens and masked values
 - The tailnet state-dir element: changing it silently re-registers the node under a new identity
   and IP, which breaks any Caddy upstream pinned to an IP. Keep the running shape unless the
   state is confirmed present at the explicit path.
-- `Name` / `TailscaleHostname` / `ORG_ENTRYPOINT` / `ORG_CMD` / the four mount targets.
+- `Name` / `TailscaleHostname` / `ORG_ENTRYPOINT` / `ORG_CMD` / the mount targets listed above
+  (0.2.9 had seven; 0.3.0 adds `nwc_uri` and `valkey_password` and drops the two Alby mounts).
 
 ---
 

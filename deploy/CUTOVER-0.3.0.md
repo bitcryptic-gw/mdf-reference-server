@@ -9,7 +9,7 @@ Deliverable index:
 |---|---|
 | demo node templates | `deploy/reference/my-mdf-server-syd.0.3.0.xml`, `my-mdf-server-prod.0.3.0.xml` |
 | Valkey template + config | `deploy/reference/my-mdf-valkey.xml`, `valkey.conf` |
-| server image | `bitcryptic/mdf-reference-server@sha256:60afaa2732304116369ae761009a0ca00f69c65c6c4054da723ad9f3a6815e44` (tag `0.3.0-rc.1`) |
+| server image | `bitcryptic/mdf-reference-server@sha256:60afaa2732304116369ae761009a0ca00f69c65c6c4054da723ad9f3a6815e44` (tag `0.3.0-rc.2`) |
 | Valkey image | `valkey/valkey@sha256:2602ace2be6569bc2bbb06f873776516ab9089821525be34f4305c67eb9db02a` |
 | live `mdf.yaml` | the repo's `mdf.yaml` is the reference; per-host differences are only the facilitator leg order and `site.url` is unchanged |
 
@@ -129,15 +129,20 @@ tag; notifications stay off until the cutover is verified.
    file in place, `PING` works with the password and fails without it.
 2. **Tailnet ACL**: `mdf-syd`, `mdf-prod` → `mdf-valkey` `tcp:6379`; both →
    `mdf-fac-syd`, `mdf-fac-pub` `tcp:8080`; `tag:caddy` → the two nodes
-   `tcp:3000` (already exists). Verify from **inside** both server containers:
-   `valkey-cli -h mdf-valkey -a $(cat …) PING` and
-   `curl http://mdf-facilitator-syd:8080/supported`.
+   `tcp:3000` (already exists). Verify from **inside** both server containers
+   with `nc -z mdf-valkey 6379` and `curl -s -o /dev/null -w '%{http_code}'
+   http://mdf-facilitator-syd:8080/supported` — the server image has **no**
+   `valkey-cli` (it is `oven/bun:alpine`). After the recreate, `/health`'s
+   `replay_store.status` is the authoritative AUTH+PING check from that node.
 3. **Gary creates the production NWC connections** (`mdf-server-syd`,
    `MDF-Server-Prod`), each `make_invoice` + `get_info` only, and writes each
    `nwc_uri` file. Revoke the Stage B `mdf-server-dev` connection.
-4. **Validate the new `mdf.yaml` offline** with the 0.3.0 loader
-   (`bun run src/index.ts` against the file with the secrets dir pointing at the
-   host copy — it exits non-zero on any config error before binding a port).
+4. **Validate the new `mdf.yaml` offline** with the 0.3.0 loader — call the
+   loader only, do not start the server:
+   `MDF_SECRETS_DIR=<dir> bun -e 'import {loadConfig} from "./src/config/loader.ts"; const c = loadConfig(process.argv[1]); console.log(c.mdfJson)' <mdf.yaml>`.
+   It exits non-zero on any config error. Running `src/index.ts` would also work
+   (it refuses before binding on a bad config) but it *serves* on a good one and
+   opens NWC, which is not what an offline check should do.
 5. **Recreate `mdf-server-syd`** (the failover) while `MDF-Server-Prod` serves
    public traffic. Verify directly over the tailnet: `/health` reports
    `version: 0.3.0`, `/mdf.json` says `0.3.1`, a 402 carries both rails on
