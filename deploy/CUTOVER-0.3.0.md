@@ -201,7 +201,7 @@ tag; notifications stay off until the cutover is verified.
      "mdf-prod":    "100.126.109.83",   // mdf-server-prod
      "mdf-fac-syd": "100.73.117.54",    // mdf-facilitator-syd
      "mdf-fac-pub": "100.72.0.21",      // mdf-facilitator-public
-     "mdf-valkey":  "100.x.x.x"         // after the Valkey container starts
+     "mdf-valkey":  "100.109.72.118"    // observed 2026-11-13; read it back with `tailscale ip -4` in the container
    },
    "grants": [
      { "src": ["mdf-syd", "mdf-prod"], "dst": ["mdf-valkey"], "ip": ["tcp:6379"] },
@@ -255,6 +255,13 @@ tag; notifications stay off until the cutover is verified.
    Running `src/index.ts` would also work (it refuses before binding on a bad
    config) but it *serves* on a good one and opens NWC, which is not what an
    offline check should do.
+4b. **Deploy the content as well as the config.** The release adds
+   `content/showcase/dual-rail.md`; `/showcase/**` is priced, but the router 404s
+   a path with no page *before* pricing is consulted, so a missing page turns the
+   new dual-rail tier into a 404 instead of a 402. Content is read per request, so
+   copying the file needs no restart — but a config-only deploy looks fine on
+   `/health` and fails on the tier. Compare the repo's `content/` against the
+   host's with hashes before staging.
 5. **Recreate `mdf-server-syd`** (the failover) while `MDF-Server-Prod` serves
    public traffic. Verify directly over the tailnet: `/health` reports
    `version: 0.3.0`, `/mdf.json` says `0.3.1`, a 402 carries both rails on
@@ -265,6 +272,13 @@ tag; notifications stay off until the cutover is verified.
    flip as a separate approved step.
 7. **Verify through the public URL**: `/mdf.json` (0.3.1), a 402 with
    `PAYMENT-REQUIRED`, an lnbtc rail present, `/health` rails.
+7b. **A live human payment has a 5-minute window.** `max_timeout_seconds: 300`
+   is also the BOLT11 expiry, so the invoice, the wallet round trip and the
+   preimage all have to happen inside five minutes; the server additionally
+   tolerates 60 s of clock skew past the invoice's expiry (verified live: a proof
+   submitted 34 s past the window settled). Mint immediately before the payer is
+   ready rather than at the start of the step, and treat a lapsed invoice as a
+   re-mint, not a failure.
 8. **Kuma**: create/rename the monitors in §2; enable notifications after a
    10-minute green soak.
 9. **Retire the v1 pool** (`x402.bitcryptic.com`) and 0.2.9 in a separate
