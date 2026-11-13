@@ -104,33 +104,111 @@ recreate is verified).
 
 ## 2. Kuma
 
-Monitors are auth-gated and Gary creates them. Keyword checks are substrings over
-`/health`'s documented, fixed-order encoding; `/health` stays HTTP 200 while a
-rail is degraded, so a monitor must look at the body, not the status code.
+Monitors are auth-gated and Gary creates them. Three scopes, and they must not be
+mixed up:
 
-| monitor (per host) | before | after | keyword |
+| scope | base URL | why |
+|---|---|---|
+| **per host** | `http://mdf-server-syd.pygmy-bramble.ts.net:3000`, `http://mdf-server-prod.pygmy-bramble.ts.net:3000` | Caddy's `lb_policy first` sends the public URL to prod, so a public-URL monitor labelled "syd" would actually test prod and syd could fail unnoticed. This is how the existing #48 monitors already reach the nodes. |
+| **public** | `https://mdf-demo.bitcryptic.com` | what a user sees, through Caddy |
+| **per leg** | `http://mdf-facilitator-syd.pygmy-bramble.ts.net:8080`, `…-public…` | the x402 v2 facilitator legs |
+
+No new tailnet grant is needed for the per-host monitors: Kuma already reaches
+both nodes on `tcp:3000` — the #48 monitors have been up against those exact
+FQDNs, and were re-checked with live heartbeats on 2026-11-13. The per-leg
+monitors need `uptimekuma → both legs tcp:8080`, which also exists.
+
+`/health` answers **200 even while a rail is degraded or a store is down**, so
+every check below is a body match, never a status code. All keyword strings are
+substrings of the compact JSON the server emits, in the order shown; each was
+matched against a live body before being written down.
+
+### Per host — `syd` (`mdf-server-syd`) and `prod` (`mdf-server-prod`)
+
+| monitor | path | type | keyword / expression |
 |---|---|---|---|
-| `mdf <host> lnbc` | `lnbc` on `/micropayment/intro`, 402 accepted | **rename `mdf <host> lnbtc offered`** | `lnbtc:000000000019d6689c085ae165831e93`, 402 accepted (it mints one invoice per probe — budgeted, see §4) |
-| `mdf <host> lightning health` | inverted `degraded` on `/health` | **keep name and meaning** | inverted `degraded` (now only the lnbtc rail can produce it) |
-| — | — | **new `mdf <host> rail 8453 ok`** | `"rail":"eip155:8453","status":"ok"` |
-| — | — | **new `mdf <host> rail 84532 ok`** | `"rail":"eip155:84532","status":"ok"` |
-| — | — | **new `mdf <host> lnbtc ok`** | `"rail":"lnbtc:000000000019d6689c085ae165831e93","status":"ok"` |
-| — | — | **new `mdf <host> replay store ok`** | inverted `"replay_store":{"status":"unavailable"}` |
-| — | — | **new `mdf <host> token store ok`** | inverted `"token_store":{"status":"unavailable"}` |
-| — | — | **new `mdf <host> mdf.json 0.3.1`** | `"mdf_version": "0.3.1"` on `/mdf.json` |
-| — | — | **new `mdf v2 <leg> gas 8453`** (one per leg, on the leg's own URL) | inverted `"network":"eip155:8453","address":"<leg signer>","balanceWei":"0"` — alerts only at exactly zero, which is the state that breaks every mainnet settle (#63 step 4) |
-| — | — | **new `mdf <host> valkey outage`** | inverted, keyword `"category":"unreachable"` — inverted means it alerts when the string is *present*, so it fires only on an outage; the category has to be named because `"category":"auth"` (wrong password) is a different fault and must not trip it |
+| `MDF Demo (<host>) mdf.json 0.3.1` | `/mdf.json` | keyword | `"mdf_version": "0.3.1"` — with the space: the document is pretty-printed |
+| `MDF Demo (<host>) rail 8453 ok` | `/health` | keyword | `"rail":"eip155:8453","status":"ok"` |
+| `MDF Demo (<host>) rail 84532 ok` | `/health` | keyword | `"rail":"eip155:84532","status":"ok"` |
+| `MDF Demo (<host>) lnbtc ok` | `/health` | keyword | `"rail":"lnbtc:000000000019d6689c085ae165831e93","status":"ok"` |
+| `MDF Demo (<host>) lightning health` | `/health` | keyword, **inverted** | `degraded` |
+| `MDF Demo (<host>) token store ok` | `/health` | keyword, **inverted** | `"token_store":{"status":"unavailable"` |
+| `MDF Demo (<host>) replay store ok` | `/health` | keyword, **inverted** | `"replay_store":{"status":"unavailable"` |
+| `MDF Demo (<host>) valkey unreachable (token)` | `/health` | keyword, **inverted** | `"token_store":{"status":"unavailable","category":"unreachable"` |
+| `MDF Demo (<host>) valkey unreachable (replay)` | `/health` | keyword, **inverted** | `"replay_store":{"status":"unavailable","category":"unreachable"` |
+| `MDF Demo (<host>) lnbtc offered` | `/micropayment/intro` | keyword, 402 accepted | `lnbtc:000000000019d6689c085ae165831e93` — mints one invoice per probe: keep it at 300 s (§4) |
 
-The store checks now probe the way a request does (AUTH plus a cheap command on
-the authenticated connection) and name the failure kind, so the body reads
-`"token_store":{"status":"unavailable","category":"auth"}` when the password is
-wrong and `…"category":"unreachable"` when nothing answers. The design note's
-flat `"replay_store":"unavailable"` shape is superseded by this one, because a
-category is what makes the failure actionable.
+`inverted` alerts when the keyword **is present**. The two `valkey unreachable`
+monitors overlap the two plain `store ok` ones deliberately: the plain ones page
+on *any* store fault, the anchored pair distinguishes "Valkey is not answering"
+from "Valkey answers but rejects us", which is the difference between a
+container-down page and a credential page.
 
-If Kuma has JSON Query with an expected value, prefer
-`$.rails[?(@.rail=='eip155:8453')].status` → `ok`. Keep the `mdf-v2-staging`
-tag; notifications stay off until the cutover is verified.
+### Public — one set, named `MDF public …`
+
+| monitor | path | type | keyword |
+|---|---|---|---|
+| `MDF public mdf.json 0.3.1` | `/mdf.json` | keyword | `"mdf_version": "0.3.1"` |
+| `MDF public rail 8453 ok` | `/health` | keyword | `"rail":"eip155:8453","status":"ok"` |
+| `MDF public lnbtc offered` | `/micropayment/intro` | keyword, 402 accepted | `lnbtc:000000000019d6689c085ae165831e93` (mints — 300 s) |
+| `MDF public home` — rename of `MDF Demo (live via caddy)` | `/` | keyword | `Micropayment sample` |
+
+### Per leg — `MDF v2 (syd leg)` and `MDF v2 (pub leg)`
+
+| monitor | path | type | keyword / expression |
+|---|---|---|---|
+| `MDF v2 (<leg>) supported` | `/supported` | keyword | that leg's signer: `0x0eebFF43652C205B51116C8E98dc1Ce2dC03ed2E` (syd), `0x496517b27772935895bcc17B98c8a5DbB541b648` (pub) |
+| `MDF v2 (<leg>) health live` | `/health` | keyword | `"stale":false` |
+| `MDF v2 (<leg>) gas 8453` | `/health` | **json-query** | `$number(signers[network='eip155:8453'].balanceWei) >= 200000000000000`, expected value `true` |
+| `MDF v2 (<leg>) sepolia empty` | `/health` | keyword, **inverted** | `"network":"eip155:84532","address":"<that leg's signer>","balanceWei":"0"` |
+
+### Why the gas check is a JSON Query and not a zero check
+
+A keyword alert on `"balanceWei":"0"` fires only once settlements have already
+started failing. Kuma 1.23.17 ships `jsonata` 2.1.0 and compares the expression's
+result with `result.toString() === expectedValue`, so a boolean expression with
+the expected value `true` is a proper "healthy while above the threshold" check.
+
+Two details that make or break it:
+
+- `balanceWei` is a **string** in the body, so `$number(...)` is required. A bare
+  comparison would compare text.
+- `>=` at the threshold rather than `>`: at exactly `200000000000000` wei the
+  leg is still healthy, and `>` would page there.
+
+Measured in Kuma's own runtime (Node 18.20.3, jsonata 2.1.0) on 2026-11-13, with
+the same `toString()` comparison Kuma uses:
+
+| body | result | monitor |
+|---|---|---|
+| live syd, `1000000000000000` | `true` | UP |
+| live pub, `999410182020393` | `true` | UP |
+| `0` | `false` | DOWN |
+| `199999999999999` | `false` | DOWN |
+| `200000000000000` (exactly) | `true` | UP |
+| no `eip155:8453` entry | `undefined` | DOWN |
+
+`200000000000000` wei is 0.0002 ETH, 20% of the 0.001 ETH each signer was
+funded with, and at the measured 0.00000059 ETH per settle it is about 340
+settles of runway before the page — early enough to top up, late enough not to
+page on a single busy day. Gary can change the number.
+
+### Two monitors are already red because of the upgrade
+
+`MDF Demo (syd) wallet` and `MDF Demo (public) wallet` are json-query monitors on
+`payment.wallet`: the 0.3.1 `/mdf.json` has no `payment` block, so both fail with
+`Cannot read properties of undefined (reading 'toString')` and the group
+`MDF Demo servers` is red only because of them.
+
+Replace them with the same intent in the new shape — the payee now lives in the
+402, not in `/mdf.json`:
+
+| monitor | path | type | keyword |
+|---|---|---|---|
+| `MDF Demo (<host>) evm payTo` | `/premium/deep-dive` | keyword, 402 accepted | `"payTo":"0xa7D911138322aF8823642beA2b174dFaC2725fB7"` |
+
+Keep the `mdf-v2-staging` tag on the new monitors; notifications stay off until
+they have been green for a soak.
 
 ## 3. Order (server and pool are independent now)
 
@@ -289,12 +367,25 @@ containers keep their tailnet identity (state is under `/app/data`).
 
 ## 4. Mint-budget numbers, as deployed
 
-Global 180/min burst 60; per client 24/min burst 8. The two `lnbtc offered`
-probes at one per 5 minutes are 0.4/min: 0.2% of global, 1.7% of one client's
-budget. Retuned to 60 s (as §2 suggests) it is 1.1% global and **8.3% of one
-client's** — under the 10% ceiling, which is why the per-client refill is 24
-rather than 12. A probe that exhausted its own bucket would see the rail omitted
-and alert on itself; it cannot starve a real user.
+Global 180/min burst 60; per client 24/min burst 8 (per client is keyed on the
+caller's address, and every Kuma probe comes from the one `uptimekuma` node, so
+they share a single bucket).
+
+Only `lnbtc offered` mints an invoice; every other monitor just reads
+`/health`, `/mdf.json`, `/`, `/supported` or a 402 on another tier.
+
+| probes | rate at 300 s | share of global | share of one client |
+|---|---|---|---|
+| 2 per-host `lnbtc offered` (the #48 monitors) | 0.4/min | 0.2% | 1.7% |
+| **3** with `MDF public lnbtc offered` added | **0.6/min** | **0.33%** | **2.5%** |
+
+At 60 s the three would be 3/min: 1.7% global but **12.5% of one client**, over
+the 10% ceiling — so the minting probes stay at 300 s. 90 s is the fastest
+interval that still fits (2/min, 8.3% of one client) if faster lnbtc alerting is
+ever wanted.
+
+A probe that exhausted its own bucket would see the rail omitted from its 402 and
+alert on itself; it cannot starve a real user.
 
 ## 5. Rollback
 
