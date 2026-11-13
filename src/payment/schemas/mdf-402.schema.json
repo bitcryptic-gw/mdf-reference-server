@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/bitcryptic-gw/mdf/mdf-402.schema.json",
+  "title": "MDF 402 Payment Required response body (x402 v2)",
+  "description": "Describes the JSON body a server emits with a 402 Payment Required response to an Accept: text/markdown request, and the same object carried base64-encoded in the PAYMENT-REQUIRED response header. The body is an x402 v2 PaymentRequired (specs/x402-specification-v2.md §5.1, at x402-foundation/x402 commit 513dd66d2b3eb2388065f9923d81aa496e626082) with MDF's own fields under the `mdf` key of `extensions` (§5.1.2). This schema describes server output; it places no obligation on consumers. Note that `format` is annotation-only in Draft 2020-12 unless the validator registers a format plugin — the accompanying `pattern` on each string field is the load-bearing constraint. Unlike x402 core, this schema requires the `mdf` extension entry, because the MDF price summary is a normative part of an MDF 402. Strictness profile: the root object is closed (`additionalProperties: false`) so that a v1-shaped field left at the top level is reported rather than silently tolerated; each `accepts[]` entry is open, because a non-standard rail may legitimately carry guidance fields and one unknown entry must never fail the whole offer; and `extensions` stays open to other extension keys, with only the `mdf` entry defined strictly here.",
+  "type": "object",
+  "required": ["x402Version", "resource", "accepts", "extensions"],
+  "additionalProperties": false,
+  "properties": {
+    "x402Version": {
+      "const": 2,
+      "description": "x402 protocol version. MDF 0.3.0 is x402 v2 only; there is no v1 mode."
+    },
+    "error": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "Human-readable explanation of why payment is required, e.g. 'PAYMENT-SIGNATURE header is required'. Advisory only; never parse this to extract price."
+    },
+    "resource": { "$ref": "#/$defs/resourceInfo" },
+    "accepts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/paymentRequirements" },
+      "description": "One entry per configured rail. A rail that cannot currently be offered is omitted, never replaced with a placeholder; if no rail can be offered the response is not a 402."
+    },
+    "extensions": {
+      "type": "object",
+      "required": ["mdf"],
+      "additionalProperties": true,
+      "properties": {
+        "mdf": { "$ref": "#/$defs/mdfExtension" }
+      },
+      "description": "x402 v2 protocol extensions. MDF requires its own entry under the key `mdf` and defines that entry strictly, but the map itself stays open: any other extension key (for example `bazaar`) is permitted and passes through untouched. This is the schema's strictness profile — closed root, open accepts[] entries, open extension map."
+    }
+  },
+  "$defs": {
+    "resourceInfo": {
+      "type": "object",
+      "required": ["url"],
+      "additionalProperties": true,
+      "description": "x402 v2 ResourceInfo. `url` is the one field in a 402 a consumer cannot reconstruct once the response is separated from the request that produced it.",
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "maxLength": 2048,
+          "description": "Absolute URL of the resource being priced, including query string. MUST equal the URL the client requested."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "Human-readable description of the protected resource."
+        },
+        "mimeType": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "MIME type of the expected response, e.g. text/markdown."
+        },
+        "serviceName": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Human-readable name of the service hosting the resource. Printable ASCII, max 32 characters."
+        },
+        "tags": {
+          "type": "array",
+          "maxItems": 5,
+          "items": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "description": "Topical tags for discovery filtering. Max 5 entries; each printable ASCII, max 32 characters."
+        },
+        "iconUrl": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 2048,
+          "description": "Absolute http(s) URL to an icon representing the service."
+        }
+      }
+    },
+
+    "paymentRequirements": {
+      "type": "object",
+      "required": ["scheme", "network", "amount", "asset", "payTo", "maxTimeoutSeconds"],
+      "additionalProperties": true,
+      "description": "An x402 v2 PaymentRequirements object. `scheme` and `network` are deliberately open: an entry on a network or scheme MDF does not define is out of scope, and a consumer should skip it rather than fail the whole offer. The two rails MDF defines (`exact` on eip155, `exact` on lnbtc) are constrained by the conditionals at the end of this definition. A non-`exact` scheme defines its own asset identifier and may name its network with a bounded opaque identifier; `exact` requires a CAIP-2 network and a token contract address. This schema bounds those fields rather than enumerating them.",
+      "properties": {
+        "scheme": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "x402 payment scheme, e.g. 'exact'. MDF defines 'exact'; any other scheme is carried as the publisher's own rail and is not evaluated by MDF."
+        },
+        "network": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9:._/-]{1,64}$",
+          "description": "Settlement network for this rail. An 'exact' rail MUST use a CAIP-2 identifier, namespace:reference — the pattern x402 v2 uses (typescript/packages/core/src/schemas/index.ts, NetworkSchemaV2); MDF uses eip155:8453, eip155:84532 and lnbtc:000000000019d6689c085ae165831e93. A non-'exact' scheme MAY name its network with an opaque bounded identifier (for example 'monad-testnet' alongside a `chainId`), which SHOULD still be CAIP-2 and which a consumer normalises before comparing against mdf.json. mdf.json itself always uses CAIP-2."
+        },
+        "amount": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)$",
+          "description": "Required payment amount in the asset's atomic units, as an integer decimal string: micro-USDC for a 6-decimal stablecoin, millisatoshis for Lightning. No sign, decimal point, exponent, separator or unit suffix."
+        },
+        "asset": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The asset paid on this rail, as the scheme identifies it: a token contract address (0x-prefixed, 40 hex digits) on an 'exact' EVM rail, the asset symbol 'BTC' on 'exact' lnbtc, or — on any other scheme — the opaque identifier that scheme defines (for example 'native' for a gas-token rail). Never a fiat currency code and never a display name."
+        },
+        "payTo": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Recipient for this rail: an EVM address for an eip155 rail, the receiver node's compressed secp256k1 public key for the lnbtc rail."
+        },
+        "maxTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "description": "Maximum time allowed for payment completion. On the lnbtc rail the BOLT11 invoice expiry MUST equal this value."
+        },
+        "extra": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Scheme-specific data, passed through to the facilitator's /verify and /settle. Opaque to MDF except where a scheme below requires a member."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "network": { "pattern": "^lnbtc:" } },
+            "required": ["network"]
+          },
+          "then": {
+            "properties": {
+              "scheme": { "const": "exact" },
+              "amount": { "pattern": "^[1-9][0-9]*$" },
+              "asset": { "const": "BTC" },
+              "payTo": {
+                "pattern": "^(02|03)[0-9a-f]{64}$",
+                "description": "Compressed secp256k1 public key of the receiving Lightning node: 33 bytes as 66 lowercase hex characters, no prefix."
+              },
+              "extra": {
+                "type": "object",
+                "required": [
+                  "paymentFlow",
+                  "invoice",
+                  "requestHash",
+                  "requestBindingProfile",
+                  "requestBindingParams"
+                ],
+                "properties": {
+                  "assetTransferMethod": { "const": "bolt11" },
+                  "paymentFlow": { "const": "upfront" },
+                  "invoice": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Fresh signed BOLT11 invoice for `amount` on `network`. Its expiry MUST equal maxTimeoutSeconds."
+                  },
+                  "requestHash": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "description": "SHA-256 of the JCS-canonicalised request binding object, which MUST equal the invoice's signed description hash."
+                  },
+                  "requestBindingProfile": {
+                    "type": "string",
+                    "enum": ["http:1", "mcp:1"]
+                  },
+                  "requestBindingParams": { "type": "object" }
+                },
+                "description": "Required members follow specs/schemes/exact/scheme_exact_lnbtc.md, which is authoritative for invoice construction, request binding and replay. MDF does not restate them. This branch is keyed on the `lnbtc:` namespace, so it covers every lnbtc network the upstream scheme defines — MDF names no testnet of its own."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "network": { "pattern": "^eip155:" },
+              "scheme": { "const": "exact" }
+            },
+            "required": ["network", "scheme"]
+          },
+          "then": {
+            "properties": {
+              "asset": { "pattern": "^0x[0-9a-fA-F]{40}$" },
+              "payTo": { "pattern": "^0x[0-9a-fA-F]{40}$" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "scheme": { "const": "exact" } },
+            "required": ["scheme"]
+          },
+          "then": {
+            "properties": {
+              "network": { "pattern": "^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$" },
+              "asset": { "pattern": "^(0x[0-9a-fA-F]{40}|[A-Z0-9]{2,10})$" }
+            }
+          },
+          "else": {
+            "properties": {
+              "asset": { "pattern": "^[A-Za-z0-9:._/-]{1,128}$" }
+            }
+          }
+        }
+      ]
+    },
+
+    "mdfExtension": {
+      "type": "object",
+      "required": ["info", "schema"],
+      "additionalProperties": false,
+      "description": "MDF's extension entry, in the structure x402 v2 §5.1.2 defines for every extension: `info` carries the data, `schema` is a JSON Schema describing it.",
+      "properties": {
+        "info": { "$ref": "#/$defs/mdfExtensionInfo" },
+        "schema": {
+          "type": "object",
+          "description": "JSON Schema for `info`. A live response MUST include one that describes the info object it actually emits. The authoritative copy is $defs/mdfExtensionInfo in this file."
+        }
+      }
+    },
+
+    "mdfExtensionInfo": {
+      "type": "object",
+      "required": ["version", "price_summary"],
+      "additionalProperties": false,
+      "description": "MDF's own 402 fields. Snake_case, and scoped to the extension: nothing here restates accepts[].amount, accepts[].payTo or accepts[].network in machine-readable form.",
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "description": "MDF specification version this response conforms to, MAJOR.MINOR.PATCH. For 0.3.0 that is '0.3.0'."
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$",
+          "description": "RFC 3339 timestamp after which this offer is no longer valid. Optional (a server SHOULD emit it): each rail's maxTimeoutSeconds, and on the lnbtc rail the BOLT11 invoice expiry that must equal it, already bound when the offer can be paid. Where both are present, expires_at MUST NOT outlive the rail's own bounded validity."
+        },
+        "price_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Human-readable price summary, derived from accepts[] and required to agree with it. Descriptive only: no structured amount, payTo or network member appears here."
+        },
+        "source_bytes": { "$ref": "#/$defs/byteCount" },
+        "savings": { "$ref": "#/$defs/savings" },
+        "auth_endpoint": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://",
+          "maxLength": 2048,
+          "description": "Present where payment at this tier issues a bearer credential rather than delivering content immediately. This is the same location /mdf.json declares as auth.endpoint for a section whose price entry carries access: token."
+        },
+        "token_estimate": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000,
+          "description": "Optional heuristic token estimate. Never authoritative. If present, token_estimate_note MUST also be present."
+        },
+        "token_estimate_note": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Description of the estimation method, e.g. 'chars/4 approximation'."
+        }
+      },
+      "dependentRequired": {
+        "token_estimate": ["token_estimate_note"]
+      }
+    },
+
+    "byteCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1099511627776,
+      "description": "A byte length. Bounded to reject implausible values from an untrusted origin."
+    },
+
+    "savings": {
+      "type": "object",
+      "required": ["source_bytes", "markdown_bytes", "reduction_pct"],
+      "additionalProperties": false,
+      "properties": {
+        "source_bytes": { "$ref": "#/$defs/byteCount" },
+        "markdown_bytes": { "$ref": "#/$defs/byteCount" },
+        "reduction_pct": {
+          "type": "number",
+          "minimum": -1000,
+          "maximum": 100,
+          "description": "(1 - markdown_bytes / source_bytes) * 100, one decimal place. May be negative where conversion increases size."
+        }
+      }
+    }
+  }
+}

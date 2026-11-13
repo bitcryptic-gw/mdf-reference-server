@@ -5,6 +5,8 @@ import { marked } from "marked";
 import matter from "gray-matter";
 import { prefersMarkdown } from "./accept.ts";
 import type { LoadedConfig } from "../config/loader.ts";
+import { isFreeEntry, isLnbtcNetwork, pricingView, resolvePriceEntry } from "../payment/rails.ts";
+import { lookupAsset } from "../config/assets.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -100,41 +102,11 @@ export function htmlSourceBytesForPath(
 // ---------------------------------------------------------------------------
 
 /**
- * Find the most specific price entry for a given URL path.
- * Glob matching: ** matches across segments, * matches within a segment.
+ * The price entry governing a path — the same resolver the payment layer uses,
+ * so a response's informational headers can never disagree with the 402.
  */
-function priceForPath(
-  urlPath: string,
-  config: LoadedConfig["config"]
-): { amount: string; currency: string | null | undefined; chain: string | null | undefined } {
-  const sections = config.pricing.sections ?? {};
-
-  // Convert glob pattern to regex
-  function globToRegex(pattern: string): RegExp {
-    const escaped = pattern
-      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-      .replace(/\*\*/g, "§DOUBLE§")
-      .replace(/\*/g, "[^/]+")
-      .replace(/§DOUBLE§/g, ".*");
-    return new RegExp(`^${escaped}$`);
-  }
-
-  // Find the most specific matching section — longer pattern = more specific
-  let bestPattern: string | null = null;
-  let bestLength = -1;
-
-  for (const pattern of Object.keys(sections)) {
-    const regex = globToRegex(pattern);
-    if (regex.test(urlPath)) {
-      if (pattern.length > bestLength) {
-        bestPattern = pattern;
-        bestLength = pattern.length;
-      }
-    }
-  }
-
-  if (bestPattern) return sections[bestPattern];
-  return config.pricing.default;
+function entryForPath(urlPath: string, config: LoadedConfig["config"]) {
+  return resolvePriceEntry(urlPath, pricingView(config)).entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,16 +178,23 @@ function mdfHeaders(
   sourceBytes: number,
   config: LoadedConfig["config"]
 ): Record<string, string> {
-  const price = priceForPath(urlPath, config);
+  const entry = entryForPath(urlPath, config);
 
   const headers: Record<string, string> = {
     "X-MDF-Version": "1",
     "X-MDF-Source-Bytes": String(sourceBytes),
   };
 
-  if (parseFloat(price.amount) > 0 && price.currency) {
-    headers["X-MDF-Price"] = price.amount;
-    headers["X-MDF-Currency"] = price.currency;
+  // Informational only: the authoritative price set is the 402's `accepts[]`
+  // (and `/mdf.json`), which is where a multi-rail price can be stated in full.
+  // A single header can only carry one rail, so these report the first
+  // configured rail, in config order.
+  const primary = entry.rails[0];
+  if (primary) {
+    headers["X-MDF-Price"] = primary.amount;
+    headers["X-MDF-Currency"] = isLnbtcNetwork(primary.network)
+      ? "BTC"
+      : lookupAsset(primary.network, primary.asset)?.symbol ?? primary.asset;
   }
 
   return headers;
@@ -297,7 +276,7 @@ export function serveContent(
   // Pricing decides caching semantics. A free resource is cacheable and
   // revalidated with validators; a paid resource must never be stored by a
   // shared cache, so it carries no validators and is never answered 304.
-  const isPriced = parseFloat(priceForPath(urlPath, config).amount) > 0;
+  const isPriced = !isFreeEntry(entryForPath(urlPath, config));
 
   // Determine what markdown content to serve
   // If frontmatter is enabled in config, include it in the markdown response;

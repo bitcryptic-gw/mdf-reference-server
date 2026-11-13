@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>wp-fab-syd</Name>
+  <Repository>wordpress:php8.4-apache</Repository>
+  <Registry>https://hub.docker.com/_/wordpress/</Registry>
+  <Network>fab-net</Network>
+  <MyIP/>
+  <MyMAC/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://forums.unraid.net/topic/88258-support-kru-x-wordpress/</Support>
+  <Project>https://wordpress.org/</Project>
+  <ReadMe/>
+  <Overview>WordPress is a free and open source blogging tool and a content management system (CMS) based on PHP and MySQL, which runs on a web hosting service.&#13;
+Use MariaDB (recommended) or Mysql as the external database.</Overview>
+  <Category>Other: Network:Web</Category>
+  <WebUI>http://[IP]:[PORT:80]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Kru-x/unraid-docker-templates/master/Kru-x/wordpress.xml</TemplateURL>
+  <Icon>https://s.w.org/style/images/about/WordPress-logotype-wmark.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled>1793419871</DateInstalled>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>MariaDB / MySQL database installed</Requires>
+  <Config Name="www" Target="/var/www/html" Default="" Mode="rw" Description="" Type="Path" Display="always" Required="false" Mask="false">/mnt/cache/appdata/wordpress-fabrepairs</Config>
+  <Config Name="WORDPRESS_DB_HOST" Target="WORDPRESS_DB_HOST" Default="" Mode="" Description="External database container hostname and port &#13;&#10;ex. 192.168.1.100:8080" Type="Variable" Display="always" Required="false" Mask="false">MariaDB-WP-FabRepairs</Config>
+  <Config Name="WORDPRESS_DB_USER" Target="WORDPRESS_DB_USER" Default="" Mode="" Description="External database user" Type="Variable" Display="always" Required="false" Mask="false">wp</Config>
+  <Config Name="WORDPRESS_DB_NAME" Target="WORDPRESS_DB_NAME" Default="" Mode="" Description="The WORDPRESS_DB_NAME needs to already exist on the given DB server; it will not be created by the wordpress container." Type="Variable" Display="always" Required="false" Mask="false">wordpress</Config>
+  <Config Name="WORDPRESS_DB_PASSWORD_FILE" Target="WORDPRESS_DB_PASSWORD_FILE" Default="" Mode="" Description="" Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Host Path 2" Target="/run/secrets/wp-db.pw" Default="" Mode="ro" Description="" Type="Path" Display="always" Required="false" Mask="false">/mnt/cache/appdata/secrets/fab-unraid-syd/wp-db.pw</Config>
+  <Config Name="TailScale Fallback State Directory" Target="CA_TS_FALLBACK_DIR" Default="/var/www/html" Mode="{3}" Description="Fallback container directory for tailscale state information - Added By Community Applications" Type="Variable" Display="advanced" Required="{7}" Mask="{8}">/var/www/html</Config>
+  <TailscaleEnabled>true</TailscaleEnabled>
+  <TailscaleIsExitNode>false</TailscaleIsExitNode>
+  <TailscaleHostname>wp-fab-syd</TailscaleHostname>
+  <TailscaleExitNodeIP/>
+  <TailscaleSSH>false</TailscaleSSH>
+  <TailscaleUserspaceNetworking>false</TailscaleUserspaceNetworking>
+  <TailscaleLANAccess>false</TailscaleLANAccess>
+  <TailscaleServe>no</TailscaleServe>
+  <TailscaleWebUI>http://[noserve]:80/</TailscaleWebUI>
+  <TailscaleDParams/>
+  <TailscaleParams/>
+  <TailscaleRoutes/>
+  <TailscaleAcceptRoutes>false</TailscaleAcceptRoutes>
+  <TailscaleStateDir/>
+</Container>
