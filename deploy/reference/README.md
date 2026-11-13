@@ -64,8 +64,16 @@ Not applied to any host. Each file passes a strict parse and the dockerMan harne
 |---|---|---|
 | `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.2`, failover secondary | `fa50f2fb4096bce3295dfeaa0cfca63693660d7959cd4c9718fe721b9f006c0e` |
 | `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.2` | `32446e90c15c9dd14d636433dd628257b3ba628ee6bd7926a4ee2dafad2c7341` |
-| `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `142e0f7068d6f0a436e07932ba055167e288c77b1dfbf080aecb25bf70788f52` |
-| `valkey.conf` | Valkey server config, mounted read-only (AOF, noeviction, ACL file) | `43d248e68647422d8f05bc82e51719b6accef769a44903feba5ffcae0dc1d6cf` |
+| `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `78e98f2261a38878b9f32d68262580d3228c4239e36c2792f8a67a17c8a9995b` |
+| `valkey.conf` | Valkey server config, mounted read-only (AOF, noeviction, ACL file) | `b103e174097edf34166c927ffa6b03d32a2767db972a77a8f65fc087efb101e7` |
+
+Host-path note (corrected 2026-11-13, cutover preflight): **unraid-private has no `cache`
+pool** — its `appdata` share sits on the single XFS pool `localdata`
+(`shareCachePool="localdata"`, `shareUseCache="only"`), and `/mnt/cache` does not exist on
+that host. The Valkey binds were changed from `/mnt/cache/appdata/mdf-valkey/...` to
+`/mnt/localdata/appdata/mdf-valkey/...`: the direct pool path, not shfs (`/mnt/user`), because
+the mount holds an AOF directory. The two demo-server templates are unaffected — their hosts
+do have `/mnt/cache`. The hashes above are the post-correction ones.
 
 Image pins:
 
@@ -107,19 +115,24 @@ rejoin from the persisted state.
 
 ### Before first start (Gary, on unraid-private)
 
+Paths are on the `localdata` pool (see the host-path note above), not `/mnt/cache`.
+
 ```bash
-mkdir -p /mnt/cache/appdata/mdf-valkey/{data,secrets}
-cp valkey.conf /mnt/cache/appdata/mdf-valkey/valkey.conf
-openssl rand -hex 32 > /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl.tmp
-printf 'user default on >%s ~* &* +@all\n' "$(cat /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl.tmp)" \
-  > /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl
-rm /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl.tmp
-chmod 600 /mnt/cache/appdata/mdf-valkey/secrets/valkey_acl
+mkdir -p /mnt/localdata/appdata/mdf-valkey/{data,secrets}
+cp valkey.conf /mnt/localdata/appdata/mdf-valkey/valkey.conf
+# The ACL line is written directly from the same file that is then copied to the
+# two demo nodes; there is no separate plaintext copy to delete afterwards.
+openssl rand -hex 32 > /mnt/localdata/appdata/mdf-valkey/secrets/valkey_password.src
+chmod 600 /mnt/localdata/appdata/mdf-valkey/secrets/valkey_password.src
+printf 'user default on >%s ~* &* +@all\n' "$(cat /mnt/localdata/appdata/mdf-valkey/secrets/valkey_password.src)" \
+  > /mnt/localdata/appdata/mdf-valkey/secrets/valkey_acl
+chmod 600 /mnt/localdata/appdata/mdf-valkey/secrets/valkey_acl
 ```
 
-Put that same 64-hex value in **both** demo nodes'
-`/mnt/cache/appdata/<appdata-dir>/secrets/valkey_password` (mode 600). They must match; rotate
-both together.
+Step 4a of the cutover brief replaces this with the ordered script (generate, build the ACL,
+copy the password to both demo hosts, *then* remove the local plaintext). The value in
+`valkey_acl` and in both demo nodes' `valkey_password` files must be identical; rotate both
+together.
 
 ## ACL grants (cutover)
 

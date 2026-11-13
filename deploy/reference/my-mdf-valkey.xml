@@ -24,6 +24,13 @@
   Apply through the Unraid Docker UI (Docker -> Add Container), not with
   `docker run`, so `my-mdf-valkey.xml` is regenerated and
   `net.unraid.docker.managed=dockerman` is set. Pinned by digest.
+
+  Host paths: unraid-private has no cache pool named "cache"; its appdata share
+  lives on the single XFS pool "localdata" (shareCachePool=localdata,
+  shareUseCache=only). The binds therefore use the direct pool path
+  /mnt/localdata/appdata/mdf-valkey/... rather than /mnt/cache/... (which does
+  not exist on that host) or /mnt/user/... (shfs/FUSE, unsuitable for an AOF
+  directory).
 -->
 <Container version="2">
   <Name>mdf-valkey</Name>
@@ -54,9 +61,9 @@ Losing this store degrades lnbtc and denies token issuance; it never takes conte
   <DonateLink/>
   <Requires/>
   <Description>Valkey 8.1 for MDF 0.3.0: shared lnbtc replay store and token store. Tailnet-only, no published port, AOF persistence, password from a mounted ACL file.</Description>
-  <Config Name="Valkey config" Target="/etc/valkey/valkey.conf" Default="/mnt/cache/appdata/mdf-valkey/valkey.conf" Mode="ro" Description="Server config file: AOF on, no eviction, ACL file path. Read-only." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/mdf-valkey/valkey.conf</Config>
-  <Config Name="ACL file" Target="/run/secrets/valkey_acl" Default="/mnt/cache/appdata/mdf-valkey/secrets/valkey_acl" Mode="ro" Description="Valkey ACL file holding the default user's password (mode 600). This is the password the demo nodes send as AUTH." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/mdf-valkey/secrets/valkey_acl</Config>
-  <Config Name="Data" Target="/data" Default="/mnt/cache/appdata/mdf-valkey/data" Mode="rw" Description="AOF directory (appendonlydir) and tailnet state. Must be on persistent storage; the replay records are the lnbtc rail's only durable state." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/mdf-valkey/data</Config>
+  <Config Name="Valkey config" Target="/etc/valkey/valkey.conf" Default="/mnt/localdata/appdata/mdf-valkey/valkey.conf" Mode="ro" Description="Server config file: AOF on, no eviction, ACL file path. Read-only." Type="Path" Display="always" Required="true" Mask="false">/mnt/localdata/appdata/mdf-valkey/valkey.conf</Config>
+  <Config Name="ACL file" Target="/run/secrets/valkey_acl" Default="/mnt/localdata/appdata/mdf-valkey/secrets/valkey_acl" Mode="ro" Description="Valkey ACL file holding the default user's password (mode 600). This is the password the demo nodes send as AUTH." Type="Path" Display="always" Required="true" Mask="false">/mnt/localdata/appdata/mdf-valkey/secrets/valkey_acl</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/localdata/appdata/mdf-valkey/data" Mode="rw" Description="AOF directory (appendonlydir) and tailnet state. Must be on persistent storage; the replay records are the lnbtc rail's only durable state." Type="Path" Display="always" Required="true" Mask="false">/mnt/localdata/appdata/mdf-valkey/data</Config>
   <Config Name="ORG_ENTRYPOINT" Target="ORG_ENTRYPOINT" Default="/usr/local/bin/docker-entrypoint.sh" Mode="" Description="Original Docker entrypoint, restored by the Unraid Tailscale hook." Type="Variable" Display="advanced-hide" Required="false" Mask="false">/usr/local/bin/docker-entrypoint.sh</Config>
   <Config Name="ORG_CMD" Target="ORG_CMD" Default="valkey-server /etc/valkey/valkey.conf" Mode="" Description="Original Docker command, restored by the Unraid Tailscale hook." Type="Variable" Display="advanced-hide" Required="false" Mask="false">valkey-server /etc/valkey/valkey.conf</Config>
   <TailscaleEnabled>true</TailscaleEnabled>
