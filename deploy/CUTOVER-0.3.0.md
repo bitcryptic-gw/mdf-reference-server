@@ -84,8 +84,9 @@ Per-host values that differ:
 
 New secret files on both hosts (mode 600, owner root, mounted read-only):
 
-- `secrets/nwc_uri` — the instance's own dedicated NWC connection,
-  `make_invoice` + `get_info` only. `mdf-server-syd` → app `mdf-server-syd`;
+- `secrets/nwc_uri` — the instance's own dedicated NWC connection, Alby Hub's
+  "Read your node info" + "Create invoices" scope (see step 3 of §3 for the exact
+  tolerated method set). `mdf-server-syd` → app `mdf-server-syd`;
   `MDF-Server-Prod` → app `MDF-Server-Prod`. Created by Gary **before** the
   recreate; without it the container refuses to start while
   `lightning.enabled: true`.
