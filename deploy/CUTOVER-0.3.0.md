@@ -112,6 +112,8 @@ rail is degraded, so a monitor must look at the body, not the status code.
 | — | — | **new `mdf <host> replay store ok`** | inverted `"replay_store":{"status":"unavailable"}` |
 | — | — | **new `mdf <host> token store ok`** | inverted `"token_store":{"status":"unavailable"}` |
 | — | — | **new `mdf <host> mdf.json 0.3.1`** | `"mdf_version": "0.3.1"` on `/mdf.json` |
+| — | — | **new `mdf v2 <leg> gas 8453`** (one per leg, on the leg's own URL) | inverted `"network":"eip155:8453","address":"<leg signer>","balanceWei":"0"` — alerts only at exactly zero, which is the state that breaks every mainnet settle (#63 step 4) |
+| — | — | **new `mdf <host> valkey outage`** | inverted, keyword `"category":"unreachable"` — inverted means it alerts when the string is *present*, so it fires only on an outage; the category has to be named because `"category":"auth"` (wrong password) is a different fault and must not trip it |
 
 The store checks now probe the way a request does (AUTH plus a cheap command on
 the authenticated connection) and name the failure kind, so the body reads
@@ -127,14 +129,78 @@ tag; notifications stay off until the cutover is verified.
 ## 3. Order (server and pool are independent now)
 
 1. **Valkey on unraid-private**: template applied, AOF directory present, ACL
-   file in place, `PING` works with the password and fails without it.
-2. **Tailnet ACL**: `mdf-syd`, `mdf-prod` → `mdf-valkey` `tcp:6379`; both →
-   `mdf-fac-syd`, `mdf-fac-pub` `tcp:8080`; `tag:caddy` → the two nodes
-   `tcp:3000` (already exists). Verify from **inside** both server containers
-   with `nc -z mdf-valkey 6379` and `curl -s -o /dev/null -w '%{http_code}'
-   http://mdf-facilitator-syd:8080/supported` — the server image has **no**
-   `valkey-cli` (it is `oven/bun:alpine`). After the recreate, `/health`'s
-   `replay_store.status` is the authoritative AUTH+PING check from that node.
+   file in place, `PING` works with the password and fails without it. Paths on
+   that host are under `/mnt/localdata/appdata/mdf-valkey/` — unraid-private has
+   no `cache` pool (see `deploy/reference/README.md`, host-path note). Generate
+   the password, build the ACL from it, **copy it to both demo hosts' password
+   files first, and only then** remove the temporary plaintext on
+   unraid-private: the copy is what must not be lost, so the plaintext may only
+   go once both copies exist and have been compared by hash.
+2. **Tailnet ACL**: the two demo nodes → `mdf-valkey` `tcp:6379`; the same two →
+   both facilitator legs `tcp:8080`; `tag:caddy` → the two nodes `tcp:3000`
+   (already exists). The nodes' names in the tailnet are `mdf-server-syd` and
+   `mdf-server-prod`; `mdf-syd`, `mdf-prod`, `mdf-fac-syd` and `mdf-fac-pub` are
+   **not** defined, so a policy written with them matches nothing. See the
+   fragment in §3a.
+
+   Verify from **inside** both current containers — the server image is
+   `oven/bun:alpine` and has **no** `curl` and **no** `valkey-cli`, so use bun.
+   `nc -z` is present and proves reachability only:
+
+   ```sh
+   # reachability
+   docker exec mdf-server-syd nc -z mdf-valkey 6379
+   # HTTP, without curl
+   docker exec mdf-server-syd bun -e 'for (const u of ["http://mdf-facilitator-syd:8080/supported","http://mdf-facilitator-public:8080/supported"]) { try { const r = await fetch(u, {signal: AbortSignal.timeout(5000)}); console.log(r.status, u); } catch (e) { console.log("ERR", u, e.name); } }'
+   # AUTH + PING. The 0.2.9 containers do not mount the password file yet (that
+   # mount is added by the 0.3.0 template), so feed it on stdin from the host's
+   # file — never in argv, an env var or a log line:
+   #   cat <host password file> | docker exec -i mdf-server-syd bun -e '<check>'
+   ```
+
+   After the recreate, `/health`'s `replay_store.status` is the authoritative
+   AUTH+PING check from that node.
+
+   **2a. The ACL fragment, written against what exists.** The policy needs
+   `hosts` entries (node names are not addressable directly) and a `grants` list.
+   IPs are the nodes' current tailnet addresses; `mdf-valkey`'s is only known
+   after it first starts (`tailscale ip -4` on unraid-private). If any of these
+   hosts is already defined under another name, reuse that name instead of adding
+   a second one.
+
+   ```jsonc
+   "hosts": {
+     "mdf-syd":     "100.83.122.107",   // mdf-server-syd
+     "mdf-prod":    "100.126.109.83",   // mdf-server-prod
+     "mdf-fac-syd": "100.73.117.54",    // mdf-facilitator-syd
+     "mdf-fac-pub": "100.72.0.21",      // mdf-facilitator-public
+     "mdf-valkey":  "100.x.x.x"         // after the Valkey container starts
+   },
+   "grants": [
+     { "src": ["mdf-syd", "mdf-prod"], "dst": ["mdf-valkey"], "ip": ["tcp:6379"] },
+     { "src": ["mdf-syd", "mdf-prod"], "dst": ["mdf-fac-syd", "mdf-fac-pub"], "ip": ["tcp:8080"] },
+     { "src": ["tag:caddy"], "dst": ["mdf-syd", "mdf-prod"], "ip": ["tcp:3000"] }
+   ]
+   ```
+
+   The third grant already exists and is listed for completeness only. As of the
+   2026-11-13 preflight the two demo nodes **could not** reach either
+   `mdf-facilitator-*:8080` (TCP connect failure, not DNS), which is the missing
+   second grant — the same pattern seen on 2026-11-10, when `tag:misc-services`
+   accepted `:8080` only from explicitly granted sources. The Kuma node
+   (`uptimekuma`, `100.67.151.96`) needs the same `:8080` treatment if its
+   facilitator monitors read over the tailnet.
+
+   **2b. Mainnet gas for the v2 signers — before the cutover goes public.**
+   `/premium/**` and `/private/**` settle on `eip155:8453`, so a signer with zero
+   mainnet ETH fails every mainnet payment at `/settle`. As of 2026-11-13 both
+   signers read `0x0` on Base mainnet: `0x0eebFF43652C205B51116C8E98dc1Ce2dC03ed2E`
+   (syd leg) and `0x496517b27772935895bcc17B98c8a5DbB541b648` (public leg). Fund
+   both on **chain id 8453** — a signer only needs gas, never USDC — with a small
+   amount sized for a few hundred settlements at current Base fees, and verify the
+   balance on-chain before recreating anything. Until it is funded, `/health`
+   reports `eip155:8453` as not `ok` and overall `status: degraded`; that is
+   expected and is not a rail failure.
 3. **Gary creates the production NWC connections** (`mdf-server-syd`,
    `MDF-Server-Prod`) and writes each `nwc_uri` file. Use Alby Hub's narrowest
    scope — **"Read your node info" + "Create invoices"** — which is what the
@@ -146,11 +212,22 @@ tag; notifications stay off until the cutover is verified.
    the wallet actually reports — check it matches. Revoke the Stage B
    `mdf-server-dev` connection (already done 2026-11-13).
 4. **Validate the new `mdf.yaml` offline** with the 0.3.0 loader — call the
-   loader only, do not start the server:
-   `MDF_SECRETS_DIR=<dir> bun -e 'import {loadConfig} from "./src/config/loader.ts"; const c = loadConfig(process.argv[1]); console.log(c.mdfJson)' <mdf.yaml>`.
-   It exits non-zero on any config error. Running `src/index.ts` would also work
-   (it refuses before binding on a bad config) but it *serves* on a good one and
-   opens NWC, which is not what an offline check should do.
+   loader only, do not start the server. Do it with a **dummy secrets directory**
+   holding correctly formatted fake values (a `0x`-address `wallet_address`, a
+   well-formed `nostr+walletconnect://` `nwc_uri`, a 64-hex `valkey_password`),
+   never the production secrets; and run it from the repo root, because
+   `content.dir: ./content` is resolved against the working directory:
+
+   ```sh
+   # from the repo root, with a dummy secrets dir prepared elsewhere
+   MDF_SECRETS_DIR=<dummy dir> bun -e 'import {loadConfig} from "./src/config/loader.ts"; const c = loadConfig(process.argv[1]); console.log(c.mdfJson)' <mdf.yaml>
+   ```
+
+   It exits non-zero on any config error, including a missing or malformed secret
+   file, so a green exit also proves the three secret files are shaped correctly.
+   Running `src/index.ts` would also work (it refuses before binding on a bad
+   config) but it *serves* on a good one and opens NWC, which is not what an
+   offline check should do.
 5. **Recreate `mdf-server-syd`** (the failover) while `MDF-Server-Prod` serves
    public traffic. Verify directly over the tailnet: `/health` reports
    `version: 0.3.0`, `/mdf.json` says `0.3.1`, a 402 carries both rails on
