@@ -62,9 +62,9 @@ Not applied to any host. Each file passes a strict parse and the dockerMan harne
 
 | file | what it is | sha256 |
 |---|---|---|
-| `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.2`, failover secondary | `fa50f2fb4096bce3295dfeaa0cfca63693660d7959cd4c9718fe721b9f006c0e` |
-| `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.2` | `32446e90c15c9dd14d636433dd628257b3ba628ee6bd7926a4ee2dafad2c7341` |
-| `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `78e98f2261a38878b9f32d68262580d3228c4239e36c2792f8a67a17c8a9995b` |
+| `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.2`, failover secondary | `d721a078196bcb59b933c229c749c9e91c4988307d2f56254bbcf52edc79a9ea` |
+| `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.2` | `8873b332a9c14c4d52c8cc514772bcc16c7590dd644a890a980daf32f62544ea` |
+| `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `eab08bb3ea7f27f3e484cae4008af1124e88791766d0a104c3b546fd019ca5c7` |
 | `valkey.conf` | Valkey server config, mounted read-only (AOF, noeviction, ACL file) | `b103e174097edf34166c927ffa6b03d32a2767db972a77a8f65fc087efb101e7` |
 
 Host-path note (corrected 2026-11-13, cutover preflight): **unraid-private has no `cache`
@@ -98,6 +98,11 @@ Exactly four things, verified by `diff` against the redacted 0.2.9 copies:
    - `/run/secrets/nwc_uri` — the NWC URI, one dedicated connection per instance.
    - `/run/secrets/valkey_password` — the store password, identical to the Valkey ACL entry.
 
+Their `Description` attributes state the required host-side ownership: the app runs as
+`bun` (uid 1000, gid 1000), so these files are `640 root:1000` (or `644 root:root`), never
+`600 root` — a root-only file is unreadable and the container refuses to start. Measured
+against the pinned image by reading the file as `su-exec bun:bun`.
+
 Every Tailscale element, every port/variable/path, `Name`, `ORG_*` and the state-dir shape are
 byte-identical to the 0.2.9 copies. `TailscaleParams` stays empty: the nodes already exist and
 rejoin from the persisted state.
@@ -126,13 +131,25 @@ openssl rand -hex 32 > /mnt/localdata/appdata/mdf-valkey/secrets/valkey_password
 chmod 600 /mnt/localdata/appdata/mdf-valkey/secrets/valkey_password.src
 printf 'user default on >%s ~* &* +@all\n' "$(cat /mnt/localdata/appdata/mdf-valkey/secrets/valkey_password.src)" \
   > /mnt/localdata/appdata/mdf-valkey/secrets/valkey_acl
+chown 999:1000 /mnt/localdata/appdata/mdf-valkey/secrets/valkey_acl
 chmod 600 /mnt/localdata/appdata/mdf-valkey/secrets/valkey_acl
 ```
 
+**Ownership is load-bearing.** The image's entrypoint drops root to its `valkey` user
+(uid 999, gid 1000) before reading `aclfile`, and chowns only `/data`. A root-owned
+`600` ACL file makes the server abort at startup with
+`Aborting Valkey startup because of ACL errors … Permission denied` — measured against
+the pinned digest, in a volume mount, with the file owned by `valkey` and mode `600`
+starting and answering `AUTH`+`PING` correctly.
+
+For the same reason the demo nodes' `valkey_password` files are **`640 root:1000`**, not
+`600 root`: the server runs as `bun` (uid 1000, gid 1000), so a root-only file is
+unreadable and the container refuses to start. `644 root:root` also works and is what the
+0.2.9 files use.
+
 Step 4a of the cutover brief replaces this with the ordered script (generate, build the ACL,
 copy the password to both demo hosts, *then* remove the local plaintext). The value in
-`valkey_acl` and in both demo nodes' `valkey_password` files must be identical; rotate both
-together.
+`valkey_acl` and in both demo nodes' password files must be identical; rotate both together.
 
 ## ACL grants (cutover)
 

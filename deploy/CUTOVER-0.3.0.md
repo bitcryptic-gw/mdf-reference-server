@@ -82,7 +82,11 @@ Per-host values that differ:
 | unraid-syd | `mdf-server-syd` | `[syd, public]` |
 | unraid-public | `MDF-Server-Prod` | `[public, syd]` |
 
-New secret files on both hosts (mode 600, owner root, mounted read-only):
+New secret files on both hosts, mounted read-only. **Ownership matters as much as
+mode: the 0.3.0 server runs as `bun` (uid 1000, gid 1000), so a mode-600 root-owned
+file is unreadable and the container refuses to start.** Use mode `640`, owner
+`root`, group `1000` (`bun`); mode `644` root:root also works and is what the
+0.2.9 files use, but it is world-readable inside the container.
 
 - `secrets/nwc_uri` — the instance's own dedicated NWC connection, Alby Hub's
   "Read your node info" + "Create invoices" scope (see step 3 of §3 for the exact
@@ -90,7 +94,9 @@ New secret files on both hosts (mode 600, owner root, mounted read-only):
   `MDF-Server-Prod` → app `MDF-Server-Prod`. Created by Gary **before** the
   recreate; without it the container refuses to start while
   `lightning.enabled: true`.
-- `secrets/valkey_password` — same 64-hex value as the Valkey ACL entry.
+- `secrets/valkey_password` — same 64-hex value as the Valkey ACL entry. The file
+  ends with a newline (65 bytes); the loader trims it, so what is sent as AUTH is
+  the same 64 hex characters the ACL holds.
 
 Removed from the hosts: `secrets/alby_api_token`, `secrets/lightning_token_secret`
 (the mounts are gone from the templates; the files can be deleted after the
@@ -131,11 +137,21 @@ tag; notifications stay off until the cutover is verified.
 1. **Valkey on unraid-private**: template applied, AOF directory present, ACL
    file in place, `PING` works with the password and fails without it. Paths on
    that host are under `/mnt/localdata/appdata/mdf-valkey/` — unraid-private has
-   no `cache` pool (see `deploy/reference/README.md`, host-path note). Generate
-   the password, build the ACL from it, **copy it to both demo hosts' password
-   files first, and only then** remove the temporary plaintext on
-   unraid-private: the copy is what must not be lost, so the plaintext may only
-   go once both copies exist and have been compared by hash.
+   no `cache` pool (see `deploy/reference/README.md`, host-path note).
+
+   **The ACL file must be owned by the uid Valkey runs as: `999:1000`, mode
+   `600`.** `valkey/valkey:8.1-alpine` starts as root, then its entrypoint drops
+   to the `valkey` user *before* reading `aclfile`, and it only chowns `/data`.
+   A root-owned `600` ACL file makes the server abort immediately with
+   `Aborting Valkey startup because of ACL errors … Permission denied` (verified
+   against the pinned digest; `640` with group `1000` also works, and the
+   directory holding it must be traversable — Docker creates `/run/secrets`
+   `755`, so it is).
+
+   Generate the password, build the ACL from it, **copy it to both demo hosts'
+   password files first, and only then** remove the temporary plaintext on
+   unraid-private: the copy is what must not be lost. The copies go on the demo
+   hosts as `640 root:1000`, not `600 root` — see §1.
 2. **Tailnet ACL**: the two demo nodes → `mdf-valkey` `tcp:6379`; the same two →
    both facilitator legs `tcp:8080`; `tag:caddy` → the two nodes `tcp:3000`
    (already exists). The nodes' names in the tailnet are `mdf-server-syd` and
