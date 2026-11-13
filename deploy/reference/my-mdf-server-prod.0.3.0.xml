@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>MDF-Server-Prod</Name>
-  <Repository>bitcryptic/mdf-reference-server@sha256:90385776b7f069a645d098288d1b0814211ee563a8928aefb5cba9ffbcfab2cc</Repository>
+  <Repository>bitcryptic/mdf-reference-server@sha256:60afaa2732304116369ae761009a0ca00f69c65c6c4054da723ad9f3a6815e44</Repository>
   <Registry>https://hub.docker.com/r/bitcryptic/mdf-server</Registry>
   <Network>bridge</Network>
   <MyIP/>

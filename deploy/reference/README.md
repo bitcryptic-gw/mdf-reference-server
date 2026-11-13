@@ -61,15 +61,15 @@ Not applied to any host. Each file passes a strict parse and the dockerMan harne
 
 | file | what it is | sha256 |
 |---|---|---|
-| `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.1`, failover secondary | `c7aea06556a8341e1f142bcb1f22c599494eb57cb0cf5d70618b9741b06a1ba3` |
-| `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.1` | `7f937cba68898ac328c723cc670d02022c1ffb6f215a9b1dad2a31c202a56ccd` |
+| `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.2`, failover secondary | `fa50f2fb4096bce3295dfeaa0cfca63693660d7959cd4c9718fe721b9f006c0e` |
+| `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.2` | `32446e90c15c9dd14d636433dd628257b3ba628ee6bd7926a4ee2dafad2c7341` |
 | `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `142e0f7068d6f0a436e07932ba055167e288c77b1dfbf080aecb25bf70788f52` |
 | `valkey.conf` | Valkey server config, mounted read-only (AOF, noeviction, ACL file) | `43d248e68647422d8f05bc82e51719b6accef769a44903feba5ffcae0dc1d6cf` |
 
 Image pins:
 
-- server: `bitcryptic/mdf-reference-server@sha256:90385776b7f069a645d098288d1b0814211ee563a8928aefb5cba9ffbcfab2cc`
-  (multi-arch index, `0.3.0-rc.1`; trivy secret scan 0 findings, and a direct grep of an
+- server: `bitcryptic/mdf-reference-server@sha256:60afaa2732304116369ae761009a0ca00f69c65c6c4054da723ad9f3a6815e44`
+  (multi-arch index, `0.3.0-rc.2`; trivy secret scan 0 findings, and a direct grep of an
   exported layer for the wallet address, `tskey-`, private-key headers and NWC URI fragments
   found nothing — the only `nostr+walletconnect` strings are the URI parser's own source)
 - Valkey: `valkey/valkey@sha256:2602ace2be6569bc2bbb06f873776516ab9089821525be34f4305c67eb9db02a`
@@ -79,7 +79,7 @@ Image pins:
 
 Exactly four things, verified by `diff` against the redacted 0.2.9 copies:
 
-1. `<Repository>` → the 0.3.0-rc.1 digest.
+1. `<Repository>` → the 0.3.0-rc.2 digest.
 2. `<Overview>` gains three lines naming the release, the rails and the Valkey store.
 3. **Removed** the `alby_api_token` and `lightning_token_secret` mounts. 0.3.0 reads
    neither: invoicing moved to NWC (`make_invoice`) and the macaroon/HMAC token is gone.

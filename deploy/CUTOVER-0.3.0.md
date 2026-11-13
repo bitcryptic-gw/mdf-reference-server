@@ -9,7 +9,7 @@ Deliverable index:
 |---|---|
 | demo node templates | `deploy/reference/my-mdf-server-syd.0.3.0.xml`, `my-mdf-server-prod.0.3.0.xml` |
 | Valkey template + config | `deploy/reference/my-mdf-valkey.xml`, `valkey.conf` |
-| server image | `bitcryptic/mdf-reference-server@sha256:90385776b7f069a645d098288d1b0814211ee563a8928aefb5cba9ffbcfab2cc` (tag `0.3.0-rc.1`) |
+| server image | `bitcryptic/mdf-reference-server@sha256:60afaa2732304116369ae761009a0ca00f69c65c6c4054da723ad9f3a6815e44` (tag `0.3.0-rc.1`) |
 | Valkey image | `valkey/valkey@sha256:2602ace2be6569bc2bbb06f873776516ab9089821525be34f4305c67eb9db02a` |
 | live `mdf.yaml` | the repo's `mdf.yaml` is the reference; per-host differences are only the facilitator leg order and `site.url` is unchanged |
 
