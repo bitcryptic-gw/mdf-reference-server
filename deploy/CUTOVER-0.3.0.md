@@ -135,8 +135,15 @@ tag; notifications stay off until the cutover is verified.
    `valkey-cli` (it is `oven/bun:alpine`). After the recreate, `/health`'s
    `replay_store.status` is the authoritative AUTH+PING check from that node.
 3. **Gary creates the production NWC connections** (`mdf-server-syd`,
-   `MDF-Server-Prod`), each `make_invoice` + `get_info` only, and writes each
-   `nwc_uri` file. Revoke the Stage B `mdf-server-dev` connection.
+   `MDF-Server-Prod`) and writes each `nwc_uri` file. Use Alby Hub's narrowest
+   scope — **"Read your node info" + "Create invoices"** — which is what the
+   server expects: it tolerates exactly `make_invoice`, `get_info`,
+   `make_hold_invoice`, `settle_hold_invoice`, `cancel_hold_invoice` and
+   `get_budget`, and refuses to start on anything else (including `pay_invoice`,
+   `lookup_invoice`, `get_balance`). A make_invoice-only connection cannot be
+   created in Alby Hub; do not try. Startup logs `lnbtc_credential` with the set
+   the wallet actually reports — check it matches. Revoke the Stage B
+   `mdf-server-dev` connection (already done 2026-11-13).
 4. **Validate the new `mdf.yaml` offline** with the 0.3.0 loader — call the
    loader only, do not start the server:
    `MDF_SECRETS_DIR=<dir> bun -e 'import {loadConfig} from "./src/config/loader.ts"; const c = loadConfig(process.argv[1]); console.log(c.mdfJson)' <mdf.yaml>`.
