@@ -64,7 +64,7 @@ Not applied to any host. Each file passes a strict parse and the dockerMan harne
 |---|---|---|
 | `my-mdf-server-syd.0.3.0.xml` | `mdf-server-syd` at `0.3.0-rc.2`, failover secondary | `d721a078196bcb59b933c229c749c9e91c4988307d2f56254bbcf52edc79a9ea` |
 | `my-mdf-server-prod.0.3.0.xml` | `MDF-Server-Prod` at `0.3.0-rc.2` | `8873b332a9c14c4d52c8cc514772bcc16c7590dd644a890a980daf32f62544ea` |
-| `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `eab08bb3ea7f27f3e484cae4008af1124e88791766d0a104c3b546fd019ca5c7` |
+| `my-mdf-valkey.xml` | new `mdf-valkey` shared store (tailnet node, no host port) | `1ba34dd24bc0ad56347aeb29e5e6ea1ef059ef71436c9454b48879445d820645` |
 | `valkey.conf` | Valkey server config, mounted read-only (AOF, noeviction, ACL file) | `b103e174097edf34166c927ffa6b03d32a2767db972a77a8f65fc087efb101e7` |
 
 Host-path note (corrected 2026-11-13, cutover preflight): **unraid-private has no `cache`
@@ -117,6 +117,27 @@ rejoin from the persisted state.
   Valkey cannot read a password from a file any other way, so an ACL file is the mechanism.
 - AOF `everysec` on `/data`; `maxmemory-policy noeviction` so a replay record can never be
   evicted into a replayable state.
+
+### How the config file reaches the server (this is a trap)
+
+Unraid's dockerMan **overwrites `ORG_ENTRYPOINT` and `ORG_CMD` with the image's own
+entrypoint and command** for every Tailscale-enabled container
+(`CreateDocker.php`: it creates a preliminary container, reads `Config.Entrypoint` /
+`Config.Cmd`, and passes them as `-e ORG_*`). A config path placed in the template's
+`ORG_CMD` is therefore discarded, and `valkey-server` starts with **no config file**: no
+ACL, so no password; no AOF; defaults everywhere. That is exactly what the first start on
+2026-11-13 did (`Warning: no config file specified, using the default config`).
+
+The path goes in the template's **`<PostArgs>`** instead — dockerMan exports it as
+`ORG_POSTARGS` and the hook's exec line is
+`${ORG_ENTRYPOINT} ${ORG_CMD} ${ORG_POSTARGS}`, i.e.
+`tini docker-entrypoint.sh valkey-server /etc/valkey/valkey.conf`. `ORG_CMD` in this
+template is kept as the image's own value (`valkey-server`) purely as documentation; it is
+overwritten at container creation either way.
+
+Verified end to end against the pinned image with this repo's `valkey.conf`: config loaded,
+`appendonly yes`, `maxmemory-policy noeviction`, AOF files created in `/data`, an
+unauthenticated `PING` answered `-NOAUTH`, and `AUTH`+`PING` answered `+OK`+`PONG`.
 
 ### Before first start (Gary, on unraid-private)
 

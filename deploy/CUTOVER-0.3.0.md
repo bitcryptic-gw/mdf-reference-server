@@ -148,6 +148,17 @@ tag; notifications stay off until the cutover is verified.
    directory holding it must be traversable — Docker creates `/run/secrets`
    `755`, so it is).
 
+   **The config path goes in the template's `<PostArgs>`, not in `ORG_CMD`.**
+   Unraid overwrites `ORG_*` with the image's own entrypoint and command for any
+   Tailscale-enabled container, so an `ORG_CMD` carrying
+   `valkey-server /etc/valkey/valkey.conf` is discarded: Valkey then starts with
+   no config file, which means **no ACL (no password), no AOF and default
+   settings** — it logs `Warning: no config file specified, using the default
+   config`. `PostArgs` becomes `ORG_POSTARGS`, which the hook appends to the exec
+   line. Confirm on the running container that `CONFIG GET appendonly` is `yes`
+   and that an unauthenticated `PING` answers `-NOAUTH`; if either is wrong, the
+   config was not loaded.
+
    Generate the password, build the ACL from it, **copy it to both demo hosts'
    password files first, and only then** remove the temporary plaintext on
    unraid-private: the copy is what must not be lost. The copies go on the demo
