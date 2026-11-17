@@ -1,141 +1,204 @@
 # mdf-reference-server
 
-Reference implementation of the [MDF (Markdown First)](https://github.com/bitcryptic-gw/mdf) spec.
+Reference implementation of the [MDF (Markdown First)](https://github.com/bitcryptic-gw/mdf) spec, **v0.3.1**.
 
-A self-hostable server that serves markdown natively to AI agents via HTTP content negotiation, with structured discovery, payment-gated content tiers, and bearer token auth. Built with Bun, configured via a single YAML file. The container runs as root only long enough for the Tailscale-in-container hook; the application itself runs as an unprivileged user (su-exec drops from root to `bun:bun`).
+A self-hostable server that serves markdown natively to AI agents via HTTP content negotiation, with structured discovery (`/mdf.json`, `/llms.txt`), payment-gated content over **x402 v2**, and a bearer-token tier. Built with Bun and configured from a single YAML file. The container starts as root only for the Tailscale-in-container hook, then drops to an unprivileged user (`bun`, uid 1000) via su-exec.
 
-**Live demo:** https://mdf-demo.bitcryptic.com  
-**Spec:** https://github.com/bitcryptic-gw/mdf  
-**Status:** v0.2.6 — L402 (Lightning) and x402 (EVM) payment verification are both live. x402 verification and settlement are delegated to a standard x402 facilitator's `/verify` and `/settle` endpoints. Payment responses are explicitly uncacheable (`no-store` on every 402 and payment failure; `private, no-store` on a paid 200), negotiated content sends `Vary: Accept` with a per-representation `ETag`, and Lightning invoices are issued in whole satoshis; see [open milestones](#status)
-
-![mdf-server dashboard](docs/dashboard.png)
+**Live demo:** https://mdf-demo.bitcryptic.com
+**Spec:** https://github.com/bitcryptic-gw/mdf (v0.3.1)
+**Status:** server **0.3.0** — the x402 v2 hard cut. Two rails are live in production: USDC on Base (`exact`, `eip155:8453`) settled through x402 v2 facilitators, and Bitcoin Lightning (`exact`, `lnbtc`) with invoices minted over NWC and preimages verified locally. There is no v1 mode: `X-PAYMENT` and L402 are not supported. See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## Quick start
 
 ```bash
-# Clone
 git clone https://github.com/bitcryptic-gw/mdf-reference-server.git
 cd mdf-reference-server
 
-# Create the secrets directory and wallet address file
+# Secrets are files, never environment variables or argv entries.
 mkdir -p secrets
-echo -n 0xYourWalletAddress > secrets/wallet_address
-chmod 600 secrets/wallet_address
+# TESTNET ONLY (see below). The burn address is a valid EIP-55 example so this
+# runs as written — replace it with your own. Startup refuses anything that is
+# not checksummed.
+echo -n 0x000000000000000000000000000000000000dEaD > secrets/wallet_address
+openssl rand -hex 32 | tr -d '\n' > secrets/valkey_password
 
-# Build and run
+# The server drops to uid 1000; Valkey runs as uid 999, gid 1000. root:1000 mode
+# 640 is readable by both. (Docker Desktop on macOS normalises bind-mount
+# ownership, so on macOS this step is a no-op rather than a requirement.)
+sudo chown root:1000 secrets/wallet_address secrets/valkey_password
+sudo chmod 640 secrets/wallet_address secrets/valkey_password
+
 docker compose up --build
 ```
 
-The server listens on port 3030 (host) → 3000 (container). The dashboard is on port 9090, no external mapping — access via Tailscale or internal network.
+Then check it from another terminal:
+
+```bash
+curl -s localhost:3030/health | python3 -m json.tool   # token_store and replay_store both "ok"
+curl -s localhost:3030/mdf.json | python3 -m json.tool # "mdf_version": "0.3.1"
+curl -i localhost:3030/premium/deep-dive               # 402 + PAYMENT-REQUIRED, accepts[] = eip155:84532
+```
+
+The server listens on host port 3030 → container 3000. The dashboard (port 9090) is not mapped to the host and has no authentication: reach it only over Tailscale or an internal network.
+
+### What the compose stack is, and is not
+
+`docker-compose.yml` runs a single-host stack from **`mdf.compose.yaml`**, not from the demo hosts' `mdf.yaml` (that file is drift-tracked on the demo servers, so the quick start gets its own).
+
+**It is Base Sepolia only.** Every priced rail in `mdf.compose.yaml` is `eip155:84532` with Base Sepolia USDC, and there is no mainnet rail anywhere in the file. That is deliberate: the quick start ships a placeholder wallet, and a forgotten placeholder must only ever be able to waste test funds. **Replace `secrets/wallet_address` before any real use**, and for a mainnet configuration start from `mdf.yaml` (the demo file) with a real EIP-55 wallet — do not edit `mdf.compose.yaml` in place to add an `eip155:8453` rail.
+
+It also runs with **Lightning off** — an `lnbtc` rail needs a funded Nostr Wallet Connect connection — so no `nwc_uri` secret is involved. The token store and the `lnbtc` replay store share a local **Valkey 8** service: AOF `everysec`, `noeviction`, `requirepass` read from the mounted `valkey_password` file, no host port.
+
+The stack **mints real 402s but settles nothing**: `facilitator.legs` in `mdf.compose.yaml` is a placeholder. To settle test-USDC, point it at a reachable, Sepolia-capable x402 v2 facilitator you control. To enable Lightning, mount `nwc_uri`, set `lightning.enabled: true`, and add the `lnbtc` rail back to a section — see [Lightning](#lightning-lnbtc).
+
+One cosmetic wrinkle: `site.url` must start with `https://` (the config schema refuses anything else), so `mdf.compose.yaml` declares `https://localhost:3030` while the listener is plain HTTP. That URL is what 402 bodies, `/mdf.json` and the feed advertise.
 
 ---
 
-## Try it
+## Try it (live demo)
 
 ```bash
-# Discover the site's MDF capabilities
+# Discovery
 curl https://mdf-demo.bitcryptic.com/mdf.json
-
-# Fetch the agent index
 curl https://mdf-demo.bitcryptic.com/llms.txt
 
-# Request markdown directly (agent-style)
+# Markdown by content negotiation
 curl -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/
-
-# Free content — no payment required
 curl -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/docs/getting-started
 
-# Paid content — returns 402 with payment instructions
-curl -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/premium/deep-dive
+# Priced content: 402 with an x402 v2 PaymentRequired body and PAYMENT-REQUIRED header
+curl -i -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/premium/deep-dive     # 0.01 USDC on Base
+curl -i -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/micropayment/intro    # 1 sat over Lightning
+curl -i -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/showcase/dual-rail    # Base USDC or Lightning
+curl -i -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/testnet/intro         # Base Sepolia test USDC
 
-# Micropayment tier over Lightning — returns 402 with an L402 invoice
-curl -H "Accept: text/markdown" https://mdf-demo.bitcryptic.com/micropayment/intro
-
-# Private content — returns 402 with auth endpoint hint
-curl https://mdf-demo.bitcryptic.com/private/internals
+# Token tier: 402 with an auth_endpoint hint; one payment buys a 24 h bearer token
+curl -i https://mdf-demo.bitcryptic.com/private/internals
 
 # Atom feed with mdf:change_type metadata
 curl https://mdf-demo.bitcryptic.com/feed.xml
 ```
 
+To pay, an x402 v2 client retries the request with a `PAYMENT-SIGNATURE` header built from one entry of `accepts[]`. A successful paid response carries `PAYMENT-RESPONSE`.
+
 ---
 
 ## Configuration
 
-All server configuration lives in `mdf.yaml`. Secrets are resolved at startup in precedence order — from `/run/secrets/<name>` files, then `MDF_*` environment variables, then any value in `mdf.yaml`. In the provided Compose setup the wallet address is mounted as `/run/secrets/wallet_address` (a file, never an env var); the Alby and Lightning-token secrets are mounted the same way.
+All configuration lives in one YAML file: `mdf.yaml` by default, or whatever `MDF_CONFIG` points at. The repo ships two: `mdf.yaml` for the demo hosts (both rails, shared Valkey, per-host facilitator order) and `mdf.compose.yaml` for the quick start (Base Sepolia only, no Lightning, local Valkey).
 
-Startup validation fails closed: a non-zero price with no resolvable wallet, or a configured Lightning block with no resolvable token secrets, aborts startup with a descriptive error. When any price is non-zero, the resolved wallet must be a valid **EIP-55 checksummed** address (mixed-case, matching its own keccak-256 checksum) — all-lowercase, all-uppercase, wrong-length, non-hex, and zero addresses are rejected. The `[lightning]` block's `api_token` and `token_secret` fields are optional and, if present, **inert** — they are never read or logged; the server resolves both from the secret file or env var and refuses to start if neither resolves.
+Pricing is per path, and each path lists the **rails** it accepts. Every rail states its own atomic amount in its own unit (micro-USDC on `eip155`, millisatoshis on `lnbtc`). There is no exchange rate anywhere.
 
 ```yaml
-site:
-  url: https://your-domain.com
-  name: Your Site Name
-  contact: admin@your-domain.com
-
 pricing:
   default:
-    amount: "0.0001"
-    currency: USDC
-    chain: base
+    rails:
+      - scheme: exact
+        network: "eip155:8453"
+        asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"   # USDC on Base
+        amount: "100"                                          # 0.0001 USDC
   sections:
     /docs/**:
-      amount: "0.0000"
-    /premium/**:
-      amount: "1.0000"
-      currency: USDC
-      chain: base
+      rails: []                                                # free
+    /micropayment/**:
+      rails:
+        - scheme: exact
+          network: "lnbtc:000000000019d6689c085ae165831e93"
+          asset: BTC
+          amount: "1000"                                       # 1 sat
     /private/**:
-      amount: "100.00"
-      currency: USDC
-      chain: base
+      access: token                                            # pay once, get a 24 h bearer token
+      rails:
+        - scheme: exact
+          network: "eip155:8453"
+          asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          amount: "100000"                                     # 0.10 USDC
 ```
 
-See `mdf.yaml` in this repo for the full reference configuration.
+`/mdf.json` is generated from this block at startup, so the published document and every 402's `accepts[]` agree by construction. A degraded or rate-limited rail stays **declared** in `/mdf.json` and is omitted only from the 402.
 
----
+**Secrets** are read only from files: `<MDF_SECRETS_DIR>/wallet_address` (default `/run/secrets`; required once an `eip155` rail is priced), `…/nwc_uri` (required when `lightning.enabled: true`), and `…/valkey_password` (used when a `[valkey]` block is configured). There is deliberately no env-var fallback for a secret value. Startups fail closed on: a priced `eip155` rail with no wallet, an address that is not EIP-55 checksummed, an `eip155` asset missing from the built-in per-network table, a missing required secret file, and an `lnbtc` rail with `lightning.enabled: false`. A missing `valkey_password` does **not** abort startup — if that Valkey requires a password it then answers `NOAUTH`, and `/health` reports the store as unavailable.
 
-## Content
+**`token_store`** is required and has no default: `valkey` for anything with more than one instance, `memory` for a single local process only (it logs a startup warning, because tokens are instance-local and a restart drops them).
 
-Place markdown files under `content/`. The directory structure maps directly to URL paths. Frontmatter is supported. The server auto-generates `/mdf.json` and `/llms.txt` from `mdf.yaml` and the content directory at startup — no manual maintenance required.
+**Environment variables** — paths and ports only, never values:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `MDF_CONFIG` | config file path | `./mdf.yaml` |
+| `MDF_PORT` | main HTTP port | `3000` |
+| `MDF_DASHBOARD_PORT` | overrides `dashboard.port` | config value (`9090`) |
+| `MDF_DATA_DIR` | writable dir for `feed-events.ndjson` | `/app/data` |
+| `MDF_SECRETS_DIR` | directory holding secret files | `/run/secrets` |
+| `MDF_WATCH_INTERVAL_MS` | content poll interval | `30000` |
 
 ---
 
 ## Payment rails
 
-Two rails are implemented:
+**USDC on Base (`exact`, `eip155:8453`; Base Sepolia `eip155:84532` for testing).** The server builds the payment requirements from the offer it issued and calls an ordered list of x402 v2 facilitator legs (`facilitator.legs`). Failover happens only on a transport error before `/verify` answers; a leg that answers at all is pinned for the rest of the request, and `/settle` is never retried. A `settlement_pending` result is reconciled against the transaction the facilitator returned and accepted only with a matching USDC `Transfer` (asset, `from`, `payTo`, exact `value`) or `authorizationState(from, nonce) == true`; anything else fails closed with 503.
 
-**L402 (Bitcoin/Lightning)** — production-complete. Creates real Lightning invoices via Alby Hub, issues HMAC-bound macaroons, and verifies preimage submission against settled invoice records.
+**Lightning (`exact`, `lnbtc`).** Invoices are minted over Nostr Wallet Connect (`make_invoice`) with the request's description hash and an expiry equal to `payment.max_timeout_seconds`, and preimages are verified locally. Replays are refused across instances and restarts through the shared Valkey store. The NWC connection must not hold a spending permission: a credential that reports `pay_invoice`, `pay_keysend`, or any method outside the invoice-minting allowlist makes the process **exit 1** at startup. An unreachable relay or wallet is different — the process starts with the rail degraded and re-checks on the invoice breaker's backoff. The rail is advertised only once the receiver node key is known (from `get_info` or `lightning.node_pubkey`).
 
-**x402 (EVM/stablecoin)** — live. The 402 `payment` object is a strict superset of x402's `PaymentRequirements` (`pay_to`, `asset`, `scheme`, `max_timeout_seconds`, optional `extra` alongside MDF's own fields). Clients submit a standard base64 `PaymentPayload` in the `X-PAYMENT` header; the server builds `PaymentRequirements` from the offer it issued and calls a configured facilitator's `/verify` then `/settle`. Any x402-compliant facilitator is pluggable via the `[facilitator]` config block.
+A degraded rail is left out of `accepts[]` and the other rails are unaffected. If no rail can be offered, the response is `503` with `Retry-After`, never a 402 with an empty `accepts[]`.
 
-On a `/settle` error the server's response is not treated as final: it confirms the EIP-3009 authorization on-chain (`authorizationState(from, nonce)`, or the tx receipt when a hash is returned) before concluding the payment failed, so a facilitator false-failure neither double-charges nor wrongly denies access.
+### Lightning (lnbtc)
 
-Sites advertise accepted rails via `payment.accepted_chains` in `/mdf.json`.
+Set `lightning.enabled: true`, mount `nwc_uri`, and add an `lnbtc` rail to a section. The connection needs invoice minting (`make_invoice`), not a spending scope. See `mdf.yaml` for a complete example, including the mint rate limits and breaker backoff.
+
+### Token tier
+
+A section with `access: token` does not serve content on payment; it sells a bearer token. `POST` to `auth.endpoint` (`/mdf/auth`; `/mdf/pay` is an accepted alias) with the section path as `resource` and a `PAYMENT-SIGNATURE` for that section:
+
+```bash
+curl -X POST https://mdf-demo.bitcryptic.com/mdf/auth \
+  -H "Content-Type: application/json" \
+  -H "PAYMENT-SIGNATURE: <base64 PaymentPayload>" \
+  -d '{"resource":"/private/internals"}'
+# → {"token":"…","expires_at":"…","ttl_seconds":86400}
+```
+
+The token is scoped to that section and sent as `Authorization: Bearer <token>`. Issuance is idempotent on the payment: if a settlement succeeds but the token write fails, retrying the **same** signature inside a 15-minute window issues the token without verifying or settling again (`503` + `Retry-After: 5` while the store is down). One payment can never mint two credentials, and it cannot be re-targeted at another section.
 
 ---
 
-## Reverse proxy
+## Health and reverse proxy
 
-A Caddy snippet is included at `caddy/Caddyfile`. Point your reverse proxy at port 3030. The server exposes `/health` (200 when the content and data directories are accessible, 503 otherwise) for load-balancer health checks; since 0.1.5 the image's own Docker `HEALTHCHECK` probes it.
+`/health` on the **main port** returns 200 while the content directory is readable and the data directory writable, 503 otherwise, with:
+
+- `status` — `ok` / `unavailable`
+- `version` — the server release version (`0.3.0`)
+- `rails[]` — one `{"rail":"<network>","status":"ok|degraded"}` per configured rail
+- `token_store` — `{"status":"ok"}` or `{"status":"unavailable","category":"auth|unreachable"}`
+- `replay_store` — same shape, present only when Valkey is configured
+- `lightning` — breaker/gate detail, present only while that rail is degraded
+
+A single degraded rail does not change the HTTP status, so a load balancer does not pull an instance that is still selling its other rails. The image's Docker `HEALTHCHECK` probes `/health`.
+
+The dashboard serves a *different* `/health` on its own port (`{"ok":true,"ts":"…"}`). Do not point a load balancer at it: the dashboard has no authentication, which is why compose maps 3000 and not 9090.
+
+A Caddy snippet is in `caddy/Caddyfile`. Inside the compose network, proxy to `mdf-server:3000`; from outside Docker, to the published host port 3030. `X-Real-IP` is trusted only from `server.trusted_proxies`, and `X-Forwarded-For` is never read.
 
 ---
 
-## Status
+## Feature status
 
 | Feature | State |
-|---------|-------|
-| HTTP content negotiation (`Accept: text/markdown`) | ✅ Complete |
-| `/mdf.json` + `/llms.txt` auto-generation | ✅ Complete |
-| ETag / `Last-Modified` caching headers | ✅ Complete |
-| Atom feed with `mdf:change_type` extension | ✅ Complete |
-| WebSub hub declaration | ✅ Complete |
-| Bearer token issuance (auth-via-payment) | ✅ Complete |
-| Dashboard | ✅ Complete |
-| L402 payment verification (Bitcoin/Lightning) | ✅ Complete |
-| Validator CLI | ✅ Complete |
-| x402 payment verification + settlement (via facilitator `/verify` + `/settle`) | ✅ Complete |
+|---|---|
+| Content negotiation (`Accept: text/markdown`), `Vary: Accept`, per-representation ETag | ✅ |
+| `/mdf.json` (spec 0.3.1) and `/llms.txt` generation | ✅ |
+| Atom feed with `mdf:change_type`, WebSub hub | ✅ |
+| x402 v2 `PaymentRequired` 402 (`PAYMENT-REQUIRED` / `PAYMENT-SIGNATURE` / `PAYMENT-RESPONSE`) | ✅ |
+| USDC on Base via v2 facilitator legs, on-chain confirmation | ✅ |
+| Lightning `lnbtc` via NWC, shared replay store | ✅ |
+| Multi-rail sections (`/showcase/**`) | ✅ |
+| Token tier (`access: token`, Valkey-backed, idempotent issuance) | ✅ |
+| Per-rail `/health` | ✅ |
+| Dashboard | ✅ (unauthenticated, keep internal) |
+
+Conformance: the [MDF validator](https://github.com/bitcryptic-gw/mdf-validator) v0.3.0 reported **56/56 checks passing, 0 warnings** against the live demo on 2026-11-13.
 
 ---
 
@@ -143,25 +206,28 @@ A Caddy snippet is included at `caddy/Caddyfile`. Point your reverse proxy at po
 
 ```bash
 bun install
-bun run src/index.ts
-```
+bun run test        # 358 tests, 0 failures, as of c56651a
 
-Run the smoke walk-through:
-
-```bash
+# Manual walk-through: starts its own server with throwaway config and secrets,
+# prints each response, never pays anything.
 bash smoke-test.sh
 ```
 
-`smoke-test.sh` is a manual smoke walk-through, not an assertion suite with a pass/fail result. It starts the server on :3000 (dashboard on :3001) and prints the response for each step: discovery (`/mdf.json`, `/llms.txt`), markdown/HTML negotiation on `/`, response headers on a free content page, the priced and auth flows (402 without payment, a malformed `X-PAYMENT` rejected with 402, bearer-token issuance through `POST /mdf/auth` and its use on `/private/internals`), a conditional 304 GET, the dashboard `/health`, and a 404. There is no count and no expected output to compare against — read its output to judge whether each step behaved. The real regression checks are the unit suites in `package.json` (`test:402`) and `src/content/handler.test.ts`, which report their own pass/fail counts.
+To run the server yourself, give it a config and the secrets that config names:
 
----
+```bash
+MDF_CONFIG=./mdf.compose.yaml MDF_SECRETS_DIR=./secrets MDF_DATA_DIR=./data \
+  bun run dev       # bun --watch; or: bun run src/index.ts
+```
+
+`mdf.compose.yaml` expects a Valkey service at `valkey:6379` (the compose stack provides one) and a `valkey_password` file; a config with `token_store: memory` and no `[valkey]` block is the simplest way to run without one. `smoke-test.sh` generates exactly that and is the reference for a self-contained local config.
+
+`smoke-test.sh` is a walk-through, not an assertion suite: it prints each response and has no pass/fail verdict. It covers discovery, content negotiation, a free page's headers, an unpaid 402 and a malformed `PAYMENT-SIGNATURE` 402, the token tier's 402 with its `auth_endpoint`, a conditional 304, `/health` on both ports, and 404s. It cannot show token issuance, because a token cannot be minted without paying.
 
 ## Authors
 
-**Gary Walker** / [BitCryptic™](https://bitcryptic.com)  
+**Gary Walker** / [BitCryptic™](https://bitcryptic.com)
 **Graham Hall** / [Slepner](https://slepner.com.au)
-
----
 
 ## License
 

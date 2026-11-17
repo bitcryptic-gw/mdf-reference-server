@@ -1,0 +1,139 @@
+# mdf.compose.yaml — configuration for the docker compose quick start.
+#
+# *** TESTNET ONLY, BY DESIGN. Every priced rail here is Base Sepolia
+# *** (eip155:84532) with Base Sepolia USDC. There is no mainnet rail, so a
+# *** forgotten placeholder wallet can only ever waste test funds. A mainnet
+# *** setup must start from `mdf.yaml` (the demo configuration) with a real
+# *** EIP-55 wallet — do not "upgrade" this file in place.
+#
+# This is deliberately NOT the demo hosts' configuration. `mdf.yaml` is the
+# production demo file (both rails, shared Valkey on another host, per-host
+# facilitator order); it is drift-tracked on the servers, so the quick start
+# gets its own file instead of editing it.
+#
+# What differs here:
+#   - Base Sepolia only, for the reason above.
+#   - Lightning is off, because an lnbtc rail needs a funded NWC connection.
+#     There is therefore no `nwc_uri` secret in the compose path.
+#   - Valkey is the local `valkey` compose service, not the demo's shared store.
+#   - The facilitator leg is a placeholder: this stack mints real 402s but
+#     cannot settle anything until you point `facilitator.legs` at a reachable
+#     x402 v2 facilitator you control (a Sepolia-capable one, given the rails).
+# site.url must be https (the schema refuses anything else) and is what 402
+# bodies, /mdf.json and the feed advertise. The listener itself is plain http on
+# port 3030; put a TLS reverse proxy in front for anything but a local run.
+site:
+  url: https://localhost:3030
+  name: MDF reference server (compose quick start)
+  contact: admin@example.com
+
+content:
+  dir: ./content
+  dialect: commonmark
+  frontmatter: true
+  math: false
+
+pricing:
+  # Unknown paths 404 before pricing is consulted, so this is only the fallback
+  # for real content outside every section below.
+  default:
+    rails:
+      - scheme: exact
+        network: "eip155:84532"
+        asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"   # USDC (Base Sepolia)
+        amount: "100"                                          # 0.0001 test-USDC
+  sections:
+    /:
+      rails: []
+    /docs/**:
+      rails: []
+    # The demo config prices this at 1 sat over lnbtc. Lightning is off in the
+    # compose path, so it is free here rather than inventing a second rail.
+    /micropayment/**:
+      rails: []
+    /premium/**:
+      rails:
+        - scheme: exact
+          network: "eip155:84532"
+          asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+          amount: "10000"                                      # 0.01 test-USDC
+    /private/**:
+      access: token
+      rails:
+        - scheme: exact
+          network: "eip155:84532"
+          asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+          amount: "100000"                                     # 0.10 test-USDC
+    # The demo's testnet tier. In this file every route is Sepolia; this section
+    # keeps the demo's smaller amount so the two configs stay comparable.
+    /testnet/**:
+      rails:
+        - scheme: exact
+          network: "eip155:84532"
+          asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"   # USDC (Base Sepolia)
+          amount: "1000"                                       # 0.0010 test-USDC
+    # The demo's dual-rail route; Lightning is off and there is no mainnet rail
+    # here, so this is the Sepolia USDC rail at the demo's amount.
+    /showcase/**:
+      rails:
+        - scheme: exact
+          network: "eip155:84532"
+          asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+          amount: "20000"                                      # 0.02 test-USDC
+
+auth:
+  endpoint: /mdf/auth
+  token_ttl_seconds: 86400
+
+# Required, no default. `valkey` because this file configures a Valkey service;
+# `memory` is for a single local process only.
+token_store: valkey
+
+valkey:
+  url: "redis://valkey:6379"
+  connect_timeout_ms: 2000
+  command_timeout_ms: 2000
+
+server:
+  # No reverse proxy in front of this stack, so nothing is trusted to set
+  # X-Real-IP. Never X-Forwarded-For.
+  trusted_proxies: []
+
+signals:
+  ai_train: false
+  ai_input: true
+  search: true
+  human_only: false
+
+feed:
+  url: /feed.xml
+  format: atom
+  websub_hub: https://pubsubhubbub.appspot.com/
+  change_types:
+    - content_update
+    - new_page
+    - pricing_change
+    - mdf_capability
+
+dashboard:
+  enabled: true
+  port: 9090
+
+payment:
+  max_timeout_seconds: 300
+
+# Off in the quick start: no NWC connection, so no `nwc_uri` secret is needed.
+# Turning it on also needs an lnbtc rail (or one of the rails above replaced),
+# and the lnbtc replay store, which this file already has in Valkey.
+lightning:
+  enabled: false
+
+# Placeholder leg. 402s are real; settlement needs a reachable x402 v2
+# facilitator. Failover is ordered, and /settle is pinned to the answering leg.
+# RPC: Sepolia only — there is no mainnet rail in this file to confirm.
+facilitator:
+  legs:
+    - "http://127.0.0.1:8080"
+  timeout_ms: 15000
+  rpc:
+    "eip155:84532": "https://sepolia.base.org"
