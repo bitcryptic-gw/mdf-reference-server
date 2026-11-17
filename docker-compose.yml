@@ -1,32 +1,90 @@
-# mdf-server — Docker Compose configuration
+# mdf-server — Docker Compose quick start (server 0.3.0, spec 0.3.1)
 #
-# Wallet address secret: create before first run:
-#   echo -n 0xYourWallet > secrets/wallet_address && chmod 600 secrets/wallet_address
+# Secrets are files, never environment variables or CLI arguments. Create them
+# before the first run — see "Quick start" in README.md:
 #
-# Feed event log: persisted to ./data/feed-events.ndjson on the host.
-# The data/ directory is created automatically on first run.
+#   mkdir -p secrets
+#   echo -n 0xYourEIP55ChecksummedWallet > secrets/wallet_address
+#   openssl rand -hex 32 | tr -d '\n' > secrets/valkey_password
+#   chown root:1000 secrets/* && chmod 640 secrets/*
 #
-# The dashboard (port 9090) has NO external port mapping.
-# Access it via Tailscale or internal Docker network only.
+# Both containers need to read those files:
+#   - mdf-server drops to bun (uid 1000, gid 1000) via su-exec;
+#   - Valkey runs as uid 999, gid 1000.
+# root:1000 mode 640 is readable by both. A mode-600 root-owned secret makes
+# either container refuse to start (or the store fail AUTH), which is the trap
+# this comment exists to prevent.
+#
+# This stack uses mdf.compose.yaml, not the demo hosts' mdf.yaml. It runs with
+# Lightning off (no nwc_uri secret) and a local Valkey for the token and lnbtc
+# replay stores. The dashboard (port 9090) has NO host port mapping.
+#
+# The feed event log (/app/data/feed-events.ndjson) lives on the `mdf-data`
+# named volume rather than a host bind mount: Docker creates a missing bind-mount
+# directory as root, and the app runs as uid 1000, so `up` would leave /health
+# at 503 on a Linux host. Read the log with:
+#   docker compose exec mdf-server cat /app/data/feed-events.ndjson
 
 services:
   mdf-server:
     build: .
     restart: unless-stopped
     ports:
-      - 3030:3000
+      - "3030:3000"
     environment:
       MDF_PORT: 3000
       MDF_DASHBOARD_PORT: 9090
       MDF_DATA_DIR: /app/data
       # MDF_WATCH_INTERVAL_MS: 30000  # default: 30s
     volumes:
-      - ./mdf.yaml:/app/mdf.yaml:ro
+      - ./mdf.compose.yaml:/app/mdf.yaml:ro
       - ./content:/app/content:ro
-      - ./data:/app/data
-      # Wallet secret — bind-mounted as a file instead of using Docker secrets,
-      # because the Compose secret uid/gid feature is not supported on this
-      # Docker version. The host file has 600 permissions; inside the container
-      # it appears world-readable (444). The secret never appears in env vars
-      # or image layers.
-      - ./secrets/wallet_address:/run/secrets/wallet_address:ro
+      - mdf-data:/app/data
+      # Bind-mounted as files rather than Docker secrets: the Compose secret
+      # uid/gid feature is not available on every Docker version. The secret
+      # never appears in an env var, an argv entry or an image layer.
+      - ./secrets:/run/secrets:ro
+    depends_on:
+      valkey:
+        condition: service_healthy
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    # The official image runs as valkey (uid 999, gid 1000). Stated explicitly so
+    # the secret file's ownership contract is visible rather than implied.
+    user: "999:1000"
+    # Valkey cannot read a password from a file, and the password must not be an
+    # env var or an argv entry. The entrypoint writes a mode-600 config from the
+    # mounted secret in /tmp (not on the data volume, so it is not persisted) and
+    # starts Valkey from it. `$$` is Compose escaping: the container's shell does
+    # the substitution, not Compose.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        umask 077
+        {
+          printf 'requirepass %s\n' "$$(cat /run/secrets/valkey_password)"
+          printf 'appendonly yes\n'
+          printf 'appendfsync everysec\n'
+          printf 'maxmemory-policy noeviction\n'
+          printf 'dir /data\n'
+        } > /tmp/valkey.conf
+        exec valkey-server /tmp/valkey.conf
+    volumes:
+      - valkey-data:/data
+      - ./secrets/valkey_password:/run/secrets/valkey_password:ro
+    healthcheck:
+      # AUTH is sent on stdin, so the password is not in any process's argv.
+      test:
+        - CMD-SHELL
+        - printf 'AUTH %s\nPING\n' "$$(cat /run/secrets/valkey_password)" | valkey-cli --no-auth-warning | grep -q PONG
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No host port: the store is reachable only on the Compose network.
+
+volumes:
+  valkey-data:
+  mdf-data:
