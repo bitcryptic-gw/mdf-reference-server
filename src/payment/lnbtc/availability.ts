@@ -189,6 +189,13 @@ export interface StartLnbtcOptions {
   client?: NwcInfoSource | null;
   log?: (message: string) => void;
   now?: () => number;
+  /**
+   * Called with the startup permission-check verdict, before it is applied to the
+   * gate. `startLnbtc` has always invoked this; the field was simply missing from
+   * the interface, so the file did not typecheck under `tsc`. Type-only: no
+   * behaviour change, and nothing here runs differently at runtime.
+   */
+  onCheck?: (check: NwcCheck) => void;
 }
 
 /**
