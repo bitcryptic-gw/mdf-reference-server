@@ -63,11 +63,13 @@ content:
   dir: ./content
 
 pricing:
+  # Base Sepolia only, matching mdf.compose.yaml: the smoke test never settles
+  # anything, so it should not name a mainnet rail at all.
   default:
     rails:
       - scheme: exact
-        network: "eip155:8453"
-        asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        network: "eip155:84532"
+        asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
         amount: "100"
   sections:
     /:
@@ -81,15 +83,15 @@ pricing:
     /premium/**:
       rails:
         - scheme: exact
-          network: "eip155:8453"
-          asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          network: "eip155:84532"
+          asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
           amount: "10000"
     /private/**:
       access: token
       rails:
         - scheme: exact
-          network: "eip155:8453"
-          asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          network: "eip155:84532"
+          asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
           amount: "100000"
     /testnet/**:
       rails:
@@ -100,8 +102,8 @@ pricing:
     /showcase/**:
       rails:
         - scheme: exact
-          network: "eip155:8453"
-          asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          network: "eip155:84532"
+          asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
           amount: "20000"
 
 auth:
@@ -146,7 +148,6 @@ facilitator:
     - "http://127.0.0.1:8080"
   timeout_ms: 15000
   rpc:
-    "eip155:8453": "https://mainnet.base.org"
     "eip155:84532": "https://sepolia.base.org"
 YAML
 

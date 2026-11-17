@@ -18,8 +18,9 @@ cd mdf-reference-server
 
 # Secrets are files, never environment variables or argv entries.
 mkdir -p secrets
-# The burn address is a valid EIP-55 example so this runs as written — replace it
-# with your own address. Startup refuses anything that is not checksummed.
+# TESTNET ONLY (see below). The burn address is a valid EIP-55 example so this
+# runs as written — replace it with your own. Startup refuses anything that is
+# not checksummed.
 echo -n 0x000000000000000000000000000000000000dEaD > secrets/wallet_address
 openssl rand -hex 32 | tr -d '\n' > secrets/valkey_password
 
@@ -37,16 +38,20 @@ Then check it from another terminal:
 ```bash
 curl -s localhost:3030/health | python3 -m json.tool   # token_store and replay_store both "ok"
 curl -s localhost:3030/mdf.json | python3 -m json.tool # "mdf_version": "0.3.1"
-curl -i localhost:3030/premium/deep-dive               # 402 + PAYMENT-REQUIRED
+curl -i localhost:3030/premium/deep-dive               # 402 + PAYMENT-REQUIRED, accepts[] = eip155:84532
 ```
 
 The server listens on host port 3030 → container 3000. The dashboard (port 9090) is not mapped to the host and has no authentication: reach it only over Tailscale or an internal network.
 
 ### What the compose stack is, and is not
 
-`docker-compose.yml` runs a single-host stack from **`mdf.compose.yaml`**, not from the demo hosts' `mdf.yaml` (that file is drift-tracked on the demo servers, so the quick start gets its own). It runs with **Lightning off** — an `lnbtc` rail needs a funded Nostr Wallet Connect connection — so no `nwc_uri` secret is involved. The token store and the `lnbtc` replay store share a local **Valkey 8** service: AOF `everysec`, `noeviction`, `requirepass` read from the mounted `valkey_password` file, no host port.
+`docker-compose.yml` runs a single-host stack from **`mdf.compose.yaml`**, not from the demo hosts' `mdf.yaml` (that file is drift-tracked on the demo servers, so the quick start gets its own).
 
-The stack **mints real 402s but settles nothing**: `facilitator.legs` in `mdf.compose.yaml` is a placeholder. To settle USDC, point it at a reachable x402 v2 facilitator you control. To enable Lightning, mount `nwc_uri`, set `lightning.enabled: true`, and add the `lnbtc` rail back to a section — see [Lightning](#lightning-lnbtc).
+**It is Base Sepolia only.** Every priced rail in `mdf.compose.yaml` is `eip155:84532` with Base Sepolia USDC, and there is no mainnet rail anywhere in the file. That is deliberate: the quick start ships a placeholder wallet, and a forgotten placeholder must only ever be able to waste test funds. **Replace `secrets/wallet_address` before any real use**, and for a mainnet configuration start from `mdf.yaml` (the demo file) with a real EIP-55 wallet — do not edit `mdf.compose.yaml` in place to add an `eip155:8453` rail.
+
+It also runs with **Lightning off** — an `lnbtc` rail needs a funded Nostr Wallet Connect connection — so no `nwc_uri` secret is involved. The token store and the `lnbtc` replay store share a local **Valkey 8** service: AOF `everysec`, `noeviction`, `requirepass` read from the mounted `valkey_password` file, no host port.
+
+The stack **mints real 402s but settles nothing**: `facilitator.legs` in `mdf.compose.yaml` is a placeholder. To settle test-USDC, point it at a reachable, Sepolia-capable x402 v2 facilitator you control. To enable Lightning, mount `nwc_uri`, set `lightning.enabled: true`, and add the `lnbtc` rail back to a section — see [Lightning](#lightning-lnbtc).
 
 One cosmetic wrinkle: `site.url` must start with `https://` (the config schema refuses anything else), so `mdf.compose.yaml` declares `https://localhost:3030` while the listener is plain HTTP. That URL is what 402 bodies, `/mdf.json` and the feed advertise.
 
@@ -82,7 +87,7 @@ To pay, an x402 v2 client retries the request with a `PAYMENT-SIGNATURE` header 
 
 ## Configuration
 
-All configuration lives in one YAML file: `mdf.yaml` by default, or whatever `MDF_CONFIG` points at. The repo ships two: `mdf.yaml` for the demo hosts (both rails, shared Valkey, per-host facilitator order) and `mdf.compose.yaml` for the quick start (no Lightning, local Valkey).
+All configuration lives in one YAML file: `mdf.yaml` by default, or whatever `MDF_CONFIG` points at. The repo ships two: `mdf.yaml` for the demo hosts (both rails, shared Valkey, per-host facilitator order) and `mdf.compose.yaml` for the quick start (Base Sepolia only, no Lightning, local Valkey).
 
 Pricing is per path, and each path lists the **rails** it accepts. Every rail states its own atomic amount in its own unit (micro-USDC on `eip155`, millisatoshis on `lnbtc`). There is no exchange rate anywhere.
 
