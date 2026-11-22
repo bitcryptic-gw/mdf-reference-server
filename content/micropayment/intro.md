@@ -1,8 +1,8 @@
 # MDF Micropayment Demo
 
-This content is gated at 1 satoshi — the smallest unit of Bitcoin — paid instantly over the Lightning Network via L402.
+This content is gated at 1 satoshi — the smallest unit of Bitcoin — paid instantly over the Lightning Network.
 
-If you're reading this, your agent has already done something remarkable: it detected a `402 Payment Required` response, parsed the Lightning invoice from the `WWW-Authenticate` header, settled the payment in milliseconds, and presented the resulting bearer token to gain access. All without human intervention.
+If you're reading this, your agent has already done something remarkable: it detected a `402 Payment Required` response, read the Lightning rail and its BOLT11 invoice out of the `PAYMENT-REQUIRED` header, settled the payment in milliseconds, and presented the preimage to gain access. All without human intervention.
 
 ## Why 1 Sat?
 
@@ -26,21 +26,24 @@ MDF uses price as a unified access policy signal across four tiers:
 | $0.01+ | Premium | Gated content; paid directly per request, no token issued |
 | $0.10+ | Private | High-value access; token scope-limited to paying path |
 
-Each tier uses the same HTTP content negotiation mechanism — `Accept: text/markdown`. The paid tiers each settle over the rail that matches their price: the 1-sat tier uses Bitcoin over Lightning (L402), while the USDC tiers use x402. Only the price changes.
+Each tier uses the same HTTP content negotiation mechanism — `Accept: text/markdown`. Every priced tier answers with a `402` whose payment request is x402 v2: the 1-sat tier is the Lightning rail (`exact` on `lnbtc`), and the USDC tiers are the Base rail (`exact` on `eip155:8453`). Only the price and the rail change.
 
 ## How It Works
 
-Agents discover pricing via `/mdf.json` before making content requests. For this endpoint, the capability document advertises:
+Agents discover pricing via `/mdf.json` before making content requests. For this endpoint, the site advertises this entry in `accepts[]`:
 
 ```json
 {
-  "amount": "0.00000001",
-  "currency": "BTC",
-  "chain": "lightning"
+  "scheme": "exact",
+  "network": "lnbtc:000000000019d6689c085ae165831e93",
+  "asset": "BTC",
+  "amount": "1000"
 }
 ```
 
-The agent constructs a request, receives a `402` with a Lightning invoice, pays, and re-presents the preimage as a bearer credential. The server verifies settlement via Alby Hub and serves the Markdown response.
+That `amount` is millisatoshis: 1000 msat, one satoshi. The `402` for this page carries the same entry plus a freshly minted BOLT11 invoice under `extra.invoice` — a new invoice on every request, valid for five minutes.
+
+The agent pays the invoice, then sends the preimage back in a `PAYMENT-SIGNATURE` header. The server checks the preimage against the invoice's own payment hash, refuses one it has already accepted, and serves the Markdown response.
 
 Total round-trip from first request to authorised content: typically under two seconds.
 
